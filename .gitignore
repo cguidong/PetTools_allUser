@@ -1,0 +1,27 @@
+﻿# Build and local editor state
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+# Generated distributions and local work
+publish*/
+outputs/
+work/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.7z
+*.msix
+*.msixbundle
+*.sha256
+# User data and diagnostic output
+settings.xml
+privacy.db*
+*.invalid-*
+diagnostics/
+*.log
+.env
+.env.*
