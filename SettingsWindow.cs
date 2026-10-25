@@ -634,7 +634,8 @@ namespace OffWorkWidget.WinUI
                 args.Handled = true;
             }), true);
 
-            bool initialized = false;
+            bool initialized = false, wheelOpen = false;
+            double? positioningOffset = null;
             int previousFirst = 0, previousLast = -1;
             void ApplyPet(string id)
             {
@@ -648,7 +649,7 @@ namespace OffWorkWidget.WinUI
             {
                 double position = wheelViewer.VerticalOffset / rowHeight;
                 int index = Math.Clamp((int)Math.Round(position), 0, count * repeats - 1);
-                ApplyPet(ids[index % count]);
+                if (wheelOpen && positioningOffset == null) ApplyPet(ids[index % count]);
                 for (int i = previousFirst; i <= previousLast; i++) rowBorders[i].Opacity = 0;
                 int first = Math.Max(0, (int)Math.Floor(position) - 3);
                 int last = Math.Min(rowBorders.Count - 1, (int)Math.Ceiling(position) + 3);
@@ -656,19 +657,32 @@ namespace OffWorkWidget.WinUI
                     rowBorders[i].Opacity = Math.Max(0, 1 - Math.Abs(i - position) * .7);
                 previousFirst = first; previousLast = last;
             }
+            void PositionWheel(int index)
+            {
+                // Opening/recentering is bookkeeping, not a user selection gesture.
+                double target = index * rowHeight;
+                positioningOffset = target;
+                wheelViewer.ChangeView(null, target, null, true);
+                if (Math.Abs(wheelViewer.VerticalOffset - target) <= .1) positioningOffset = null;
+            }
             EventHandler<object>? initialize = null;
             initialize = (_, __) =>
             {
                 if (wheelViewer.ExtentHeight <= viewportHeight) return;
                 initialized = true;
                 wheelViewer.LayoutUpdated -= initialize;
-                wheelViewer.ChangeView(null, (count * 3 + Math.Max(0, Array.IndexOf(ids, petId))) * rowHeight, null, false);
+                PositionWheel(count * 3 + Math.Max(0, Array.IndexOf(ids, petId)));
                 UpdateWheelSelection();
             };
             wheelViewer.LayoutUpdated += initialize;
             wheelViewer.ViewChanged += (_, args) =>
             {
-                if (!initialized) return;
+                if (!initialized || !wheelOpen) return;
+                if (positioningOffset is double target)
+                {
+                    if (Math.Abs(wheelViewer.VerticalOffset - target) > .1) return;
+                    positioningOffset = null;
+                }
                 UpdateWheelSelection();
                 if (!args.IsIntermediate)
                 {
@@ -679,7 +693,7 @@ namespace OffWorkWidget.WinUI
                         return;
                     }
                     if (index < count || index >= count * (repeats - 1))
-                        wheelViewer.ChangeView(null, (count * 3 + index % count) * rowHeight, null, false);
+                        PositionWheel(count * 3 + index % count);
                 }
             };
             wheelViewer.KeyDown += (_, args) =>
@@ -727,12 +741,15 @@ namespace OffWorkWidget.WinUI
             bool petKeyboardOpen = false;
             petMenu.Opening += (_, __) =>
             {
+                wheelOpen = false;
                 petKeyboardOpen = petBtn.FocusState == FocusState.Keyboard;
                 panel.RequestedTheme = root.ActualTheme;
             };
+            petMenu.Closing += (_, __) => { wheelOpen = false; positioningOffset = null; };
             petMenu.Opened += (_, __) =>
             {
-                wheelViewer.ChangeView(null, (count * 3 + Math.Max(0, Array.IndexOf(ids, petId))) * rowHeight, null, false);
+                wheelOpen = true;
+                PositionWheel(count * 3 + Math.Max(0, Array.IndexOf(ids, petId)));
                 focusSink.Focus(petKeyboardOpen ? FocusState.Keyboard : FocusState.Pointer);
             };
             focusSink.KeyDown += (_, args) =>
