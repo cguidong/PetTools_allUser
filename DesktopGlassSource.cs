@@ -41,7 +41,6 @@ internal sealed class DesktopGlassSource : IDisposable
     long capturedContentRevision;
     bool hasCapturedSceneStamp;
     bool hasLayoutStamp;
-    const int BackgroundMotionInterval = 16;
     const int CaptureMargin = 256;
     const int CaptureInterval = 100;
     const int MovingCaptureInterval = 32, MovingCaptureMargin = 256;
@@ -106,7 +105,7 @@ internal sealed class DesktopGlassSource : IDisposable
         if (disposed || frozen || paused || inFlight || layoutProbeInFlight || !IsActive || visualDrag || preparingWindowMove ||
             !IsWindowVisible(handle) || IsIconic(handle)) return;
         long now = Environment.TickCount64;
-        int interval = now < backgroundMotionUntil ? BackgroundMotionInterval : 50;
+        int interval = now < backgroundMotionUntil ? 0 : 50;
         if (now - lastLayoutProbe < interval) return;
         lastLayoutProbe = now;
         if (!TryGetRenderBounds(out int x, out int y, out int width, out int height)) return;
