@@ -343,7 +343,7 @@ internal static class CompositorWindowCapture
                         if (disposed) return;
                         if (pending != null)
                         {
-                            retainedSurface?.Dispose(); retainedSurface = null;
+                            retainedSurface = null;
                             retained?.Dispose(); retained = pending; pending = null;
                         }
                         else if (!regionRefresh || retained == null) return;
@@ -353,8 +353,8 @@ internal static class CompositorWindowCapture
                     {
                         var size = captured.ContentSize;
                         if (size.Width <= 0 || size.Height <= 0 || (long)size.Width * size.Height > PixelBudget) continue;
-                        // A static retained frame may be recropped repeatedly without a new
-                        // FrameArrived. Its surface stays open until that frame is replaced.
+                        // This surface is borrowed from the frame pool. Closing it also closes
+                        // a recycled texture used by later frames. Only dispose the owning frame.
                         var surface = retainedSurface ??= captured.Surface;
                         var original = surface.Description;
                         if (original.Width != size.Width || original.Height != size.Height)
@@ -482,7 +482,7 @@ internal static class CompositorWindowCapture
             if (item != null) { try { item.Closed -= ItemClosed; } catch { } }
             if (pool != null) { try { pool.FrameArrived -= FrameArrived; } catch { } }
             try { session?.Dispose(); } catch { }
-            retainedSurface?.Dispose(); retainedSurface = null;
+            retainedSurface = null;
             retained?.Dispose(); retained = null;
             try { pool?.Dispose(); } catch { }
             try { crop?.Dispose(); } catch { }
