@@ -57,7 +57,7 @@ internal static class CompositorWindowCapture
     static readonly object gate = new object();
     static readonly Dictionary<IntPtr, Source> sources = new Dictionary<IntPtr, Source>();
     static readonly Dictionary<IntPtr, long> retryAfter = new Dictionary<IntPtr, long>();
-    const int FrameIntervalMilliseconds = 100, FastFrameIntervalMilliseconds = 8, FailureRetryMilliseconds = 5000;
+    const int FrameIntervalMilliseconds = 100, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
     static string? lastError;
