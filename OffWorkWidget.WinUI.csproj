@@ -5,9 +5,11 @@
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <RootNamespace>OffWorkWidget.WinUI</RootNamespace>
     <AssemblyName>OffWorkWidget.WinUI</AssemblyName>
-    <Version>1.0.7</Version>
-    <AssemblyVersion>1.0.7.0</AssemblyVersion>
-    <FileVersion>1.0.7.0</FileVersion>
+    <Version>1.0.8</Version>
+    <AssemblyVersion>1.0.8.0</AssemblyVersion>
+    <FileVersion>1.0.8.0</FileVersion>
+    <AssemblyTitle>下班倒计时 清透</AssemblyTitle>
+    <Product>下班倒计时 清透</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon Condition="Exists('assets\app-icon.ico')">assets\app-icon.ico</ApplicationIcon>
     <Platforms>x64</Platforms>

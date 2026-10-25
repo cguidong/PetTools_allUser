@@ -637,6 +637,13 @@ namespace OffWorkWidget.WinUI
             bool initialized = false, wheelOpen = false;
             double? positioningOffset = null;
             int previousFirst = 0, previousLast = -1;
+            void TraceWheel(string tag)
+            {
+                if (!GlassProfile.Enabled) return;
+                int center = (int)Math.Round((positioningOffset ?? wheelViewer.VerticalOffset) / rowHeight);
+                int visibleRow = Math.Clamp(center, 0, rowBorders.Count - 1);
+                GlassProfile.Event($"pet-wheel {tag} extent={wheelViewer.ExtentHeight:F1} viewport={wheelViewer.ViewportHeight:F1} offset={wheelViewer.VerticalOffset:F1} actual={wheelRows.ActualHeight:F1} desired={wheelRows.DesiredSize.Height:F1} initialized={initialized} open={wheelOpen} positioning={(positioningOffset.HasValue ? positioningOffset.Value.ToString("F1") : "null")} rows={rowBorders.Count} loaded={rowBorders.Count(r => r.IsLoaded)} center={center} centerOpacity={rowBorders[visibleRow].Opacity:F2} firstOpacity={rowBorders[0].Opacity:F2}");
+            }
             void ApplyPet(string id)
             {
                 if (id == petId) return;
@@ -668,11 +675,13 @@ namespace OffWorkWidget.WinUI
             EventHandler<object>? initialize = null;
             initialize = (_, __) =>
             {
+                TraceWheel("layout");
                 if (wheelViewer.ExtentHeight <= viewportHeight) return;
                 initialized = true;
                 wheelViewer.LayoutUpdated -= initialize;
                 PositionWheel(count * 3 + Math.Max(0, Array.IndexOf(ids, petId)));
                 UpdateWheelSelection();
+                TraceWheel("initialized");
             };
             wheelViewer.LayoutUpdated += initialize;
             wheelViewer.ViewChanged += (_, args) =>
@@ -749,8 +758,18 @@ namespace OffWorkWidget.WinUI
             petMenu.Opened += (_, __) =>
             {
                 wheelOpen = true;
+                TraceWheel("opened");
                 PositionWheel(count * 3 + Math.Max(0, Array.IndexOf(ids, petId)));
+                // The content can finish its first measure before Opened and jump
+                // straight to the target offset. ViewChanged is suppressed while
+                // wheelOpen is false, so publish the row opacity here as well.
+                UpdateWheelSelection();
                 focusSink.Focus(petKeyboardOpen ? FocusState.Keyboard : FocusState.Pointer);
+                wheelViewer.DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+                {
+                    TraceWheel("opened-low");
+                    if (wheelOpen) UpdateWheelSelection();
+                });
             };
             focusSink.KeyDown += (_, args) =>
             {

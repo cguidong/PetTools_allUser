@@ -5,8 +5,9 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.7"
+  #define AppVersion "1.0.8"
 #endif
+#define AppCodename "清透"
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
   #define OutputName "OffWorkWidget-Installer-QA"
@@ -22,7 +23,11 @@
 AppId={#ProductId}
 AppName=下班倒计时
 AppVersion={#AppVersion}
+AppVerName=下班倒计时 {#AppVersion} {#AppCodename}
 AppPublisher=下班倒计时
+VersionInfoProductName=下班倒计时 {#AppCodename}
+VersionInfoProductVersion={#AppVersion}
+VersionInfoDescription=下班倒计时 {#AppVersion} {#AppCodename} 安装程序
 DefaultDirName={localappdata}\Programs\{#InstallLeaf}
 DefaultGroupName={#ShortcutName}
 DisableProgramGroupPage=yes

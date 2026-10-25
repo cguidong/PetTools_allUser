@@ -43,6 +43,7 @@ internal sealed unsafe class NativeCaptureCrop : IDisposable
         ObjectDisposedException.ThrowIf(disposed, this);
         if (left < 0 || top < 0 || cropWidth <= 0 || cropHeight <= 0)
             throw new ArgumentOutOfRangeException(nameof(cropWidth));
+        long profileStarted = GlassProfile.Timestamp();
         IntPtr input = GetNative(source.As<IDirect3DDxgiInterfaceAccess>(),
             new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c"));
         try
@@ -61,13 +62,18 @@ internal sealed unsafe class NativeCaptureCrop : IDisposable
                 (context, texture, 0, 0, 0, 0, input, 0, &box);
             return surface!;
         }
-        finally { Marshal.Release(input); }
+        finally
+        {
+            Marshal.Release(input);
+            GlassProfile.Crop(profileStarted, (long)cropWidth * cropHeight);
+        }
     }
 
     // The capture worker may block on GPU completion here; the UI thread never maps this texture.
     internal void ReadPixels(byte[] destination)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
+        long profileStarted = GlassProfile.Timestamp();
         ArgumentNullException.ThrowIfNull(destination);
         if (texture == IntPtr.Zero) throw new InvalidOperationException("Copy a capture region before reading pixels.");
         int rowBytes = checked(width * 4);
@@ -104,6 +110,7 @@ internal sealed unsafe class NativeCaptureCrop : IDisposable
         finally
         {
             ((delegate* unmanaged[Stdcall]<IntPtr, IntPtr, uint, void>)Slot(context, UnmapSlot))(context, staging, 0);
+            GlassProfile.Readback(profileStarted, (long)width * height);
         }
     }
     void EnsureTexture(int cropWidth, int cropHeight, uint pixelFormat)

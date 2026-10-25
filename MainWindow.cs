@@ -104,6 +104,7 @@ public sealed class MainWindow : Window
     readonly Stopwatch glassAppearanceClock = new Stopwatch();
     bool glassAppearanceInitialized;
     double glassTone, glassFromTone, glassTargetTone, glassTint, glassFromTint, glassTargetTint;
+    bool analysisRegionsDirty = true;
     int walkingFrame, petRevision;
     Microsoft.UI.Xaml.Media.ImageSource[]? walkingFrames;
     readonly DispatcherQueueTimer walkTimer;
@@ -114,6 +115,7 @@ public sealed class MainWindow : Window
         try { timeBeginPeriod(1); } catch { }
         dataFolder = Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") ?? (smoke ? Path.Combine(Path.GetTempPath(), "OffWorkWidget-WinUI-smoke") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"));
         Directory.CreateDirectory(dataFolder);
+        GlassProfile.Configure(dataFolder);
         Title = "下班倒计时 · 液体玻璃";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         native = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd));
@@ -223,8 +225,13 @@ public sealed class MainWindow : Window
         surface.Loaded += (_, __) => EnsureRenderEraseMonitor();
         desktopSource = new DesktopGlassSource(this, surface, backdropCard);
         desktopSource.FrameUpdated = UpdateAppearance;
+        desktopSource.MetricsUpdated = UpdateAppearance;
         desktopSource.BeforeRender = () => { UpdateDragFrame(); UpdateScalePreviewBounds(); UpdateStatsTransition(); UpdateTextTransition(); UpdateGlassTransition(); };
         surface.Loaded += (_, __) => UpdateRenderViewport();
+        surface.LayoutUpdated += (_, __) => analysisRegionsDirty = true;
+        caption.SizeChanged += (_, __) => analysisRegionsDirty = true;
+        countdown.SizeChanged += (_, __) => analysisRegionsDirty = true;
+        stats.SizeChanged += (_, __) => analysisRegionsDirty = true;
         native.Changed += (_, args) => { if (args.DidSizeChange) UpdateRenderViewport(); };
         ApplySettings();
 
@@ -252,7 +259,9 @@ public sealed class MainWindow : Window
             if (!smoke && !previewFrozen && elapsed.Elapsed.TotalSeconds > 5 && Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") != null)
             {
                 previewFrozen = true;
-                File.WriteAllText(Path.Combine(dataFolder, "capture-status.txt"), "Frames=" + desktopSource.FrameCount + "; Ready=" + desktopSource.IsReady + "; Error=" + desktopSource.LastError);
+                File.WriteAllText(Path.Combine(dataFolder, "capture-status.txt"),
+                    "Frames=" + desktopSource.FrameCount + "; Ready=" + desktopSource.IsReady + "; Error=" + desktopSource.LastError +
+                    "; Glass=" + glass.LastError + "; Supported=" + glass.IsSupported);
             }
             if (smoke && !previewFrozen && elapsed.Elapsed.TotalSeconds > 5 && desktopSource.IsReady)
             {
@@ -387,21 +396,12 @@ public sealed class MainWindow : Window
         pet.RenderTransform = petTransform;
         pet.PointerEntered += (_, __) => { petTransform.ScaleX = 1.035; petTransform.ScaleY = 1.035; };
         pet.PointerExited += (_, __) => { petTransform.ScaleX = 1; petTransform.ScaleY = 1; };
+        pet.RightTapped += (_, e) => { ShowContextMenu(e.GetPosition(surface)); e.Handled = true; };
         var breathe = new DoubleAnimation { From = 0, To = -2, Duration = new Duration(TimeSpan.FromSeconds(2.8)), AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } };
         Storyboard.SetTarget(breathe, petTransform); Storyboard.SetTargetProperty(breathe, "TranslateY");
         var breathing = new Storyboard(); breathing.Children.Add(breathe);
         pet.Loaded += (_, __) => breathing.Begin();
-        pet.RightTapped += (_, e) =>
-        {
-            var menu = CreateWidgetMenu();
-            foreach (string id in new[] { "red-panda", "cow-cat", "corgi", "panda", "polar-bear" })
-            {
-                string selected = id;
-                Add(menu, PetName(id), () => SelectPet(selected));
-            }
-            menu.ShowAt(pet, e.GetPosition(pet)); e.Handled = true;
-        };
-        ToolTipService.SetToolTip(pet, "点击爆金币 · 右键切换宠物 · 双击卡片打开设置");
+        ToolTipService.SetToolTip(pet, "点击爆金币 · 双击卡片打开设置");
     }
 
     StackPanel Stat(string title, TextBlock value)
@@ -423,7 +423,6 @@ public sealed class MainWindow : Window
         rest.FontSize = Math.Round(pay.FontSize * logicalSize / 22 * dpi) / dpi;
         rest.FontWeight = unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium;
     }
-    static string PetName(string id) => id switch { "red-panda" => "小熊猫", "corgi" => "柯基", "panda" => "熊猫", "polar-bear" => "北极熊", _ => "奶牛猫" };
     static string NormalizePet(string id) => id == "cat" ? "cow-cat" : id == "samoyed" ? "corgi" : id == "red-panda" || id == "cow-cat" || id == "corgi" || id == "panda" || id == "polar-bear" ? id : "cow-cat";
 
     void PreviewPet(string id)
@@ -433,16 +432,12 @@ public sealed class MainWindow : Window
         if (DateTime.Now < reminderUntil) _ = StartWalk();
     }
 
-    void SelectPet(string id)
-    {
-        PreviewPet(id);
-        Save();
-    }
-
     void LoadPet() { pet.Source = new BitmapImage(new Uri("ms-appx:///assets/" + settings.PetId + ".png")); }
 
     readonly Stopwatch layoutTransitionClock = new Stopwatch();
     bool layoutTransitionActive, layoutHostActive;
+    long layoutLastFrameAt;
+    int layoutFrameCount;
     int layoutClipLeft = int.MinValue, layoutClipWidth = -1;
     readonly TranslateTransform layoutTranslation = new TranslateTransform();
     int layoutCurrentWidth, layoutCurrentX, layoutHostX, layoutHostWidth;
@@ -874,24 +869,21 @@ public sealed class MainWindow : Window
 
     void UpdateAppearance()
     {
+        long appearanceStarted = GlassProfile.Timestamp();
+        double layoutMs = 0;
+        if (analysisRegionsDirty)
+        {
+            long layoutStarted = GlassProfile.Timestamp();
+            UpdateAnalysisRegions();
+            layoutMs = GlassProfile.Ms(layoutStarted);
+        }
         double textTarget;
         double glassTarget;
         if (settings.AutomaticAppearance)
         {
             if (desktopSource.IsReady)
             {
-                double textLight = desktopSource.TextLuminance;
-                if (caption.ActualWidth > 0 && countdown.ActualWidth > 0)
-                {
-                    var a = caption.TransformToVisual(surface).TransformPoint(new Point(0, 0));
-                    var b = countdown.TransformToVisual(surface).TransformPoint(new Point(0, 0));
-                    double dpi = GetDpiForWindow(hwnd) / 96.0;
-                    double left = Math.Min(a.X, b.X), top = Math.Min(a.Y, b.Y);
-                    double right = Math.Max(a.X + caption.ActualWidth, b.X + countdown.ActualWidth);
-                    double bottom = Math.Max(a.Y + caption.ActualHeight, b.Y + countdown.ActualHeight);
-                    if (desktopSource.TryGetRegionLuminance((int)Math.Floor(left * dpi), (int)Math.Floor(top * dpi),
-                        (int)Math.Ceiling((right - left) * dpi), (int)Math.Ceiling((bottom - top) * dpi), out double localLight)) textLight = localLight;
-                }
+                double textLight = desktopSource.TextRegionLuminance ?? desktopSource.TextLuminance;
                 textTarget = textLight < .43 ? 1 : textLight > .53 ? 0 : textAppearanceInitialized ? textTargetTone : textLight < .48 ? 1 : 0;
                 double light = desktopSource.Luminance;
                 glassTarget = light < .43 ? 1 : light > .53 ? 0 : glassAppearanceInitialized ? glassTargetTone : light < .48 ? 1 : 0;
@@ -925,13 +917,7 @@ public sealed class MainWindow : Window
 
         if (settings.AutomaticAppearance)
         {
-            if (desktopSource.IsReady && stats.ActualWidth > 0 && stats.ActualHeight > 0)
-            {
-                var origin = stats.TransformToVisual(surface).TransformPoint(new Point(0, 0));
-                double dpi = GetDpiForWindow(hwnd) / 96.0;
-                if (desktopSource.TryGetUniformRegionTone((int)Math.Round(origin.X * dpi), (int)Math.Round(origin.Y * dpi),
-                    (int)Math.Round(stats.ActualWidth * dpi), (int)Math.Round(stats.ActualHeight * dpi), out bool dark)) statsDark = dark;
-            }
+            if (desktopSource.IsReady && desktopSource.StatsDark is bool dark) statsDark = dark;
             else if (!desktopSource.IsReady && !statsAppearanceInitialized) statsDark = textTarget > .5;
         }
         else statsDark = settings.NightMode;
@@ -973,6 +959,31 @@ public sealed class MainWindow : Window
         var theme = glassTarget > .5 ? ElementTheme.Dark : ElementTheme.Light;
         if (surface.RequestedTheme != theme) surface.RequestedTheme = theme;
         if (hostSurface.RequestedTheme != theme) hostSurface.RequestedTheme = theme;
+        GlassProfile.Appearance(GlassProfile.Ms(appearanceStarted), layoutMs, 0, 0,
+            textTarget, glassTarget, statsDark, settings.AutomaticAppearance);
+    }
+
+    void UpdateAnalysisRegions()
+    {
+        if (!analysisRegionsDirty) return;
+        if (caption.ActualWidth <= 0 || countdown.ActualWidth <= 0) return;
+        var a = caption.TransformToVisual(surface).TransformPoint(new Point(0, 0));
+        var b = countdown.TransformToVisual(surface).TransformPoint(new Point(0, 0));
+        double dpi = GetDpiForWindow(hwnd) / 96.0;
+        double left = Math.Min(a.X, b.X), top = Math.Min(a.Y, b.Y);
+        double right = Math.Max(a.X + caption.ActualWidth, b.X + countdown.ActualWidth);
+        double bottom = Math.Max(a.Y + caption.ActualHeight, b.Y + countdown.ActualHeight);
+        int textX = (int)Math.Floor(left * dpi), textY = (int)Math.Floor(top * dpi);
+        int textW = (int)Math.Ceiling((right - left) * dpi), textH = (int)Math.Ceiling((bottom - top) * dpi);
+        int statsX = 0, statsY = 0, statsW = 0, statsH = 0;
+        if (stats.ActualWidth > 0 && stats.ActualHeight > 0)
+        {
+            var origin = stats.TransformToVisual(surface).TransformPoint(new Point(0, 0));
+            statsX = (int)Math.Round(origin.X * dpi); statsY = (int)Math.Round(origin.Y * dpi);
+            statsW = (int)Math.Round(stats.ActualWidth * dpi); statsH = (int)Math.Round(stats.ActualHeight * dpi);
+        }
+        desktopSource.SetAnalysisRegions(textX, textY, textW, textH, statsX, statsY, statsW, statsH);
+        analysisRegionsDirty = false;
     }
 
     void UpdateGlassTransition()
@@ -1055,8 +1066,11 @@ public sealed class MainWindow : Window
         shownWidgetWidth = 368;
         layoutTransitionActive = uiSettings.AnimationsEnabled;
         layoutProgress = layoutStartProgress;
+        layoutFrameCount = 0; layoutLastFrameAt = 0;
         // Refresh calculates the target geometry without resizing during the transition.
         Refresh();
+        if (GlassProfile.Enabled)
+            GlassProfile.Event($"layout-toggle show={settings.ShowSalaryLayout} startProgress={layoutStartProgress:F3} startWidth={layoutStartWidth} target={layoutTargetWidth}");
         if (layoutTransitionActive)
         {
             var area = DisplayArea.GetFromWindowId(native.Id, DisplayAreaFallback.Primary).WorkArea;
@@ -1093,6 +1107,7 @@ public sealed class MainWindow : Window
     void UpdateLayoutTransition()
     {
         if (!layoutTransitionActive || disposed) return;
+        long frameStarted = GlassProfile.Timestamp();
         double time = uiSettings.AnimationsEnabled ? Math.Clamp(layoutTransitionClock.Elapsed.TotalMilliseconds / 260, 0, 1) : 1;
         double eased = time * time * (3 - 2 * time);
         layoutProgress = layoutStartProgress + ((settings.ShowSalaryLayout ? 1 : 0) - layoutStartProgress) * eased;
@@ -1114,7 +1129,18 @@ public sealed class MainWindow : Window
         // before widening the native outline into the newly visible pixels.
         if (sizeChanged) surface.UpdateLayout();
         desktopSource.UpdateVisualBounds(x + layoutInsetX, native.Position.Y + layoutInsetY, renderWidth, renderHeight);
-        desktopSource.SynchronizeVisualFrame();
+        bool covered = desktopSource.AtlasCovers(x + layoutInsetX, native.Position.Y + layoutInsetY, renderWidth, renderHeight);
+        bool published = desktopSource.SynchronizeVisualFrame();
+        // XAML has now produced one frame at the animated width; safe to reveal
+        // the full host while the rounded clip still owns the visible edge.
+        if (layoutFrameCount == 0) UpdateLayoutHostClip(layoutHostX, layoutHostWidth);
+        layoutFrameCount++;
+        if (GlassProfile.Enabled)
+        {
+            double interval = layoutLastFrameAt == 0 ? 0 : GlassProfile.Ms(layoutLastFrameAt);
+            layoutLastFrameAt = GlassProfile.Timestamp();
+            GlassProfile.Event($"layout-frame p={layoutProgress:F3} ui={GlassProfile.Ms(frameStarted):F2} int={interval:F2} w={width} h={renderHeight} target={layoutTargetWidth} covered={(covered ? 1 : 0)} published={(published ? 1 : 0)}");
+        }
         // Keep the native region stable; the composed clip owns the animated edge.
         if (time >= 1) CompleteLayoutTransition();
     }
@@ -1143,6 +1169,12 @@ public sealed class MainWindow : Window
         surface.RenderTransform = layoutTranslation;
         desktopSource.BeginVisualDrag(layoutStartX + layoutInsetX, native.Position.Y + layoutInsetY,
             Math.Max(1, layoutStartWidth - layoutInsetWidth), Math.Max(1, layoutTargetHeight - layoutInsetHeight));
+        // Keep the exposed spare area clipped to the card until XAML has presented
+        // the first animated frame; otherwise stale white backing shows at the
+        // right rounded corners on the first expansion after launch.
+        UpdateLayoutHostClip(layoutStartX, layoutStartWidth);
+        if (GlassProfile.Enabled)
+            GlassProfile.Event($"layout-host x={layoutHostX} w={layoutHostWidth} start={layoutStartX}:{layoutStartWidth} target={layoutTargetX}:{layoutTargetWidth} inset={layoutInsetX},{layoutInsetY}:{layoutInsetWidth},{layoutInsetHeight}");
         // WinUI installs its caption handler after activation; keep our spare-area hit test first.
         sessionMonitor?.Dispose();
         sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(hwnd);
@@ -1186,6 +1218,8 @@ public sealed class MainWindow : Window
 
     void CompleteLayoutTransition()
     {
+        if (GlassProfile.Enabled)
+            GlassProfile.Event($"layout-complete frames={layoutFrameCount} elapsed={layoutTransitionClock.Elapsed.TotalMilliseconds:F1} progress={layoutProgress:F3}");
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
         salaryArea.Opacity = 1;
         FinishLayoutHost();
@@ -1605,6 +1639,7 @@ public sealed class MainWindow : Window
         glass.Dispose();
         try { timeEndPeriod(1); } catch { }
         privacy.Dispose();
+        GlassProfile.Shutdown();
     }
 
     [StructLayout(LayoutKind.Sequential)] struct NativeClientRect { internal int Left, Top, Right, Bottom; }

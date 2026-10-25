@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
@@ -22,18 +23,24 @@ internal sealed class DesktopGlassSource : IDisposable
     readonly MatrixTransform samplingTransform = new MatrixTransform();
     readonly DispatcherQueueTimer timer;
     WriteableBitmap? bitmap, atlasBitmap;
+    Stream? bitmapStream, atlasStream;
     bool visualDrag, followMovingHost, preparingWindowMove;
     Win32Rect visualBounds;
     int uploadedVersion;
     int motionX, motionY, motionDirectionX, motionDirectionY;
     int displayedWidth, displayedHeight;
+    IntPtr renderWindowHandle;
     byte[]? spareScenePixels, sceneScratchPixels;
     internal Action? BeforeRender;
     bool disposed, frozen, inFlight, paused, layoutProbeInFlight;
     WindowBackdropCapture.Frame? atlas;
     int atlasX, atlasY, atlasVersion, displayedVersion, displayedX = int.MinValue, displayedY;
-    byte[] pixels = Array.Empty<byte>();
+    AnalysisRegions analysisRegions = AnalysisRegions.Empty;
+    Metrics metrics = Metrics.None;
+    double[] statsColumns = Array.Empty<double>();
     DateTime lastCapture;
+    DateTime lastCaptureCompletedUtc;
+    long lastRenderAt;
     long lastLayoutProbe, backgroundMotionUntil;
     ulong layoutStamp;
     long contentRevision;
@@ -41,17 +48,62 @@ internal sealed class DesktopGlassSource : IDisposable
     long capturedContentRevision;
     bool hasCapturedSceneStamp;
     bool hasLayoutStamp;
+    long lastSceneProbeAt;
+    long layoutBurstUntil;
+    ulong lastSceneProbeLayout;
+    const int MovingLayoutProbeInterval = 32;
+    const int LayoutBurstMilliseconds = 180;
     const int CaptureMargin = 256;
     const int CaptureInterval = 100;
     const int MovingCaptureInterval = 32, MovingCaptureMargin = 256;
     internal string? LastError { get; private set; }
     internal Action? FrameUpdated;
+    internal Action? MetricsUpdated;
     internal bool IsActive { get; private set; }
-    internal double Luminance { get; private set; } = .5;
-    internal double TextLuminance { get; private set; } = .5;
+    internal double Luminance => Volatile.Read(ref metrics).Luminance;
+    internal double TextLuminance => Volatile.Read(ref metrics).TextLuminance;
+    internal double? TextRegionLuminance => Volatile.Read(ref metrics).TextRegionLuminance;
+    internal bool? StatsDark => Volatile.Read(ref metrics).StatsDark;
     internal bool IsReady => IsActive && sourceBrush.ImageSource != null && LastError == null;
     internal int FrameCount { get; private set; }
     internal int CapturedWindows { get; private set; }
+
+    sealed class AnalysisRegions
+    {
+        internal static readonly AnalysisRegions Empty = new(0, 0, 0, 0, 0, 0, 0, 0);
+        internal readonly int TextX, TextY, TextW, TextH, StatsX, StatsY, StatsW, StatsH;
+        internal AnalysisRegions(int textX, int textY, int textW, int textH,
+            int statsX, int statsY, int statsW, int statsH)
+        {
+            TextX = textX; TextY = textY; TextW = textW; TextH = textH;
+            StatsX = statsX; StatsY = statsY; StatsW = statsW; StatsH = statsH;
+        }
+        internal bool HasText => TextW > 0 && TextH > 0;
+        internal bool HasStats => StatsW > 0 && StatsH > 0;
+    }
+
+    sealed class Metrics
+    {
+        internal static readonly Metrics None = new(.5, .5, null, null);
+        internal readonly double Luminance;
+        internal readonly double TextLuminance;
+        internal readonly double? TextRegionLuminance;
+        internal readonly bool? StatsDark;
+        internal Metrics(double luminance, double textLuminance, double? textRegionLuminance, bool? statsDark)
+        { Luminance = luminance; TextLuminance = textLuminance; TextRegionLuminance = textRegionLuminance; StatsDark = statsDark; }
+        internal bool Differs(Metrics other) =>
+            Math.Abs(Luminance - other.Luminance) > .001 ||
+            Math.Abs(TextLuminance - other.TextLuminance) > .001 ||
+            NullableDiff(TextRegionLuminance, other.TextRegionLuminance) ||
+            StatsDark != other.StatsDark;
+        static bool NullableDiff(double? left, double? right) =>
+            left.HasValue != right.HasValue || (left.HasValue && Math.Abs(left.Value - right.Value) > .001);
+    }
+
+    internal void SetAnalysisRegions(int textX, int textY, int textW, int textH,
+        int statsX, int statsY, int statsW, int statsH)
+        => Volatile.Write(ref analysisRegions, new AnalysisRegions(textX, textY, textW, textH, statsX, statsY, statsW, statsH));
+
     internal void FreezeForPreview() { frozen = true; timer.Stop(); }
 
     internal void Pause()
@@ -130,6 +182,8 @@ internal sealed class DesktopGlassSource : IDisposable
     internal void BeginVisualDrag(int x, int y, int width, int height)
     {
         visualDrag = true;
+        Volatile.Write(ref lastSceneProbeAt, 0);
+        Volatile.Write(ref layoutBurstUntil, 0);
         timer.Interval = TimeSpan.FromMilliseconds(MovingCaptureInterval);
         followMovingHost = false;
         UpdateVisualBounds(x, y, width, height);
@@ -188,6 +242,8 @@ internal sealed class DesktopGlassSource : IDisposable
     internal void EndVisualDrag()
     {
         visualDrag = false;
+        Volatile.Write(ref lastSceneProbeAt, 0);
+        Volatile.Write(ref layoutBurstUntil, 0);
         timer.Interval = TimeSpan.FromMilliseconds(CaptureInterval);
         followMovingHost = false;
         displayedX = int.MinValue;
@@ -248,34 +304,84 @@ internal sealed class DesktopGlassSource : IDisposable
         ulong previousLayout = capturedLayoutStamp;
         long previousContent = capturedContentRevision;
         bool recentlyCaptured = DateTime.UtcNow - lastCapture < TimeSpan.FromMilliseconds(CaptureInterval);
+        int cardX = x, cardY = y, cardWidth = w, cardHeight = h;
+        var regions = Volatile.Read(ref analysisRegions);
+        int previousAtlasX = atlasX, previousAtlasY = atlasY;
         inFlight = true;
         try
         {
             var captured = await Task.Run(() =>
             {
+                long composeStarted = GlassProfile.Timestamp();
+                double layoutMs = 0;
+                bool layoutProbed = false;
                 if (movingScene)
                 {
-                    sceneLayout = WindowBackdropCapture.GetLayoutStamp(handle, left, top, right - left, bottom - top);
+                    long probeNow = Environment.TickCount64;
+                    int probeInterval = probeNow < Volatile.Read(ref layoutBurstUntil) ? 0 : MovingLayoutProbeInterval;
+                    layoutProbed = probeNow - Volatile.Read(ref lastSceneProbeAt) >= probeInterval;
+                    if (layoutProbed)
+                    {
+                        ulong previousProbeLayout = lastSceneProbeLayout;
+                        long layoutStarted = GlassProfile.Timestamp();
+                        sceneLayout = WindowBackdropCapture.GetLayoutStamp(handle, left, top, right - left, bottom - top);
+                        layoutMs = GlassProfile.Ms(layoutStarted);
+                        Volatile.Write(ref lastSceneProbeAt, probeNow);
+                        lastSceneProbeLayout = sceneLayout;
+                        if (sceneLayout != previousProbeLayout) Volatile.Write(ref layoutBurstUntil, probeNow + LayoutBurstMilliseconds);
+                    }
+                    else sceneLayout = lastSceneProbeLayout;
                     sceneContent = CompositorWindowCapture.Revision;
                     // Only transform the existing texture when its screen-anchored scene is unchanged.
                     if (capturedStamp && compareScene && previous != null &&
                         previous.Width == right - left && previous.Height == bottom - top &&
                         sceneLayout == previousLayout && sceneContent == previousContent && recentlyCaptured)
-                        return (Frame: previous, Unchanged: true, Scratch: scratchBuffer, Skipped: true);
+                    {
+                        double skippedCompose = GlassProfile.Ms(composeStarted);
+                        long skippedMetricsStarted = GlassProfile.Timestamp();
+                        var skippedMetrics = ComputeMetrics(previous.PixelsBGRA, previous.Width, previous.Height,
+                            previousAtlasX, previousAtlasY, cardX, cardY, cardWidth, cardHeight, regions);
+                        return (Frame: previous, Unchanged: true, Scratch: scratchBuffer, Skipped: true,
+                            ComposeMs: skippedCompose, Pending: false, LayoutMs: layoutMs, Probed: layoutProbed,
+                            Analysis: skippedMetrics, MetricsMs: GlassProfile.Ms(skippedMetricsStarted));
+                    }
                 }
                 int byteCount = checked((right - left) * (bottom - top) * 4);
                 var scratch = scratchBuffer?.Length != byteCount ? new byte[byteCount] : scratchBuffer;
                 var fresh = WindowBackdropCapture.CaptureAt(handle, left, top, right - left, bottom - top, outputBuffer, scratch);
+                double composeMs = GlassProfile.Ms(composeStarted);
+                long metricsStarted = GlassProfile.Timestamp();
+                var analysis = fresh.Success
+                    ? ComputeMetrics(fresh.PixelsBGRA, fresh.Width, fresh.Height, left, top,
+                        cardX, cardY, cardWidth, cardHeight, regions)
+                    : null;
+                double metricsMs = GlassProfile.Ms(metricsStarted);
                 bool unchanged = compareScene && fresh.Success && previous != null &&
                     fresh.Width == previous.Width && fresh.Height == previous.Height &&
                     fresh.PixelsBGRA.AsSpan().SequenceEqual(previous.PixelsBGRA);
-                return (Frame: fresh, Unchanged: unchanged, Scratch: scratch, Skipped: false);
+                return (Frame: fresh, Unchanged: unchanged, Scratch: scratch, Skipped: false,
+                    ComposeMs: composeMs, Pending: fresh.PendingRegion, LayoutMs: layoutMs, Probed: layoutProbed,
+                    Analysis: analysis, MetricsMs: metricsMs);
             });
-            if (captured.Skipped) return;
+            bool metricsChanged = false;
+            if (captured.Analysis != null)
+            {
+                var previousMetrics = Volatile.Read(ref metrics);
+                metricsChanged = captured.Analysis.Differs(previousMetrics);
+                Volatile.Write(ref metrics, captured.Analysis);
+            }
+            GlassProfile.Capture(captured.ComposeMs, captured.MetricsMs, captured.LayoutMs, captured.Probed,
+                captured.Pending, captured.Unchanged, captured.Skipped, captured.Frame.CapturedWindows);
+            if (captured.Skipped)
+            {
+                if (metricsChanged) MetricsUpdated?.Invoke();
+                return;
+            }
             lastCapture = DateTime.UtcNow;
             var frame = captured.Frame;
             if (disposed || frozen || !IsActive) return;
             if (!frame.Success) { if (!frame.PendingRegion) LastError = frame.Error; return; }
+            lastCaptureCompletedUtc = DateTime.UtcNow;
             // Static captures often contain the same compositor snapshot. Recycle
             // the unconsumed result or old scene without reuploading unchanged pixels.
             spareScenePixels = captured.Unchanged ? frame.PixelsBGRA : previous?.PixelsBGRA;
@@ -298,6 +404,7 @@ internal sealed class DesktopGlassSource : IDisposable
             LastError = null;
             // The UI continuation can publish before the next render tick; do not hold a ready frame.
             if (!captured.Unchanged) RenderLatest();
+            else if (metricsChanged) MetricsUpdated?.Invoke();
         }
         catch (Exception ex)
         {
@@ -308,17 +415,25 @@ internal sealed class DesktopGlassSource : IDisposable
 
     internal void SynchronizeGeometry()
     {
-        image.CornerRadius = card.CornerRadius;
-        image.Width = surface.Width; image.Height = surface.Height;
+        var radius = card.CornerRadius;
+        if (!image.CornerRadius.Equals(radius)) image.CornerRadius = radius;
+        if (!image.Width.Equals(surface.Width)) image.Width = surface.Width;
+        if (!image.Height.Equals(surface.Height)) image.Height = surface.Height;
     }
 
-    internal void SynchronizeVisualFrame() => RenderLatest();
+    internal bool SynchronizeVisualFrame() => RenderLatest();
 
-    void RenderLatest()
+    internal bool AtlasCovers(int x, int y, int width, int height)
+        => atlas != null && x >= atlasX && y >= atlasY &&
+           x + width <= atlasX + atlas.Width && y + height <= atlasY + atlas.Height;
+
+    bool RenderLatest()
     {
-        if (disposed || frozen || paused || !IsActive || atlas == null || !IsWindowVisible(handle) || IsIconic(handle)) return;
+        if (disposed || frozen || paused || !IsActive || atlas == null || !IsWindowVisible(handle) || IsIconic(handle)) return false;
+        long renderStarted = GlassProfile.Timestamp();
+        double uploadMs = 0;
         SynchronizeGeometry();
-        if (!TryGetRenderBounds(out int x, out int y, out int w, out int h)) return;
+        if (!TryGetRenderBounds(out int x, out int y, out int w, out int h)) return false;
         if (followMovingHost) ObserveWindowMotion(x, y);
         int offsetX = x - atlasX, offsetY = y - atlasY;
         if (offsetX < 0 || offsetY < 0 || offsetX + w > atlas.Width || offsetY + h > atlas.Height)
@@ -326,25 +441,30 @@ internal sealed class DesktopGlassSource : IDisposable
             // Keep the last complete frame until the new screen region arrives.
             // Clearing here exposes the black shader input with stale dark text.
             Capture();
-            return;
+            return false;
         }
         if (displayedVersion == atlasVersion && displayedX == x && displayedY == y &&
             displayedWidth == w && displayedHeight == h &&
             (visualDrag ? uploadedVersion == atlasVersion : bitmap?.PixelWidth == w && bitmap.PixelHeight == h) &&
-            sourceBrush.ImageSource != null) return;
+            sourceBrush.ImageSource != null) return false;
         if (visualDrag)
         {
             if (atlasBitmap == null || atlasBitmap.PixelWidth != atlas.Width || atlasBitmap.PixelHeight != atlas.Height)
             {
+                atlasStream?.Dispose();
                 atlasBitmap = new WriteableBitmap(atlas.Width, atlas.Height);
+                atlasStream = atlasBitmap.PixelBuffer.AsStream();
                 uploadedVersion = 0;
             }
+            atlasStream ??= atlasBitmap.PixelBuffer.AsStream();
             if (uploadedVersion != atlasVersion)
             {
-                using (Stream stream = atlasBitmap.PixelBuffer.AsStream())
-                    stream.Write(atlas.PixelsBGRA, 0, atlas.PixelsBGRA.Length);
+                long uploadStarted = GlassProfile.Timestamp();
+                atlasStream.Position = 0;
+                atlasStream.Write(atlas.PixelsBGRA, 0, atlas.PixelsBGRA.Length);
                 atlasBitmap.Invalidate();
                 uploadedVersion = atlasVersion;
+                uploadMs = GlassProfile.Ms(uploadStarted);
             }
             sourceBrush.Stretch = Stretch.None;
             sourceBrush.AlignmentX = AlignmentX.Left;
@@ -360,37 +480,35 @@ internal sealed class DesktopGlassSource : IDisposable
         {
             if (bitmap == null || bitmap.PixelWidth != w || bitmap.PixelHeight != h)
             {
+                bitmapStream?.Dispose();
                 bitmap = new WriteableBitmap(w, h);
-                pixels = new byte[checked(w * h * 4)];
+                bitmapStream = bitmap.PixelBuffer.AsStream();
             }
-            int stride = w * 4;
+            bitmapStream ??= bitmap.PixelBuffer.AsStream();
+            long uploadStarted = GlassProfile.Timestamp();
+            int sourceStride = atlas.Width * 4;
+            int sourceOffset = (offsetY * atlas.Width + offsetX) * 4;
+            var stream = bitmapStream;
+            stream.Position = 0;
             for (int row = 0; row < h; row++)
-                Buffer.BlockCopy(atlas.PixelsBGRA, ((offsetY + row) * atlas.Width + offsetX) * 4, pixels, row * stride, stride);
-            using (Stream stream = bitmap.PixelBuffer.AsStream())
-                stream.Write(pixels, 0, pixels.Length);
+                stream.Write(atlas.PixelsBGRA, sourceOffset + row * sourceStride, w * 4);
             bitmap.Invalidate();
+            uploadMs = GlassProfile.Ms(uploadStarted);
             sourceBrush.Transform = null;
             sourceBrush.Stretch = Stretch.Fill;
             if (sourceBrush.ImageSource != bitmap) sourceBrush.ImageSource = bitmap;
         }
-        byte[] luminancePixels = visualDrag ? atlas.PixelsBGRA : pixels;
-        int luminanceWidth = visualDrag ? atlas.Width : w;
-        int luminanceX = visualDrag ? offsetX : 0, luminanceY = visualDrag ? offsetY : 0;
-        double light = 0, textLight = 0;
-        int samples = 0, textSamples = 0;
-        for (int row = 0; row < h; row += 4)
-        for (int column = 0; column < w; column += 4)
-        {
-            int index = ((row + luminanceY) * luminanceWidth + column + luminanceX) * 4;
-            double value = (luminancePixels[index] * .0722 + luminancePixels[index + 1] * .7152 + luminancePixels[index + 2] * .2126) / 255;
-            light += value; samples++;
-            if (column <= (int)(w * .55)) { textLight += value; textSamples++; }
-        }
-        Luminance = samples == 0 ? .5 : light / samples;
-        TextLuminance = textSamples == 0 ? .5 : textLight / textSamples;
         displayedX = x; displayedY = y; displayedWidth = w; displayedHeight = h; displayedVersion = atlasVersion;
         FrameCount++;
+        long appearanceStarted = GlassProfile.Timestamp();
         FrameUpdated?.Invoke();
+        double appearanceMs = GlassProfile.Ms(appearanceStarted);
+        double intervalMs = lastRenderAt == 0 ? 0 : GlassProfile.Ms(lastRenderAt);
+        lastRenderAt = GlassProfile.Timestamp();
+        double captureToRenderMs = lastCaptureCompletedUtc == default ? 0 : (DateTime.UtcNow - lastCaptureCompletedUtc).TotalMilliseconds;
+        GlassProfile.Render(GlassProfile.Ms(renderStarted), uploadMs, appearanceMs, intervalMs, captureToRenderMs,
+            visualDrag, true, visualDrag ? (long)atlas.Width * atlas.Height : (long)w * h, atlasVersion);
+        return true;
     }
 
     internal bool TryGetRenderBounds(out int x, out int y, out int width, out int height)
@@ -404,64 +522,93 @@ internal sealed class DesktopGlassSource : IDisposable
         return TryGetHostRenderBounds(out x, out y, out width, out height);
     }
 
-    internal bool TryGetRegionLuminance(int offsetX, int offsetY, int width, int height, out double light)
+    Metrics? ComputeMetrics(byte[] pixels, int frameWidth, int frameHeight, int frameX, int frameY,
+        int cardX, int cardY, int cardWidth, int cardHeight, AnalysisRegions regions)
     {
-        light = .5;
-        if (atlas == null || width <= 0 || height <= 0 || !TryGetRenderBounds(out int x, out int y, out _, out _)) return false;
-        long left = (long)x + offsetX - atlasX, top = (long)y + offsetY - atlasY;
-        if (left < 0 || top < 0 || left + width > atlas.Width || top + height > atlas.Height) return false;
-        double total = 0;
-        int samples = 0;
-        for (int row = 0; row < height; row += 4)
-        for (int column = 0; column < width; column += 4)
+        if (cardWidth <= 0 || cardHeight <= 0 || frameWidth <= 0 || frameHeight <= 0 ||
+            pixels.Length < (long)frameWidth * frameHeight * 4) return null;
+        int left = cardX - frameX, top = cardY - frameY;
+        if (left < 0 || top < 0 || left + cardWidth > frameWidth || top + cardHeight > frameHeight) return null;
+        double light = 0, textLight = 0;
+        int samples = 0, textSamples = 0;
+        int textBoundary = (int)(cardWidth * .55);
+        for (int row = 0; row < cardHeight; row += 4)
+        for (int column = 0; column < cardWidth; column += 4)
         {
-            int index = (((int)top + row) * atlas.Width + (int)left + column) * 4;
-            total += (atlas.PixelsBGRA[index] * .0722 + atlas.PixelsBGRA[index + 1] * .7152 + atlas.PixelsBGRA[index + 2] * .2126) / 255;
-            samples++;
+            int index = ((top + row) * frameWidth + left + column) * 4;
+            double value = (pixels[index] * .0722 + pixels[index + 1] * .7152 + pixels[index + 2] * .2126) / 255;
+            light += value; samples++;
+            if (column <= textBoundary) { textLight += value; textSamples++; }
         }
-        light = total / samples;
-        return true;
-    }
+        double luminance = samples == 0 ? .5 : light / samples;
+        double textLuminance = textSamples == 0 ? .5 : textLight / textSamples;
 
-    double[] regionColumns = Array.Empty<double>();
-    internal bool TryGetUniformRegionTone(int offsetX, int offsetY, int width, int height, out bool dark)
-    {
-        dark = false;
-        if (atlas == null || width <= 0 || height <= 0 || !TryGetRenderBounds(out int x, out int y, out _, out _)) return false;
-        int left = x + offsetX - atlasX, top = y + offsetY - atlasY;
-        if (left < 0 || top < 0 || left + width > atlas.Width || top + height > atlas.Height) return false;
-        if (regionColumns.Length < width) regionColumns = new double[width];
-        Array.Clear(regionColumns, 0, width);
-        bool allDark = true, allLight = true;
-        // Every row AND column must agree; a thin opposite-colour strip still holds the current tone.
-        for (int row = 0; row < height; row++)
+        double? textRegionLuminance = null;
+        if (regions.HasText)
         {
-            double rowLight = 0;
-            for (int column = 0; column < width; column++)
+            int regionX = left + regions.TextX, regionY = top + regions.TextY;
+            int regionW = regions.TextW, regionH = regions.TextH;
+            if (regionX >= 0 && regionY >= 0 && regionX + regionW <= frameWidth && regionY + regionH <= frameHeight)
             {
-                int index = ((top + row) * atlas.Width + left + column) * 4;
-                double light = (atlas.PixelsBGRA[index] * .0722 + atlas.PixelsBGRA[index + 1] * .7152 + atlas.PixelsBGRA[index + 2] * .2126) / 255;
-                rowLight += light; regionColumns[column] += light;
+                double regionLight = 0;
+                int regionSamples = 0;
+                for (int row = 0; row < regionH; row += 4)
+                for (int column = 0; column < regionW; column += 4)
+                {
+                    int index = ((regionY + row) * frameWidth + regionX + column) * 4;
+                    regionLight += (pixels[index] * .0722 + pixels[index + 1] * .7152 + pixels[index + 2] * .2126) / 255;
+                    regionSamples++;
+                }
+                if (regionSamples != 0) textRegionLuminance = regionLight / regionSamples;
             }
-            allDark &= rowLight / width < .44;
-            allLight &= rowLight / width > .56;
-            if (!allDark && !allLight) return false;
         }
-        for (int column = 0; column < width; column++)
+
+        bool? statsDark = null;
+        if (regions.HasStats)
         {
-            allDark &= regionColumns[column] / height < .44;
-            allLight &= regionColumns[column] / height > .56;
-            if (!allDark && !allLight) return false;
+            int regionX = left + regions.StatsX, regionY = top + regions.StatsY;
+            int regionW = regions.StatsW, regionH = regions.StatsH;
+            if (regionX >= 0 && regionY >= 0 && regionX + regionW <= frameWidth && regionY + regionH <= frameHeight)
+            {
+                if (statsColumns.Length < regionW) statsColumns = new double[regionW];
+                Array.Clear(statsColumns, 0, regionW);
+                bool allDark = true, allLight = true;
+                // Every row AND column must agree; a thin opposite-colour strip still holds the current tone.
+                for (int row = 0; row < regionH; row++)
+                {
+                    double rowLight = 0;
+                    for (int column = 0; column < regionW; column++)
+                    {
+                        int index = ((regionY + row) * frameWidth + regionX + column) * 4;
+                        double value = (pixels[index] * .0722 + pixels[index + 1] * .7152 + pixels[index + 2] * .2126) / 255;
+                        rowLight += value; statsColumns[column] += value;
+                    }
+                    allDark &= rowLight / regionW < .44;
+                    allLight &= rowLight / regionW > .56;
+                    if (!allDark && !allLight) return new Metrics(luminance, textLuminance, textRegionLuminance, null);
+                }
+                for (int column = 0; column < regionW; column++)
+                {
+                    allDark &= statsColumns[column] / regionH < .44;
+                    allLight &= statsColumns[column] / regionH > .56;
+                    if (!allDark && !allLight) return new Metrics(luminance, textLuminance, textRegionLuminance, null);
+                }
+                statsDark = allDark;
+            }
         }
-        dark = allDark;
-        return true;
+        return new Metrics(luminance, textLuminance, textRegionLuminance, statsDark);
     }
 
     internal bool TryGetHostRenderBounds(out int x, out int y, out int width, out int height)
     {
         // WinUI keeps a one-pixel inset above this XAML child even in a borderless HWND.
-        IntPtr renderWindow = FindWindowEx(handle, IntPtr.Zero, "Microsoft.UI.Content.DesktopChildSiteBridge", null);
-        if (renderWindow == IntPtr.Zero) renderWindow = handle;
+        IntPtr renderWindow = renderWindowHandle;
+        if (renderWindow == IntPtr.Zero || !IsWindow(renderWindow))
+        {
+            IntPtr child = FindWindowEx(handle, IntPtr.Zero, "Microsoft.UI.Content.DesktopChildSiteBridge", null);
+            renderWindowHandle = child;
+            renderWindow = child != IntPtr.Zero ? child : handle;
+        }
         x = y = width = height = 0;
         var origin = new Win32Point();
         if (!GetClientRect(renderWindow, out Win32Rect client) || !ClientToScreen(renderWindow, ref origin)) return false;
@@ -480,9 +627,11 @@ internal sealed class DesktopGlassSource : IDisposable
         timer.Stop();
         CompositionTarget.Rendering -= OnRendering;
         atlas = null;
+        bitmapStream?.Dispose(); atlasStream?.Dispose();
+        bitmapStream = atlasStream = null;
         bitmap = atlasBitmap = null;
         BeforeRender = null;
-        pixels = Array.Empty<byte>();
+        metrics = Metrics.None;
         spareScenePixels = sceneScratchPixels = null;
         surface.Children.Remove(image);
         sourceBrush.ImageSource = null;
@@ -497,5 +646,6 @@ internal sealed class DesktopGlassSource : IDisposable
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr window, ref Win32Point point);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr handle);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr handle);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr handle);
     [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr handle, uint affinity);
 }
