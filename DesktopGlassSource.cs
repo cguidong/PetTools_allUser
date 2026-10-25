@@ -34,8 +34,16 @@ internal sealed class DesktopGlassSource : IDisposable
     int atlasX, atlasY, atlasVersion, displayedVersion, displayedX = int.MinValue, displayedY;
     byte[] pixels = Array.Empty<byte>();
     DateTime lastCapture;
+    long lastLayoutProbe, backgroundMotionUntil;
+    ulong layoutStamp;
+    long contentRevision;
+    ulong capturedLayoutStamp;
+    long capturedContentRevision;
+    bool hasCapturedSceneStamp;
+    bool hasLayoutStamp;
+    const int BackgroundMotionInterval = 16;
     const int CaptureMargin = 256;
-    const int CaptureInterval = 16;
+    const int CaptureInterval = 100;
     const int MovingCaptureInterval = 32, MovingCaptureMargin = 256;
     internal string? LastError { get; private set; }
     internal Action? FrameUpdated;
@@ -88,12 +96,32 @@ internal sealed class DesktopGlassSource : IDisposable
     void OnRendering(object? sender, object args)
     {
         BeforeRender?.Invoke();
+        if (followMovingHost) RequestFrame();
+        else UpdateBackgroundMotion();
         RenderLatest();
+    }
+
+    void UpdateBackgroundMotion()
+    {
+        if (disposed || frozen || paused || inFlight || !IsActive || visualDrag || preparingWindowMove ||
+            !IsWindowVisible(handle) || IsIconic(handle)) return;
+        long now = Environment.TickCount64;
+        if (now >= backgroundMotionUntil && now - lastLayoutProbe < BackgroundMotionInterval) return;
+        lastLayoutProbe = now;
+        if (!TryGetRenderBounds(out int x, out int y, out int width, out int height)) return;
+        ulong next = WindowBackdropCapture.GetLayoutStamp(handle, x - 48, y - 48, width + 96, height + 96);
+        long nextContent = CompositorWindowCapture.Revision;
+        if ((hasLayoutStamp && next != layoutStamp) || nextContent != contentRevision) backgroundMotionUntil = now + 180;
+        layoutStamp = next;
+        contentRevision = nextContent;
+        hasLayoutStamp = true;
+        if (now < backgroundMotionUntil) RequestFrame();
     }
 
     internal void BeginVisualDrag(int x, int y, int width, int height)
     {
         visualDrag = true;
+        timer.Interval = TimeSpan.FromMilliseconds(MovingCaptureInterval);
         followMovingHost = false;
         UpdateVisualBounds(x, y, width, height);
         uploadedVersion = 0;
@@ -151,6 +179,7 @@ internal sealed class DesktopGlassSource : IDisposable
     internal void EndVisualDrag()
     {
         visualDrag = false;
+        timer.Interval = TimeSpan.FromMilliseconds(CaptureInterval);
         followMovingHost = false;
         displayedX = int.MinValue;
         // Publish a complete normal crop in this UI turn; retain the old image
@@ -161,23 +190,28 @@ internal sealed class DesktopGlassSource : IDisposable
     // Motion samples a screen-anchored scene without waiting for the source app.
     internal void Capture()
     {
-        if (DateTime.UtcNow - lastCapture >= TimeSpan.FromMilliseconds(CaptureInterval)) RequestFrame();
+        if (followMovingHost) { RequestFrame(); return; }
+        int interval = visualDrag || preparingWindowMove ? MovingCaptureInterval : CaptureInterval;
+        if (DateTime.UtcNow - lastCapture >= TimeSpan.FromMilliseconds(interval)) RequestFrame();
     }
 
     async void RequestFrame()
     {
         if (disposed || frozen || paused || inFlight || !IsActive || !IsWindowVisible(handle) || IsIconic(handle)) return;
-        if ((followMovingHost || preparingWindowMove) &&
+        if (preparingWindowMove && !followMovingHost &&
             DateTime.UtcNow - lastCapture < TimeSpan.FromMilliseconds(MovingCaptureInterval)) return;
         if (!TryGetRenderBounds(out int x, out int y, out int w, out int h)) return;
         if (followMovingHost) ObserveWindowMotion(x, y);
         int margin = followMovingHost || preparingWindowMove ? MovingCaptureMargin : visualDrag ? CaptureMargin : 48;
+        // Preserve look-ahead along motion without reading a full margin on the idle axis.
+        int marginX = followMovingHost && motionDirectionX == 0 ? MovingCaptureMargin / 2 : margin;
+        int marginY = followMovingHost && motionDirectionY == 0 ? MovingCaptureMargin / 2 : margin;
         int leadX = followMovingHost ? motionDirectionX * (MovingCaptureMargin / 2) : 0;
         int leadY = followMovingHost ? motionDirectionY * (MovingCaptureMargin / 2) : 0;
-        int left = Math.Min(x, Math.Max(GetSystemMetrics(76), x + leadX - margin));
-        int top = Math.Min(y, Math.Max(GetSystemMetrics(77), y + leadY - margin));
-        int right = Math.Max(x + w, Math.Min(GetSystemMetrics(76) + GetSystemMetrics(78), x + w + leadX + margin));
-        int bottom = Math.Max(y + h, Math.Min(GetSystemMetrics(77) + GetSystemMetrics(79), y + h + leadY + margin));
+        int left = Math.Min(x, Math.Max(GetSystemMetrics(76), x + leadX - marginX));
+        int top = Math.Min(y, Math.Max(GetSystemMetrics(77), y + leadY - marginY));
+        int right = Math.Max(x + w, Math.Min(GetSystemMetrics(76) + GetSystemMetrics(78), x + w + leadX + marginX));
+        int bottom = Math.Max(y + h, Math.Min(GetSystemMetrics(77) + GetSystemMetrics(79), y + h + leadY + marginY));
         int probeX = Math.Clamp(x + leadX, GetSystemMetrics(76), Math.Max(GetSystemMetrics(76), GetSystemMetrics(76) + GetSystemMetrics(78) - w));
         int probeY = Math.Clamp(y + leadY, GetSystemMetrics(77), Math.Max(GetSystemMetrics(77), GetSystemMetrics(77) + GetSystemMetrics(79) - h));
         if (right <= left || bottom <= top) return;
@@ -198,6 +232,19 @@ internal sealed class DesktopGlassSource : IDisposable
         var outputBuffer = spareScenePixels;
         var scratchBuffer = sceneScratchPixels;
         bool compareScene = left == atlasX && top == atlasY;
+        ulong sceneLayout = 0;
+        long sceneContent = 0;
+        if (followMovingHost)
+        {
+            sceneLayout = WindowBackdropCapture.GetLayoutStamp(handle, left, top, right - left, bottom - top);
+            sceneContent = CompositorWindowCapture.Revision;
+            // Pure movement inside the same scene only changes the sampling transform.
+            // Keep the low-rate refresh for source lifetime and capture recovery.
+            if (hasCapturedSceneStamp && compareScene && previous != null &&
+                previous.Width == right - left && previous.Height == bottom - top &&
+                sceneLayout == capturedLayoutStamp && sceneContent == capturedContentRevision &&
+                DateTime.UtcNow - lastCapture < TimeSpan.FromMilliseconds(CaptureInterval)) return;
+        }
         inFlight = true;
         lastCapture = DateTime.UtcNow;
         try
@@ -214,7 +261,7 @@ internal sealed class DesktopGlassSource : IDisposable
             });
             var frame = captured.Frame;
             if (disposed || frozen || !IsActive) return;
-            if (!frame.Success) { LastError = frame.Error; return; }
+            if (!frame.Success) { if (!frame.PendingRegion) LastError = frame.Error; return; }
             // Static captures often contain the same compositor snapshot. Recycle
             // the unconsumed result or old scene without reuploading unchanged pixels.
             spareScenePixels = captured.Unchanged ? frame.PixelsBGRA : previous?.PixelsBGRA;
@@ -226,8 +273,17 @@ internal sealed class DesktopGlassSource : IDisposable
                 atlasX = left; atlasY = top;
                 atlasVersion++;
             }
+            if (followMovingHost)
+            {
+                capturedLayoutStamp = sceneLayout;
+                capturedContentRevision = sceneContent;
+                hasCapturedSceneStamp = true;
+            }
+            else hasCapturedSceneStamp = false;
             CapturedWindows = frame.CapturedWindows;
             LastError = null;
+            // The UI continuation can publish before the next render tick; do not hold a ready frame.
+            if (!captured.Unchanged) RenderLatest();
         }
         catch (Exception ex)
         {

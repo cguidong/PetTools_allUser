@@ -1,11 +1,11 @@
-﻿#ifndef PayloadDir
+#ifndef PayloadDir
   #error PayloadDir is required
 #endif
 #ifndef OutputDir
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.2"
+  #define AppVersion "1.0.7"
 #endif
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
@@ -56,6 +56,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,prerequisites\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\prerequisites\VC_redist.x64.exe"; Flags: dontcopy
+#include "ObsoleteRuntimeFiles.iss"
 [Icons]
 Name: "{group}\{#ShortcutName}"; Filename: "{app}\OffWorkWidget.WinUI.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#ShortcutName}"; Filename: "{app}\OffWorkWidget.WinUI.exe"; WorkingDir: "{app}"; Tasks: desktopicon
@@ -77,13 +78,60 @@ var
   InstallPath: TNewEdit;
   DesktopShortcut: TNewCheckBox;
 
+function HasUNCShare(Drive: string): Boolean;
+var
+  Tail: string;
+  Separator: Integer;
+begin
+  Tail := Copy(Drive, 3, Length(Drive));
+  Separator := Pos('\', Tail);
+  Result := (Copy(Drive, 1, 2) = '\\') and
+    (Separator > 1) and (Separator < Length(Tail));
+end;
+
+function NormalizeInstallPath(Path: string): string;
+var
+  Drive: string;
+begin
+  Result := Trim(Path);
+  if Length(Result) >= 2 then
+    if (Result[1] = '"') and (Result[Length(Result)] = '"') then
+      Result := Copy(Result, 2, Length(Result) - 2);
+  StringChangeEx(Result, '/', '\', True);
+  Drive := ExtractFileDrive(Result);
+  if (Copy(Drive, 1, 2) = '\\') and not HasUNCShare(Drive) then exit;
+  if (Drive <> '') and (CompareText(AddBackslash(Result), AddBackslash(Drive)) = 0) then
+    Result := AddBackslash(Result) + '{#InstallLeaf}';
+end;
+
+function ValidInstallPath(Path: string): Boolean;
+var
+  Drive: string;
+  I: Integer;
+begin
+  Result := False;
+  if Length(Path) < 3 then exit;
+  Drive := ExtractFileDrive(Path);
+  Result := ((Length(Path) >= 3) and (Length(Drive) = 2) and
+    (Pos(Uppercase(Copy(Path, 1, 1)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') > 0) and
+    (Path[2] = ':') and (Path[3] = '\')) or
+    HasUNCShare(Drive);
+  if not Result then exit;
+  for I := 1 to Length(Path) do
+    if (Ord(Path[I]) < 32) or (Pos(Path[I], '<>"|?*') > 0) or
+      ((Path[I] = ':') and (I <> 2)) then begin
+      Result := False;
+      exit;
+    end;
+end;
+
 procedure BrowseInstallFolder(Sender: TObject);
 var
   Directory: string;
 begin
   Directory := InstallPath.Text;
   if BrowseForFolder('选择安装位置', Directory, False) then
-    InstallPath.Text := Directory;
+    InstallPath.Text := NormalizeInstallPath(Directory);
 end;
 
 procedure InitializeWizard;
@@ -132,7 +180,7 @@ begin
   InstallPath.Parent := InstallPage.Surface;
   InstallPath.SetBounds(0, ScaleY(179), InstallPage.SurfaceWidth - ScaleX(82), ScaleY(30));
   InstallPath.Text := WizardDirValue;
-  InstallPath.ReadOnly := True;
+  InstallPath.ReadOnly := False;
   InstallPath.Font.Name := 'Segoe UI';
   InstallPath.Font.Size := 10;
   BrowseButton := TNewButton.Create(WizardForm);
@@ -186,7 +234,14 @@ function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
   if CurPageID = InstallPage.ID then begin
-    WizardForm.DirEdit.Text := Trim(InstallPath.Text);
+    InstallPath.Text := NormalizeInstallPath(InstallPath.Text);
+    if not ValidInstallPath(InstallPath.Text) then begin
+      MsgBox('请输入完整安装路径，例如 D:\OffWorkWidget。选择磁盘根目录时会自动添加应用文件夹。', mbError, MB_OK);
+      WizardForm.ActiveControl := InstallPath;
+      Result := False;
+      exit;
+    end;
+    WizardForm.DirEdit.Text := InstallPath.Text;
     if DesktopShortcut.Checked then WizardSelectTasks('desktopicon')
     else WizardSelectTasks('');
   end;
@@ -274,16 +329,28 @@ begin
     if not ShellExec('runas', ExpandConstant('{tmp}\VC_redist.x64.exe'),
       '/install /passive /norestart', '', SW_SHOWNORMAL,
       ewWaitUntilTerminated, ExitCode) then begin
-      Result := '未完成 Microsoft Visual C++ x64 运行库安装。请允许系统授权，然后重试。错误：' + IntToStr(ExitCode);
+      Log('VC++ runtime launch failed: ' + IntToStr(ExitCode));
+      if ExitCode = 1223 then
+        Result := '已取消运行库安装授权。安装包已包含运行库；请返回上一步后重试，并在 Windows 授权窗口中允许 Microsoft Visual C++ 安装。'
+      else
+        Result := '无法启动包内 Microsoft Visual C++ x64 运行库安装程序。错误：' + IntToStr(ExitCode);
       exit;
     end;
     if (ExitCode <> 0) and (ExitCode <> 3010) and (ExitCode <> 1638) then begin
-      Result := 'Microsoft Visual C++ x64 运行库安装失败，错误：' + IntToStr(ExitCode);
+      Log('VC++ runtime installation failed: ' + IntToStr(ExitCode));
+      if ExitCode = 1602 then
+        Result := '已取消 Microsoft Visual C++ x64 运行库安装。请返回上一步后重试；运行库安装成功后才能运行挂件。'
+      else
+        Result := 'Microsoft Visual C++ x64 运行库安装失败，错误：' + IntToStr(ExitCode);
       exit;
     end;
     RuntimeReboot := ExitCode = 3010;
-    if not HasVCRuntime then
-      Result := '运行库尚未就绪。请重启电脑后重新安装，或先安装包内要求的 Microsoft Visual C++ v14 x64 运行库。';
+    if not HasVCRuntime then begin
+      if RuntimeReboot then
+        Result := '运行库安装程序要求重启。请重启电脑后重新安装。'
+      else
+        Result := '运行库安装后检测未通过。请手动运行发布目录 prerequisites 中的 VC_redist.x64.exe，完成后重试。';
+    end;
   end;
 end;
 
@@ -297,4 +364,22 @@ begin
   Result := CloseRunningWidget;
   if not Result then
     MsgBox('请先从下班倒计时的托盘菜单选择“退出”，然后重新卸载。个人设置会保留。', mbInformation, MB_OK);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  RunKey, Command, ExpectedCommand: string;
+begin
+  if CurUninstallStep <> usUninstall then exit;
+#ifdef InstallerQATest
+  RunKey := 'Software\OffWorkWidget\InstallerQA\Run';
+#else
+  RunKey := 'Software\Microsoft\Windows\CurrentVersion\Run';
+#endif
+  ExpectedCommand := '"' + ExpandConstant('{app}\OffWorkWidget.WinUI.exe') + '"';
+  if RegQueryStringValue(HKCU, RunKey, 'OffWorkWidget', Command) and
+    (CompareText(Command, ExpectedCommand) = 0) then begin
+    if not RegDeleteValue(HKCU, RunKey, 'OffWorkWidget') then
+      Log('Unable to remove this installation startup entry.');
+  end;
 end;

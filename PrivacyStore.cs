@@ -30,7 +30,7 @@ namespace OffWorkWidget
         public bool HasPassword { get { return ReadRequired()[1].Length != 0; } }
         public decimal LoadSalary()
         {
-            var clear = ProtectedData.Unprotect(Convert.FromBase64String(ReadRequired()[3]), Entropy, DataProtectionScope.CurrentUser);
+            var clear = NativeDataProtection.Unprotect(Convert.FromBase64String(ReadRequired()[3]), Entropy);
             try { return decimal.Parse(Encoding.UTF8.GetString(clear), CultureInfo.InvariantCulture); }
             finally { Array.Clear(clear,0,clear.Length); }
         }
@@ -93,7 +93,7 @@ namespace OffWorkWidget
         static string Seal(decimal value)
         {
             byte[] clear = Encoding.UTF8.GetBytes(value.ToString(CultureInfo.InvariantCulture));
-            try { return Convert.ToBase64String(ProtectedData.Protect(clear,Entropy,DataProtectionScope.CurrentUser)); }
+            try { return Convert.ToBase64String(NativeDataProtection.Protect(clear,Entropy)); }
             finally { Array.Clear(clear,0,clear.Length); }
         }
         string[] ReadRequired() { var row = Read(); if(row == null) throw new InvalidDataException("隐私数据缺失。"); return row; }

@@ -5,17 +5,16 @@
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <RootNamespace>OffWorkWidget.WinUI</RootNamespace>
     <AssemblyName>OffWorkWidget.WinUI</AssemblyName>
-    <Version>1.0.2</Version>
-    <AssemblyVersion>1.0.2.0</AssemblyVersion>
-    <FileVersion>1.0.2.0</FileVersion>
+    <Version>1.0.7</Version>
+    <AssemblyVersion>1.0.7.0</AssemblyVersion>
+    <FileVersion>1.0.7.0</FileVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon Condition="Exists('assets\app-icon.ico')">assets\app-icon.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImportWindowsDesktopTargets>false</ImportWindowsDesktopTargets>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin\**;obj\**;publish\**;publish-*\**</DefaultItemExcludes>
     <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
     <EnableDefaultPageItems>false</EnableDefaultPageItems>
     <WinUISDKReferences>false</WinUISDKReferences>
@@ -24,13 +23,13 @@
     <SelfContained>true</SelfContained>
     <PublishSingleFile>false</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
+    <SatelliteResourceLanguages>en;zh-Hans;zh-Hant</SatelliteResourceLanguages>
     <PublishAot>false</PublishAot>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
     <EmbeddedResource Include="assets\china-holidays-2026.json" LogicalName="china-holidays-2026.json" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2270" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
@@ -52,5 +51,119 @@
       <ResolvedFileToPublish Include="$(TargetDir)App.xbf" RelativePath="App.xbf" CopyToPublishDirectory="PreserveNewest" />
       <ResolvedFileToPublish Include="$(TargetDir)$(AssemblyName).pri" RelativePath="$(AssemblyName).pri" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
+  </Target>
+  <Target Name="ExcludeUnusedMachineLearningRuntime" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <!-- The application does not use Windows ML; retain UI and .NET Core runtime components. -->
+      <!-- Replace desktop-framework facades even if the old DLL has a newer timestamp. -->
+      <ResolvedFileToPublish Update="@(ResolvedFileToPublish)"
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'WindowsBase' Or '%(ResolvedFileToPublish.Filename)' == 'System.Drawing' Or '%(ResolvedFileToPublish.Filename)' == 'Microsoft.VisualBasic'">
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'DirectML' Or '%(ResolvedFileToPublish.Filename)' == 'onnxruntime' Or '%(ResolvedFileToPublish.Filename)' == 'Microsoft.Windows.AI.MachineLearning'" />
+    </ItemGroup>
+  </Target>
+  <Target Name="RemoveStaleOptionalRuntimeFiles" AfterTargets="Publish" Condition="'$(PublishDir)' != ''">
+    <ItemGroup>
+      <StaleOptionalRuntimeFiles Include="$(PublishDir)DirectML.dll;$(PublishDir)onnxruntime.dll;$(PublishDir)Microsoft.Windows.AI.MachineLearning.dll" />
+      <StaleOptionalRuntimeFiles Include="$(PublishDir)cs\*.resources.dll;$(PublishDir)de\*.resources.dll;$(PublishDir)es\*.resources.dll;$(PublishDir)fr\*.resources.dll;$(PublishDir)it\*.resources.dll;$(PublishDir)ja\*.resources.dll;$(PublishDir)ko\*.resources.dll;$(PublishDir)pl\*.resources.dll;$(PublishDir)pt-BR\*.resources.dll;$(PublishDir)ru\*.resources.dll;$(PublishDir)tr\*.resources.dll" />
+    </ItemGroup>
+    <Delete Files="@(StaleOptionalRuntimeFiles)" />
+  </Target>
+  <Target Name="RemoveStaleWindowsDesktopRuntimeFiles" AfterTargets="Publish" Condition="'$(PublishDir)' != ''">
+    <ItemGroup>
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)Accessibility.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)D3DCompiler_47_cor3.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)DirectWriteForwarder.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)Microsoft.VisualBasic.Forms.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)Microsoft.Win32.Registry.AccessControl.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)Microsoft.Win32.SystemEvents.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PenImc_cor3.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationCore.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework-SystemCore.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework-SystemData.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework-SystemDrawing.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework-SystemXml.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework-SystemXmlLinq.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.Aero.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.Aero2.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.AeroLite.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.Classic.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.Luna.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationFramework.Royale.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationNative_cor3.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)PresentationUI.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)ReachFramework.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.CodeDom.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Configuration.ConfigurationManager.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Design.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Diagnostics.EventLog.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Diagnostics.EventLog.Messages.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Diagnostics.PerformanceCounter.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.DirectoryServices.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Drawing.Common.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Drawing.Design.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.IO.Packaging.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Printing.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Resources.Extensions.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Security.Cryptography.Pkcs.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Security.Cryptography.ProtectedData.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Security.Cryptography.Xml.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Security.Permissions.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Threading.AccessControl.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Controls.Ribbon.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Extensions.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Forms.Design.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Forms.Design.Editors.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Forms.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Forms.Primitives.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Input.Manipulations.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Windows.Presentation.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)System.Xaml.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)UIAutomationClient.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)UIAutomationClientSideProviders.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)UIAutomationProvider.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)UIAutomationTypes.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)vcruntime140_cor3.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)WindowsFormsIntegration.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)wpfgfx_cor3.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\Microsoft.VisualBasic.Forms.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\PresentationCore.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\PresentationFramework.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\PresentationUI.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\ReachFramework.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Windows.Controls.Ribbon.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Windows.Forms.Design.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Windows.Forms.Primitives.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Windows.Forms.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Windows.Input.Manipulations.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\System.Xaml.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\UIAutomationClient.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\UIAutomationClientSideProviders.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\UIAutomationProvider.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\UIAutomationTypes.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\WindowsBase.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hans\WindowsFormsIntegration.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\Microsoft.VisualBasic.Forms.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\PresentationCore.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\PresentationFramework.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\PresentationUI.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\ReachFramework.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Windows.Controls.Ribbon.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Windows.Forms.Design.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Windows.Forms.Primitives.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Windows.Forms.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Windows.Input.Manipulations.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\System.Xaml.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\UIAutomationClient.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\UIAutomationClientSideProviders.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\UIAutomationProvider.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\UIAutomationTypes.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\WindowsBase.resources.dll" />
+      <StaleDesktopRuntimeFiles Include="$(PublishDir)zh-Hant\WindowsFormsIntegration.resources.dll" />
+    </ItemGroup>
+    <Delete Files="@(StaleDesktopRuntimeFiles)" />
   </Target>
 </Project>

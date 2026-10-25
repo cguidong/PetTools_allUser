@@ -1,12 +1,11 @@
 using System;
 using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Windows.Graphics.Imaging;
 
 namespace OffWorkWidget.WinUI;
 
@@ -29,6 +28,7 @@ internal static class WindowBackdropCapture
         internal double TextLuminance { get; init; } = .5;
         internal int CapturedWindows { get; init; }
         internal string? Error { get; init; }
+        internal bool PendingRegion { get; init; }
         internal bool Success => Error == null && PixelsBGRA.Length != 0;
     }
 
@@ -219,40 +219,12 @@ internal static class WindowBackdropCapture
                 if (wallpaperPixels != null && path == cachedWallpaperPath && lastWrite == wallpaperLastModified && wallpaperWidth == screenW && wallpaperHeight == screenH)
                     return;
 
-                using var original = new Bitmap(path);
-                Bitmap targetBmp;
-                bool disposeTarget = false;
-                if (original.Width == screenW && original.Height == screenH)
-                {
-                    targetBmp = original;
-                }
-                else
-                {
-                    targetBmp = new Bitmap(screenW, screenH, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
-                    using (var g = Graphics.FromImage(targetBmp))
-                    {
-                        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBilinear;
-                        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-                        g.DrawImage(original, new System.Drawing.Rectangle(0, 0, screenW, screenH));
-                    }
-                    disposeTarget = true;
-                }
-
-                try
-                {
-                    wallpaperWidth = targetBmp.Width;
-                    wallpaperHeight = targetBmp.Height;
-                    var data = targetBmp.LockBits(new System.Drawing.Rectangle(0, 0, targetBmp.Width, targetBmp.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
-                    wallpaperPixels = new byte[data.Stride * targetBmp.Height];
-                    Marshal.Copy(data.Scan0, wallpaperPixels, 0, wallpaperPixels.Length);
-                    targetBmp.UnlockBits(data);
-                    cachedWallpaperPath = path;
-                    wallpaperLastModified = lastWrite;
-                }
-                finally
-                {
-                    if (disposeTarget) targetBmp.Dispose();
-                }
+                byte[] pixels = DecodeWallpaperAsync(path, screenW, screenH).GetAwaiter().GetResult();
+                wallpaperPixels = pixels;
+                wallpaperWidth = screenW;
+                wallpaperHeight = screenH;
+                cachedWallpaperPath = path;
+                wallpaperLastModified = lastWrite;
             }
             catch
             {
@@ -263,6 +235,33 @@ internal static class WindowBackdropCapture
                 wallpaperLastModified = default;
             }
         }
+    }
+
+    // Windows Imaging Component codecs also handle extensionless TranscodedWallpaper files.
+    // The caller runs on a capture worker; keep asynchronous decoding off the UI context.
+    private static async Task<byte[]> DecodeWallpaperAsync(string path, int width, int height)
+    {
+        using var file = File.OpenRead(path);
+        using var stream = file.AsRandomAccessStream();
+        var decoder = await BitmapDecoder.CreateAsync(stream).AsTask().ConfigureAwait(false);
+        var transform = new BitmapTransform
+        {
+            ScaledWidth = checked((uint)width),
+            ScaledHeight = checked((uint)height),
+            InterpolationMode = BitmapInterpolationMode.Linear
+        };
+        bool scaled = decoder.PixelWidth != width || decoder.PixelHeight != height;
+        var provider = await decoder.GetPixelDataAsync(
+            BitmapPixelFormat.Bgra8, scaled ? BitmapAlphaMode.Premultiplied : BitmapAlphaMode.Straight, transform,
+            ExifOrientationMode.IgnoreExifOrientation, ColorManagementMode.DoNotColorManage)
+            .AsTask().ConfigureAwait(false);
+        byte[] pixels = provider.DetachPixelData();
+        if (pixels.Length != checked(width * height * 4))
+            throw new InvalidDataException("Unexpected wallpaper pixel dimensions.");
+        // Match the old RGB surface: same-size files retain straight RGB; scaled images
+        // composite transparency over the black target. Both publish opaque BGRA.
+        for (int i = 3; i < pixels.Length; i += 4) pixels[i] = 255;
+        return pixels;
     }
 
     internal static bool TryGetWallpaperSlice(int screenX, int screenY, int width, int height, byte[] output, out double luminance)
@@ -358,6 +357,25 @@ internal static class WindowBackdropCapture
         return CaptureAt(excludedHandle, origin.X, origin.Y, width, height);
     }
 
+    // Geometry-only probe: no PrintWindow, graphics device creation or pixel readback.
+    internal static ulong GetLayoutStamp(IntPtr excludedHandle, int x, int y, int width, int height)
+    {
+        ulong stamp = 14695981039346656037UL;
+        bool passedSelf = false;
+        var target = new Rect(x, y, x + width, y + height);
+        void Mix(long value) { unchecked { stamp = (stamp ^ (ulong)value) * 1099511628211UL; } }
+        EnumWindows((window, _) =>
+        {
+            if (!passedSelf) { if (window == excludedHandle) passedSelf = true; return true; }
+            if (IsDesktopWindow(window) || !IsWindowVisible(window) || IsIconic(window) || IsCloaked(window) ||
+                !GetWindowVisualBounds(window, out Rect bounds) || !Intersect(target, bounds, out Rect overlap)) return true;
+            Mix(window.ToInt64());
+            Mix(bounds.Left); Mix(bounds.Top); Mix(bounds.Right); Mix(bounds.Bottom);
+            return true;
+        }, IntPtr.Zero);
+        return stamp;
+    }
+
     internal static Frame CaptureAt(IntPtr excludedHandle, int targetX, int targetY, int width, int height,
         byte[]? reusableOutput = null, byte[]? sliceBuffer = null)
     {
@@ -376,7 +394,7 @@ internal static class WindowBackdropCapture
             var output = reusableOutput?.Length == outputLength ? reusableOutput : new byte[outputLength];
             if (ReferenceEquals(output, reusableOutput)) Array.Clear(output);
             if (ReferenceEquals(output, sliceBuffer)) sliceBuffer = null;
-            bool passedSelf = false, hasTransparency = false;
+            bool passedSelf = false, hasTransparency = false, pendingRegion = false;
 
             EnumWindows((window, _) =>
             {
@@ -415,11 +433,24 @@ internal static class WindowBackdropCapture
                     windowClass.ToString() == "WinUIDesktopWin32WindowClass";
                 // GPU child surfaces need compositor capture even when their top-level
                 // HWND has ordinary styles. Keep the shell overflow's existing mask.
-                if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.TryGetFrame(window, out var frame) && frame != null)
+                if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.TryGetFrame(window, target.Left, target.Top,
+                    width, height, out var frame) && frame != null)
                 {
+                    using var frameLease = frame;
                     // A resized HWND can expose PrintWindow's stale black backing.
                     // Wait for a matching compositor snapshot instead of stretching it.
                     if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds)) return true;
+                    var fullBounds = frameBounds;
+                    frameBounds = new Rect(frameBounds.Left + frame.PixelLeft, frameBounds.Top + frame.PixelTop,
+                        frameBounds.Left + frame.PixelLeft + frame.PixelWidth, frameBounds.Top + frame.PixelTop + frame.PixelHeight);
+                    if (Intersect(target, fullBounds, out Rect needed) &&
+                        (needed.Left < frameBounds.Left || needed.Top < frameBounds.Top ||
+                        needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom))
+                    {
+                        CompositorWindowCapture.RequestRefresh(window);
+                        pendingRegion = true;
+                        return false;
+                    }
                     if (!GetWindowRect(window, out Rect nativeBounds)) return true;
                     var compositorCoverage = new List<Rect>();
                     // A compositor snapshot can predate a native region shrink.
@@ -429,7 +460,7 @@ internal static class WindowBackdropCapture
                     foreach (Rect remaining in uncovered)
                         foreach (Rect visible in compositorCoverage)
                             if (Intersect(remaining, visible, out Rect hit) && Intersect(hit, frameBounds, out Rect clipped))
-                                CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.Width, frameBounds, clipped);
+                                CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
                     hasTransparency = true;
                     captured++;
                     uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
@@ -495,6 +526,9 @@ internal static class WindowBackdropCapture
 
                 return uncovered.Count > 0;
             }, IntPtr.Zero);
+
+            if (pendingRegion)
+                return new Frame { Error = "等待背景裁剪更新。", PendingRegion = true };
 
             // Fill any uncovered regions with the actual desktop wallpaper and icons
             if (uncovered.Count != 0)
@@ -654,6 +688,13 @@ internal static class WindowBackdropCapture
         }
     }
 
+    internal static bool TryGetCaptureOrigin(IntPtr window, int width, int height, out int x, out int y)
+    {
+        bool matched = TryGetCompositorBounds(window, width, height, out Rect bounds);
+        x = bounds.Left; y = bounds.Top;
+        return matched;
+    }
+
     private static bool TryGetCompositorBounds(IntPtr window, int width, int height, out Rect bounds)
     {
         if (GetWindowVisualBounds(window, out bounds) && bounds.Right - bounds.Left == width && bounds.Bottom - bounds.Top == height)
@@ -670,6 +711,12 @@ internal static class WindowBackdropCapture
             int to = ((y - target.Top) * outputWidth + x - target.Left) * 4;
             int remaining = 255 - output[to + 3];
             if (remaining == 0 || source[from + 3] == 0) continue;
+            if (remaining == 255)
+            {
+                output[to] = source[from]; output[to + 1] = source[from + 1];
+                output[to + 2] = source[from + 2]; output[to + 3] = source[from + 3];
+                continue;
+            }
             // Captured RGB is already premultiplied. Accumulate front to back.
             for (int c = 0; c < 4; c++)
                 output[to + c] = (byte)Math.Min(255, output[to + c] + (source[from + c] * remaining + 127) / 255);

@@ -18,7 +18,6 @@ using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Foundation;
 using Windows.Graphics;
-using Forms = System.Windows.Forms;
 
 namespace OffWorkWidget.WinUI;
 
@@ -49,9 +48,13 @@ public sealed class MainWindow : Window
     readonly TextBlock countdown = new TextBlock { FontSize = 36, FontWeight = Microsoft.UI.Text.FontWeights.Medium, FontFamily = new FontFamily("Segoe UI"), Margin = new Thickness(0, 4, 0, 10) };
     readonly TextBlock rest = new TextBlock(), pay = new TextBlock(), earned = new TextBlock();
     readonly System.Collections.Generic.List<TextBlock> statTitles = new();
+
+
     readonly Button earningsEye = new Button { Padding = new Thickness(0), BorderThickness = new Thickness(0), Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)), MinWidth = 0, MinHeight = 0 };
-    readonly Grid eyeDrawing = new Grid { Width = 16, Height = 14 };
-    readonly Microsoft.UI.Xaml.Shapes.Path eyeSlash = new();
+    readonly FontIcon earningsVisibilityIcon = new() { FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), Glyph = "\uED1A", IsTextScaleFactorEnabled = false };
+    readonly SolidColorBrush eyeBackground = new(Windows.UI.Color.FromArgb(16, 0, 0, 0));
+    readonly SolidColorBrush eyeHoverBackground = new(Windows.UI.Color.FromArgb(32, 0, 0, 0));
+    readonly SolidColorBrush eyePressedBackground = new(Windows.UI.Color.FromArgb(48, 0, 0, 0));
     readonly StackPanel salaryArea = new StackPanel { Spacing = 5 };
     readonly Grid statsRow = new Grid();
     readonly Border stats = new Border { CornerRadius = new CornerRadius(16), Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(-8, 0, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -82,7 +85,10 @@ public sealed class MainWindow : Window
     readonly DesktopGlassSource desktopSource;
     double pixelScale = 1;
     readonly IntPtr hwnd;
-    Forms.NotifyIcon? tray;
+    NativeTrayIcon? tray;
+    WinUIEx.Messaging.WindowMessageMonitor? sessionMonitor;
+    bool sessionNotificationRegistered;
+    double nextSessionRegistrationAttempt;
     SettingsWindow? settingsWindow;
     Mutex? instance;
     EventWaitHandle? activation;
@@ -233,12 +239,16 @@ public sealed class MainWindow : Window
         surface.DoubleTapped += (_, __) => OpenSettings();
         native.Closing += (_, e) => { if (!exiting) { EndDrag(null); e.Cancel = true; native.Hide(); } };
         Closed += (_, __) => DisposeResources();
-        Microsoft.Win32.SystemEvents.SessionSwitch += SessionChanged;
+        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(hwnd);
+        sessionMonitor.WindowMessageReceived += OnSessionChanged;
+        sessionMonitor.WindowMessageReceived += OnLayoutHitTest;
+        TryRegisterSessionNotifications();
 
         timer = DispatcherQueue.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(100);
         timer.Tick += (_, __) =>
         {
+            if (!sessionNotificationRegistered && elapsed.Elapsed.TotalSeconds >= nextSessionRegistrationAttempt) TryRegisterSessionNotifications();
             if (!smoke && !previewFrozen && elapsed.Elapsed.TotalSeconds > 5 && Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") != null)
             {
                 previewFrozen = true;
@@ -287,6 +297,44 @@ public sealed class MainWindow : Window
         menu.Items.Add(item);
     }
 
+    MenuFlyout CreateWidgetMenu()
+    {
+        // Popup theme resources may retain the app theme, so set the menu palette explicitly.
+        ElementTheme theme = settings.AutomaticAppearance ? surface.ActualTheme
+            : settings.NightMode ? ElementTheme.Dark : ElementTheme.Light;
+        bool dark = theme == ElementTheme.Dark;
+        bool highContrast = new Windows.UI.ViewManagement.AccessibilitySettings().HighContrast;
+        var systemColors = new Windows.UI.ViewManagement.UISettings();
+        var background = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.Window)
+            : dark ? Windows.UI.Color.FromArgb(255, 39, 39, 42) : Windows.UI.Color.FromArgb(255, 250, 250, 252);
+        var foreground = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.WindowText)
+            : dark ? Windows.UI.Color.FromArgb(255, 242, 242, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
+        var hover = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.Highlight)
+            : dark ? Windows.UI.Color.FromArgb(255, 60, 60, 65) : Windows.UI.Color.FromArgb(255, 232, 232, 237);
+        var border = highContrast ? foreground : dark ? Windows.UI.Color.FromArgb(255, 68, 68, 74) : Windows.UI.Color.FromArgb(255, 218, 218, 224);
+        var ink = new SolidColorBrush(foreground);
+        var hoverInk = highContrast ? new SolidColorBrush(systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.HighlightText)) : ink;
+        var menu = new MenuFlyout();
+        var style = new Style(typeof(MenuFlyoutPresenter));
+        style.Setters.Add(new Setter(FrameworkElement.RequestedThemeProperty, theme));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(background)));
+        style.Setters.Add(new Setter(Control.ForegroundProperty, ink));
+        style.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(border)));
+        menu.MenuFlyoutPresenterStyle = style;
+        menu.Opening += (_, __) =>
+        {
+            foreach (var item in menu.Items)
+            {
+                item.RequestedTheme = theme;
+                item.Foreground = ink;
+                item.Resources["MenuFlyoutItemBackgroundPointerOver"] = new SolidColorBrush(hover);
+                item.Resources["MenuFlyoutItemBackgroundPressed"] = new SolidColorBrush(hover);
+                item.Resources["MenuFlyoutItemForegroundPointerOver"] = hoverInk;
+                item.Resources["MenuFlyoutItemForegroundPressed"] = hoverInk;
+            }
+        };
+        return menu;
+    }
     void BuildCard()
     {
         var body = new Grid { Margin = new Thickness(24, 18, 12, 18), ColumnSpacing = 20 };
@@ -304,14 +352,15 @@ public sealed class MainWindow : Window
         var salaryTitle = new TextBlock { Text = "今天赚了", FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = statsForeground, VerticalAlignment = VerticalAlignment.Center };
         statTitles.Add(salaryTitle);
         salaryHeader.Children.Add(salaryTitle);
-        eyeDrawing.Children.Add(new Microsoft.UI.Xaml.Shapes.Path
-        {
-            Data = (Geometry)Microsoft.UI.Xaml.Markup.XamlBindingHelper.ConvertValue(typeof(Geometry), "M1,7 C4,1 12,1 15,7 C12,13 4,13 1,7 Z M10,7 A2,2 0 1 1 6,7 A2,2 0 1 1 10,7"),
-            Stroke = statsForeground, StrokeThickness = 1.5
-        });
-        eyeSlash.Data = (Geometry)Microsoft.UI.Xaml.Markup.XamlBindingHelper.ConvertValue(typeof(Geometry), "M2,1 L14,13");
-        eyeSlash.Stroke = statsForeground; eyeSlash.StrokeThickness = 1.5;
-        eyeDrawing.Children.Add(eyeSlash); earningsEye.Content = eyeDrawing;
+        earningsVisibilityIcon.Foreground = statsForeground;
+        earningsEye.Content = earningsVisibilityIcon;
+        earningsEye.Foreground = statsForeground;
+        earningsEye.Background = eyeBackground;
+        earningsEye.CornerRadius = new CornerRadius(100);
+        earningsEye.Resources["ButtonBackgroundPointerOver"] = eyeHoverBackground;
+        earningsEye.Resources["ButtonBackgroundPressed"] = eyePressedBackground;
+        earningsEye.Resources["ButtonForegroundPointerOver"] = statsForeground;
+        earningsEye.Resources["ButtonForegroundPressed"] = statsForeground;
         earningsEye.Click += async (_, __) =>
         {
             earningsEye.IsEnabled = false;
@@ -320,10 +369,12 @@ public sealed class MainWindow : Window
             finally { earningsEye.IsEnabled = true; }
         };
         salaryHeader.Children.Add(earningsEye);
-        salaryArea.Children.Add(salaryHeader); salaryArea.Children.Add(earned);
+        salaryArea.Children.Add(salaryHeader); salaryArea.Children.Add(new Border { Child = earned });
         earned.FontSize = 20; earned.FontFamily = new FontFamily("Segoe UI"); earned.FontWeight = Microsoft.UI.Text.FontWeights.Medium; earned.Foreground = statsForeground;
         Grid.SetColumn(salaryArea, 2); row.Children.Add(salaryArea);
         foreach (FrameworkElement column in row.Children) column.HorizontalAlignment = HorizontalAlignment.Center;
+
+
         stats.Background = statsGlass; stats.Child = row;
         stats.SizeChanged += (_, __) => SynchronizeStatsGeometry();
         text.Children.Add(stats);
@@ -342,7 +393,7 @@ public sealed class MainWindow : Window
         pet.Loaded += (_, __) => breathing.Begin();
         pet.RightTapped += (_, e) =>
         {
-            var menu = new MenuFlyout();
+            var menu = CreateWidgetMenu();
             foreach (string id in new[] { "cat", "samoyed", "polar-bear" })
             {
                 string selected = id;
@@ -359,10 +410,19 @@ public sealed class MainWindow : Window
         var heading = new TextBlock { Text = title, FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = statsForeground };
         statTitles.Add(heading); panel.Children.Add(heading);
         value.FontSize = 20; value.FontFamily = new FontFamily("Segoe UI"); value.FontWeight = Microsoft.UI.Text.FontWeights.Medium; value.Foreground = statsForeground;
-        panel.Children.Add(value);
+        panel.Children.Add(new Border { Child = value });
         return panel;
     }
 
+    void UpdateRestTypography()
+    {
+        bool unset = rest.Text == "未设置";
+        bool weekday = rest.Text.Length == 2 && rest.Text[0] == '周';
+        double logicalSize = unset ? 18 : weekday ? 20 : 22;
+        double dpi = Math.Max(96u, GetDpiForWindow(hwnd)) / 96d;
+        rest.FontSize = Math.Round(pay.FontSize * logicalSize / 22 * dpi) / dpi;
+        rest.FontWeight = unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium;
+    }
     static string PetName(string id) => id == "samoyed" ? "萨摩耶" : id == "polar-bear" ? "大白熊" : "小猫";
 
     void SelectPet(string id)
@@ -391,6 +451,7 @@ public sealed class MainWindow : Window
         settings.Calendar = calendar;
         if (settings.PetId != "cat" && settings.PetId != "samoyed" && settings.PetId != "polar-bear") settings.PetId = "cat";
         ApplyWidgetSize();
+        ApplyMouseClickThrough();
         LoadPet(); reminders.Reset(); Refresh();
     }
 
@@ -530,7 +591,15 @@ public sealed class MainWindow : Window
         caption.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
         countdown.FontSize = Size(36); countdown.Margin = new Thickness(0, Size(4), 0, Size(8));
         foreach (var heading in statTitles) { heading.FontSize = Size(15); heading.FontWeight = Microsoft.UI.Text.FontWeights.Normal; heading.IsTextScaleFactorEnabled = false; }
-        foreach (var value in new[] { rest, pay, earned }) { value.FontSize = Size(22); value.IsTextScaleFactorEnabled = false; }
+        foreach (var value in new[] { rest, pay, earned })
+        {
+            value.FontSize = Size(22); value.IsTextScaleFactorEnabled = false;
+            value.LineHeight = 0; value.LineStackingStrategy = LineStackingStrategy.MaxHeight;
+            value.TextLineBounds = TextLineBounds.Tight;
+            value.VerticalAlignment = VerticalAlignment.Center;
+            if (value.Parent is Border valueSlot) valueSlot.Height = Size(30);
+        }
+        UpdateRestTypography();
         caption.IsTextScaleFactorEnabled = false; countdown.IsTextScaleFactorEnabled = false;
         if (card.Child is Grid body)
         {
@@ -550,9 +619,8 @@ public sealed class MainWindow : Window
         stats.Margin = new Thickness(-Size(8), 0, 0, 0); stats.CornerRadius = new CornerRadius(16 * scale);
         SynchronizeStatsGeometry();
         foreach (StackPanel column in statsRow.Children) column.Spacing = Size(5);
-        earningsEye.Width = Size(22); earningsEye.Height = Size(20);
-        eyeDrawing.RenderTransformOrigin = new Point(.5, .5);
-        eyeDrawing.RenderTransform = new ScaleTransform { ScaleX = scale, ScaleY = scale };
+        earningsEye.Width = Size(20); earningsEye.Height = Size(20);
+        earningsVisibilityIcon.FontSize = Size(13);
     }
 
     string? fittedCaptionText;
@@ -753,6 +821,7 @@ public sealed class MainWindow : Window
             rest.Text = days < 0 ? "未设置" : days + "天";
             ToolTipService.SetToolTip(rest, Logic.RestDescription(now, settings, days));
         }
+        UpdateRestTypography();
         pay.Text = Logic.UntilPay(now, settings.PayDay) + "天";
         if (!layoutTransitionActive)
         {
@@ -762,7 +831,7 @@ public sealed class MainWindow : Window
         }
         else salaryArea.Visibility = Visibility.Visible;
         earned.Text = settings.HideAmount ? "***元" : Logic.Earned(now, settings).ToString("F2", CultureInfo.InvariantCulture) + "元";
-        eyeSlash.Visibility = settings.HideAmount ? Visibility.Visible : Visibility.Collapsed;
+        earningsVisibilityIcon.Glyph = settings.HideAmount ? "\uED1A" : "\uE890";
         string eyeAction = settings.HideAmount ? "显示金额（需验证密码）" : "隐藏金额";
         ToolTipService.SetToolTip(earningsEye, eyeAction);
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(earningsEye, eyeAction);
@@ -941,6 +1010,10 @@ public sealed class MainWindow : Window
         byte Mix(double light, double dark) => (byte)Math.Round(light + (dark - light) * statsTone);
         var ink = Windows.UI.Color.FromArgb(255, Mix(24, 255), Mix(26, 255), Mix(30, 255));
         if (statsForeground.Color != ink) statsForeground.Color = ink;
+        byte eyeTone = Mix(0, 255);
+        eyeBackground.Color = Windows.UI.Color.FromArgb(16, eyeTone, eyeTone, eyeTone);
+        eyeHoverBackground.Color = Windows.UI.Color.FromArgb(36, eyeTone, eyeTone, eyeTone);
+        eyePressedBackground.Color = Windows.UI.Color.FromArgb(52, eyeTone, eyeTone, eyeTone);
         var tint = Windows.UI.Color.FromArgb(210, Mix(245, 40), Mix(245, 40), Mix(248, 44));
         if (statsBackground.Color != tint) statsBackground.Color = tint;
         if (statsGlass.FallbackColor != tint) statsGlass.FallbackColor = tint;
@@ -951,7 +1024,7 @@ public sealed class MainWindow : Window
 
     async Task<bool> RevealSalary(XamlRoot root)
     {
-        bool unlocked = await PrivacyPrompts.UnlockAsync(root, privacy);
+        bool unlocked = await PrivacyPrompts.UnlockAsync(root, privacy, settings.AutomaticAppearance ? surface.ActualTheme : settings.NightMode ? ElementTheme.Dark : ElementTheme.Light);
         if (exiting) return false;
         decimal storedSalary = privacy.LoadSalary();
         if (settings.Salary != storedSalary) { settings.Salary = storedSalary; HideSalary(); }
@@ -1032,7 +1105,7 @@ public sealed class MainWindow : Window
         if (sizeChanged) surface.UpdateLayout();
         desktopSource.UpdateVisualBounds(x + layoutInsetX, native.Position.Y + layoutInsetY, renderWidth, renderHeight);
         desktopSource.SynchronizeVisualFrame();
-        UpdateLayoutHostClip(x, width);
+        // Keep the native region stable; the composed clip owns the animated edge.
         if (time >= 1) CompleteLayoutTransition();
     }
 
@@ -1050,9 +1123,9 @@ public sealed class MainWindow : Window
         layoutCurrentX = layoutStartX; layoutCurrentWidth = layoutStartWidth;
         layoutHostX = Math.Min(layoutStartX, layoutTargetX);
         layoutHostWidth = Math.Max(layoutStartX + layoutStartWidth, layoutTargetX + layoutTargetWidth) - layoutHostX;
-        // Keep spare host pixels clipped while the XAML card grows inside it.
+        // Initialize the maximum native backing once; the composed clip animates inside it.
         layoutClipLeft = int.MinValue; layoutClipWidth = -1;
-        UpdateLayoutHostClip(layoutStartX, layoutStartWidth);
+        UpdateLayoutHostClip(layoutHostX, layoutHostWidth);
         native.MoveAndResize(new RectInt32(layoutHostX, native.Position.Y, layoutHostWidth, layoutTargetHeight));
         ClearTransparentHostBackground();
         if (!desktopSource.TryGetHostRenderBounds(out layoutRenderHostX, out layoutRenderHostY, out _, out _))
@@ -1060,6 +1133,11 @@ public sealed class MainWindow : Window
         surface.RenderTransform = layoutTranslation;
         desktopSource.BeginVisualDrag(layoutStartX + layoutInsetX, native.Position.Y + layoutInsetY,
             Math.Max(1, layoutStartWidth - layoutInsetWidth), Math.Max(1, layoutTargetHeight - layoutInsetHeight));
+        // WinUI installs its caption handler after activation; keep our spare-area hit test first.
+        sessionMonitor?.Dispose();
+        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(hwnd);
+        sessionMonitor.WindowMessageReceived += OnSessionChanged;
+        sessionMonitor.WindowMessageReceived += OnLayoutHitTest;
     }
 
     void UpdateLayoutHostClip(int x, int width)
@@ -1080,9 +1158,7 @@ public sealed class MainWindow : Window
         else
         {
             layoutClipLeft = left; layoutClipWidth = renderWidth;
-            // GetDC was limited by the previous region at host initialization.
-            // Initialize the newly visible strip after each region expansion,
-            // including the XAML child that the root DC may exclude.
+            // Initialize the visible backing, including the XAML child that the root DC may exclude.
             ClearTransparentHostBackground();
         }
     }
@@ -1108,7 +1184,41 @@ public sealed class MainWindow : Window
 
     void HideSalary() { if (exiting || disposed) return; settings.HideAmount = true; Refresh(); }
 
-    void SessionChanged(object sender, Microsoft.Win32.SessionSwitchEventArgs e) { if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionLock) DispatcherQueue.TryEnqueue(() => { EndDrag(null); HideSalary(); }); }
+    void TryRegisterSessionNotifications()
+    {
+        if (disposed) return;
+        nextSessionRegistrationAttempt = elapsed.Elapsed.TotalSeconds + 5;
+        sessionNotificationRegistered = WTSRegisterSessionNotification(hwnd, 0);
+    }
+
+    void OnLayoutHitTest(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
+    {
+        if (!layoutHostActive || args.Message.MessageId != 0x0084 /* WM_NCHITTEST */) return;
+        long position = args.Message.LParam.ToInt64();
+        double x = (short)(position & 0xffff) - layoutCurrentX - layoutInsetX;
+        double y = (short)((position >> 16) & 0xffff) - native.Position.Y - layoutInsetY;
+        double width = Math.Max(1, layoutCurrentWidth - layoutInsetWidth);
+        double height = Math.Max(1, layoutTargetHeight - layoutInsetHeight);
+        double radius = Math.Min(36 * pixelScale, Math.Min(width, height) * .5);
+        double dx = x - Math.Clamp(x, radius, width - radius);
+        double dy = y - Math.Clamp(y, radius, height - radius);
+        if (x < 0 || x >= width || y < 0 || y >= height || dx * dx + dy * dy > radius * radius)
+        {
+            args.Result = new IntPtr(-1); // HTTRANSPARENT: spare animation host is not interactive.
+            args.Handled = true;
+        }
+    }
+
+    void OnSessionChanged(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
+    {
+        if (args.Message.MessageId == 0x02B1 && unchecked((long)args.Message.WParam) == 7)
+            DispatcherQueue.TryEnqueue(() => { EndDrag(null); HideSalary(); });
+    }
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] static extern bool WTSRegisterSessionNotification(IntPtr window, uint flags);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)] static extern bool WTSUnRegisterSessionNotification(IntPtr window);
 
     void OpenSettings()
     {
@@ -1192,7 +1302,6 @@ public sealed class MainWindow : Window
         native.Move(position);
         lastDragPosition = position;
         dragMoved = true;
-        desktopSource.Capture();
     }
 
     PointInt32 ClampDragPosition(PointInt32 position)
@@ -1214,6 +1323,7 @@ public sealed class MainWindow : Window
         eraseRenderHandle = render;
         renderEraseMonitor = new WinUIEx.Messaging.WindowMessageMonitor(render);
         renderEraseMonitor.WindowMessageReceived += OnEraseBackground;
+        renderEraseMonitor.WindowMessageReceived += OnLayoutHitTest;
     }
 
     void OnEraseBackground(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
@@ -1302,31 +1412,45 @@ public sealed class MainWindow : Window
     void ShowContextMenu(Point point)
     {
         if (disposed) return;
-        var menu = new MenuFlyout();
+        var menu = CreateWidgetMenu();
         Add(menu, "设置", OpenSettings);
         Add(menu, "隐藏到托盘", () => native.Hide());
         Add(menu, "退出", Exit);
         menu.ShowAt(surface, point);
     }
 
-    void CenterWidget()
+    void ApplyMouseClickThrough()
+    {
+        if (settings.MouseClickThrough)
+        {
+            EndDrag(null);
+            glass.SetInteraction(0, 0, false);
+        }
+        int extended = GetWindowLong(hwnd, GWL_EXSTYLE);
+        int next = settings.MouseClickThrough
+            ? extended | WS_EX_LAYERED | WS_EX_TRANSPARENT
+            : extended & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT);
+        if (next == extended) return;
+        SetWindowLong(hwnd, GWL_EXSTYLE, next);
+        // Keep XAML opaque at the window level; only mouse input passes through.
+        if (settings.MouseClickThrough) SetLayeredWindowAttributes(hwnd, 0, 255, 2 /* LWA_ALPHA */);
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, 0x0037 /* FRAMECHANGED | NOACTIVATE | NOZORDER | NOMOVE | NOSIZE */);
+    }
+
+    void ToggleMouseClickThrough()
     {
         if (exiting || disposed) return;
-        var size = scalePreviewHostActive ? new SizeInt32(scalePreviewWidth, scalePreviewHeight) : native.Size;
-        var area = DisplayArea.GetFromPoint(new PointInt32(native.Position.X + size.Width / 2,
-            native.Position.Y + size.Height / 2), DisplayAreaFallback.Primary).WorkArea;
-        int cx = area.X + (area.Width - size.Width) / 2;
-        int cy = area.Y + (area.Height - size.Height) / 2;
-        native.Move(new PointInt32(cx, cy));
-        settings.X = cx; settings.Y = cy;
-        Save();
-        ShowWidget();
+        settings.MouseClickThrough = !settings.MouseClickThrough;
+        ApplyMouseClickThrough();
+        settingsWindow?.RefreshMouseClickThrough(settings.MouseClickThrough);
+        Save(true);
     }
 
     void ShowWidget()
     {
         if (exiting || disposed) return;
         native.Show();
+        ApplyMouseClickThrough();
         Activate();
         try
         {
@@ -1338,14 +1462,8 @@ public sealed class MainWindow : Window
 
     void CreateTray(string path)
     {
-        tray = new Forms.NotifyIcon { Icon = new System.Drawing.Icon(path), Text = "下班倒计时 · 多宠物", Visible = true };
-        var menu = new Forms.ContextMenuStrip();
-        menu.Items.Add("显示", null, (_, __) => DispatcherQueue.TryEnqueue(ShowWidget));
-        menu.Items.Add("居中显示", null, (_, __) => DispatcherQueue.TryEnqueue(CenterWidget));
-        menu.Items.Add("设置", null, (_, __) => DispatcherQueue.TryEnqueue(OpenSettings));
-        menu.Items.Add("退出", null, (_, __) => { menu.Close(); DispatcherQueue.TryEnqueue(Exit); });
-        tray.ContextMenuStrip = menu;
-        tray.DoubleClick += (_, __) => DispatcherQueue.TryEnqueue(ShowWidget);
+        tray = new NativeTrayIcon(hwnd, path, ShowWidget, OpenSettings, Exit, () => false,
+            ToggleMouseClickThrough, () => settings.MouseClickThrough);
     }
 
     static Settings CloneSettings(Settings s)
@@ -1360,6 +1478,7 @@ public sealed class MainWindow : Window
             WorkDays = s.WorkDays,
             PayDay = s.PayDay,
             Topmost = s.Topmost,
+            MouseClickThrough = s.MouseClickThrough,
             NightMode = s.NightMode,
             AutomaticAppearance = s.AutomaticAppearance,
             PetId = s.PetId,
@@ -1454,12 +1573,14 @@ public sealed class MainWindow : Window
         if (disposed) return;
         try { EndDrag(null); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
         disposed = true;
+
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
         timer?.Stop();
         walkTimer?.Stop();
         smokeTimer?.Stop();
-        Microsoft.Win32.SystemEvents.SessionSwitch -= SessionChanged;
-        if (tray != null) { tray.Visible = false; tray.Dispose(); }
+        if (sessionNotificationRegistered) { WTSUnRegisterSessionNotification(hwnd); sessionNotificationRegistered = false; }
+        sessionMonitor?.Dispose();
+        tray?.Dispose();
         installerExitWait?.Unregister(null);
         installerExit?.Dispose();
         activationWait?.Unregister(null);
@@ -1512,4 +1633,7 @@ public sealed class MainWindow : Window
     const int WS_SYSMENU = 0x00080000;
     const int WS_EX_TOOLWINDOW = 0x00000080;
     const int WS_EX_APPWINDOW = 0x00040000;
+    const int WS_EX_LAYERED = 0x00080000;
+    const int WS_EX_TRANSPARENT = 0x00000020;
+    [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr window, uint colorKey, byte alpha, uint flags);
 }

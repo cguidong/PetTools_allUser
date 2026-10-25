@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 
 namespace OffWorkWidget
@@ -35,6 +35,7 @@ namespace OffWorkWidget
         public decimal WorkDays = 21.75m;
         public int PayDay = 10;
         public bool Topmost = true;
+        public bool MouseClickThrough = false;
         public bool NightMode = false;
         public bool AutomaticAppearance = true;
         public string PetId = "cat";

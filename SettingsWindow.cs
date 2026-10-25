@@ -52,14 +52,16 @@ namespace OffWorkWidget.WinUI
         bool dayTimeEnabled, loadingSchedule;
         string scheduleMode = "";
         readonly List<OffWorkWidget.WorkScheduleProfile> workSchedules = new();
-        TextBlock scheduleLabel = null!, dayTimeStartDisplay = null!, dayTimeEndDisplay = null!;
+        TextBlock dayTimeStartDisplay = null!, dayTimeEndDisplay = null!;
         ToggleSwitch dayTimeSwitch = null!;
         Grid dayTimeTimes = null!;
         readonly List<OffWorkWidget.DayWorkTime> dayTimes = new();
         int editingDay = 6;
         bool dayTimeExpanded;
         StackPanel dayTimeSection = null!, dayTimeEditor = null!;
-        Border dayTimeReveal = null!;
+        Border dayTimeReveal = null!, dayTimeTimesReveal = null!;
+        readonly RectangleGeometry dayTimeTimesClip = new RectangleGeometry();
+        double dayTimeTimesFrom, dayTimeTimesTo, dayTimeTimesOpacityFrom;
         readonly RectangleGeometry dayTimeRevealClip = new RectangleGeometry();
         readonly Stopwatch dayTimeRevealClock = new Stopwatch();
         bool animatingDayTimeReveal;
@@ -93,17 +95,21 @@ namespace OffWorkWidget.WinUI
         double? scaleDragValue;
         bool settingScaleFromPointer;
         ToggleSwitch holidays, water, walk, topmost;
+        ToggleSwitch startup = null!, mouseClickThrough = null!;
+        bool startupInitiallyEnabled;
         TextBlock holidayStatus, passwordStatus, scaleLabel;
+        Action? refreshAdjustmentReveal;
         Image petThumb;
         Border incomeContent, restContent, careContent;
         Grid incomeChevron, restChevron, careChevron;
-        Microsoft.UI.Xaml.Shapes.Path eyeSlash;
+        FontIcon salaryVisibilityIcon;
         ToggleSwitch salaryLayoutSwitch;
 
         ScrollViewer settingsScroll = null!;
         TextBlock compactTitle = null!;
         Border toolbar = null!;
-        Button autoAppearanceButton = null!, nightAppearanceButton = null!, backToTop = null!;
+        Button autoAppearanceButton = null!, nightAppearanceButton = null!, backToTop = null!, footerCancel = null!;
+        readonly ScaleTransform footerArrowScale = new ScaleTransform { ScaleX = 0, ScaleY = 0 };
         readonly SolidColorBrush pageBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush headerBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush footerBackgroundBrush = new SolidColorBrush();
@@ -112,12 +118,15 @@ namespace OffWorkWidget.WinUI
         readonly LinearGradientBrush headerFade = new LinearGradientBrush();
         readonly Border headerFadeLayer = new Border { Height = 24, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Opacity = 0 };
         readonly Border[] accordionCards = new Border[3];
-        readonly Border[] accordionDividers = new Border[2];
+        readonly TextBlock?[] accordionSummaries = new TextBlock?[3];
+        StackPanel workingHoursContent = null!, restPlanContent = null!, appearanceOptions = null!;
+        Button petSelector = null!;
         readonly double[] accordionProgress = new double[3], accordionStart = new double[3], accordionTarget = new double[3];
         readonly Stopwatch accordionClock = new Stopwatch();
         readonly Windows.UI.ViewManagement.UISettings animationSettings = new Windows.UI.ViewManagement.UISettings();
         bool animatingAccordion;
         int expandedAccordion;
+        bool workSectionExpanded = true;
         bool salaryAuthorized, automatic, night, privacyPromptOpen;
         string? salaryDraft;
         string petId;
@@ -132,6 +141,7 @@ namespace OffWorkWidget.WinUI
         readonly SolidColorBrush subInkBrush = new SolidColorBrush();
         readonly SolidColorBrush cardBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush inputBackgroundBrush = new SolidColorBrush();
+        readonly SolidColorBrush selectionBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush timeHoverBrush = new SolidColorBrush();
         readonly SolidColorBrush timePressedBrush = new SolidColorBrush();
         readonly SolidColorBrush dividerBrush = new SolidColorBrush();
@@ -198,7 +208,7 @@ namespace OffWorkWidget.WinUI
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.ActualThemeChanged += (_, __) => ApplyThemeBrushes();
-            SystemBackdrop = new WinUIEx.TransparentTintBackdrop();
+            SystemBackdrop = new WinUIEx.TransparentTintBackdrop(Windows.UI.Color.FromArgb(0, 0, 0, 0));
             windowSurface.Children.Add(frostedBackground); windowSurface.Children.Add(root);
             windowSurface.SizeChanged += (_, __) => UpdateWindowContour();
             Content = windowSurface;
@@ -209,14 +219,16 @@ namespace OffWorkWidget.WinUI
             settingsScroll = new ScrollViewer { Content = form, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
             settingsScroll.ViewChanged += (_, __) => UpdateScrollChrome();
             form.Margin = new Thickness(16, 0, 16, 8);
+            form.Children.Add(new Border { Height = 56, IsHitTestVisible = false });
+            settingsScroll.Loaded += (_, __) => BindTitleTransition();
             var scrollSurface = CreateScrollSurface();
             Grid.SetRow(scrollSurface, 1); root.Children.Add(scrollSurface);
-            BuildHero();
+            BuildPetSelector();
 
-            BuildWorkingHoursCard();
+            BuildWorkingHoursContent();
             BuildAccordionGroup();
             BuildDesktopLayoutCard();
-            BuildTopmostCard();
+            BuildWindowOptionsCard();
 
             BuildFooter();
             headerFade.StartPoint = new Windows.Foundation.Point(0, 0); headerFade.EndPoint = new Windows.Foundation.Point(0, 1);
@@ -238,6 +250,13 @@ namespace OffWorkWidget.WinUI
             };
         }
 
+        void CloseSettings()
+        {
+            // Hide the composed frame before Closed disconnects its backdrop and rounded clip.
+            native.Hide();
+            Close();
+        }
+
         void PositionWindow()
         {
             string icon = Path.Combine(AppContext.BaseDirectory, "assets", "app-icon.ico");
@@ -256,7 +275,15 @@ namespace OffWorkWidget.WinUI
             // A composition clip has fractional-alpha edges; a native window
             // region only keeps or discards complete pixels and creates stair steps.
             SetWindowRgn(hwnd, IntPtr.Zero, false);
-            if (windowSurface.ActualWidth > 0 && windowSurface.ActualHeight > 0)
+            double width = windowSurface.ActualWidth, height = windowSurface.ActualHeight;
+            // Establish the contour before the first XAML layout is presented.
+            if ((width <= 0 || height <= 0) && GetClientRect(hwnd, out ClientRect bounds))
+            {
+                double dpi = Math.Max(96, GetDpiForWindow(hwnd)) / 96d;
+                width = (bounds.Right - bounds.Left) / dpi;
+                height = (bounds.Bottom - bounds.Top) / dpi;
+            }
+            if (width > 0 && height > 0)
             {
                 var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowSurface);
                 if (windowGeometry == null)
@@ -264,7 +291,7 @@ namespace OffWorkWidget.WinUI
                     windowGeometry = visual.Compositor.CreateRoundedRectangleGeometry();
                     visual.Clip = visual.Compositor.CreateGeometricClip(windowGeometry);
                 }
-                windowGeometry.Size = new System.Numerics.Vector2((float)windowSurface.ActualWidth, (float)windowSurface.ActualHeight);
+                windowGeometry.Size = new System.Numerics.Vector2((float)width, (float)height);
                 windowGeometry.CornerRadius = new System.Numerics.Vector2(24);
             }
             IntPtr render = FindWindowEx(hwnd, IntPtr.Zero, "Microsoft.UI.Content.DesktopChildSiteBridge", null);
@@ -330,7 +357,7 @@ namespace OffWorkWidget.WinUI
             bool dark = root.ActualTheme == ElementTheme.Dark;
             pageBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 16 : 255), 28, 28, 30) : Windows.UI.Color.FromArgb((byte)(automatic ? 20 : 255), 242, 242, 247);
             root.Background = pageBackgroundBrush;
-            footerActionBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 64, 64, 72) : Windows.UI.Color.FromArgb(255, 220, 223, 232);
+            footerActionBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 58, 58, 60) : Windows.UI.Color.FromArgb(255, 229, 229, 234);
             footerBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 190 : 255), 28, 28, 30) : Windows.UI.Color.FromArgb((byte)(automatic ? 210 : 255), 242, 242, 247);
             if (footerFade.GradientStops.Count == 2)
             {
@@ -355,12 +382,13 @@ namespace OffWorkWidget.WinUI
             inkBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 242, 242, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
             subInkBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 174, 174, 182) : Windows.UI.Color.FromArgb(255, 107, 107, 116);
             cardBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 80 : 255), 40, 40, 44) : Windows.UI.Color.FromArgb((byte)(automatic ? 115 : 255), 255, 255, 255);
+            selectionBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 76, 76, 82) : Windows.UI.Color.FromArgb(255, 224, 224, 229);
             inputBackgroundBrush.Color = dark
-                ? (automatic ? Windows.UI.Color.FromArgb(240, 18, 18, 22) : Windows.UI.Color.FromArgb(255, 28, 28, 30))
-                : (automatic ? Windows.UI.Color.FromArgb(240, 220, 224, 234) : Windows.UI.Color.FromArgb(255, 242, 243, 247));
+                ? (automatic ? Windows.UI.Color.FromArgb(220, 48, 48, 52) : Windows.UI.Color.FromArgb(255, 28, 28, 30))
+                : (automatic ? Windows.UI.Color.FromArgb(225, 243, 244, 247) : Windows.UI.Color.FromArgb(255, 242, 243, 247));
             timeHoverBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 48, 48, 54) : automatic ? Windows.UI.Color.FromArgb(255, 210, 215, 227) : Windows.UI.Color.FromArgb(255, 233, 234, 241);
             timePressedBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 58, 58, 64) : automatic ? Windows.UI.Color.FromArgb(255, 200, 206, 221) : Windows.UI.Color.FromArgb(255, 221, 223, 233);
-            dividerBrush.Color = dark ? Windows.UI.Color.FromArgb(160, 80, 80, 88) : Windows.UI.Color.FromArgb(180, 218, 220, 228);
+            dividerBrush.Color = dark ? Windows.UI.Color.FromArgb(160, 80, 80, 88) : Windows.UI.Color.FromArgb(100, 204, 207, 215);
 
             foreach (var card in cardBorders)
             {
@@ -444,12 +472,16 @@ namespace OffWorkWidget.WinUI
         void BuildHeader()
         {
             var header = new Grid { Height = 40, Padding = new Thickness(16, 4, 16, 0), Background = headerBackgroundBrush };
-            compactTitle = new TextBlock { Text = "把下班，设成期待", FontSize = 16, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 0, 108, 0), TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center, Opacity = 0 };
+            compactTitle = new TextBlock { Text = Title, FontSize = 24, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Left, IsHitTestVisible = false, IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center, Opacity = 1 };
             header.Children.Add(compactTitle);
+            Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetIsTranslationEnabled(compactTitle, true);
+            var titleVisual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(compactTitle);
+            titleVisual.Properties.InsertVector3("Translation", new System.Numerics.Vector3(0, 40, 0));
+            compactTitle.SizeChanged += (_, __) => titleVisual.CenterPoint = new System.Numerics.Vector3(0, (float)compactTitle.ActualHeight / 2, 0);
             var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
             autoAppearanceButton = CreateHeaderIconButton("\uE7F4", "系统自适应：随背景明暗变化", () => ChangeAppearance(true));
             nightAppearanceButton = CreateHeaderIconButton("\uE708", "切换日间或夜间模式", () => ChangeAppearance(false));
-            var closeBtn = CreateHeaderIconButton("\uE711", "关闭设置", () => Close());
+            var closeBtn = CreateHeaderIconButton("\uE711", "关闭设置", () => CloseSettings());
             right.Children.Add(autoAppearanceButton); right.Children.Add(nightAppearanceButton); right.Children.Add(closeBtn);
             header.Children.Add(right);
             SetTitleBar(header);
@@ -483,15 +515,12 @@ namespace OffWorkWidget.WinUI
             };
 
             toolbar = new Border { Child = header, BorderBrush = dividerBrush };
+            Canvas.SetZIndex(toolbar, 2);
             Grid.SetRow(toolbar, 0); root.Children.Add(toolbar);
         }
 
-        void BuildHero()
+        void BuildPetSelector()
         {
-            var hero = new Grid { Height = 64, Margin = new Thickness(0, 0, 0, 12) };
-            hero.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            hero.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            hero.Children.Add(new TextBlock { Text = "把下班，设成期待", FontSize = 22, FontWeight = Microsoft.UI.Text.FontWeights.Bold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
             var petBtn = new Button
             {
                 Padding = new Thickness(6, 4, 6, 4),
@@ -526,7 +555,7 @@ namespace OffWorkWidget.WinUI
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
                 row.Children.Add(new Image { Source = PetImage(id), Width = 32, Height = 34 });
                 var name = new TextBlock { Text = PetName(id), FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
-                var check = new FontIcon { Glyph = "\uE73E", FontFamily = new FontFamily("Segoe Fluent Icons"), FontSize = 13, Foreground = accentBlue };
+                var check = new FontIcon { Glyph = "\uE73E", FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontSize = 13, Foreground = accentBlue };
                 Grid.SetColumn(name, 1); row.Children.Add(name); Grid.SetColumn(check, 2); row.Children.Add(check);
                 var item = new Button { Content = row, Height = 46, Padding = new Thickness(8, 4, 8, 4), CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
                 item.FocusVisualPrimaryBrush = accentBlue; item.FocusVisualPrimaryThickness = new Thickness(1.5);
@@ -557,16 +586,40 @@ namespace OffWorkWidget.WinUI
             };
             petBtn.Flyout = petMenu;
             ToolTipService.SetToolTip(petBtn, "切换桌面宠物");
-            Grid.SetColumn(petBtn, 1); hero.Children.Add(petBtn);
-            form.Children.Add(hero);
+            petSelector = petBtn;
+        }
+
+        void BindTitleTransition()
+        {
+            var scroll = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetScrollViewerManipulationPropertySet(settingsScroll);
+            var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(compactTitle);
+            var compositor = visual.Compositor;
+            var scale = compositor.CreateExpressionAnimation("Vector3(1 - Clamp(-scroll.Translation.Y / 56, 0, 1) / 3, 1 - Clamp(-scroll.Translation.Y / 56, 0, 1) / 3, 1)");
+            scale.SetReferenceParameter("scroll", scroll);
+            var position = compositor.CreateExpressionAnimation("40 * (1 - Clamp(-scroll.Translation.Y / 56, 0, 1))");
+            position.SetReferenceParameter("scroll", scroll);
+            visual.StartAnimation("Scale", scale);
+            visual.StartAnimation("Translation.Y", position);
         }
 
         void UpdateScrollChrome()
         {
-            double amount = Math.Clamp((settingsScroll.VerticalOffset - 24) / 32, 0, 1);
-            compactTitle.Opacity = amount;
+            compactTitle.Opacity = 1;
             UpdateHeaderTransition();
-            if (backToTop != null) backToTop.Visibility = settingsScroll.VerticalOffset > 32 ? Visibility.Visible : Visibility.Collapsed;
+            if (backToTop != null)
+            {
+                double reveal = animationSettings.AnimationsEnabled
+                    ? Math.Clamp((settingsScroll.VerticalOffset - 120) / 80, 0, 1)
+                    : settingsScroll.VerticalOffset > 160 ? 1 : 0;
+                footerCancel.Margin = new Thickness(0, 0, 46 * reveal, 0);
+                footerArrowScale.ScaleX = footerArrowScale.ScaleY = reveal;
+                backToTop.Opacity = reveal;
+                backToTop.IsEnabled = reveal > 0;
+                backToTop.IsHitTestVisible = reveal > 0;
+                backToTop.IsTabStop = reveal > 0;
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(backToTop,
+                    reveal > 0 ? Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Content : Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Raw);
+            }
         }
 
         void UpdateHeaderTransition()
@@ -587,23 +640,16 @@ namespace OffWorkWidget.WinUI
                 CornerRadius = new CornerRadius(15),
                 Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
                 BorderThickness = new Thickness(0),
-                Content = new FontIcon { Glyph = glyph, FontSize = 16, FontFamily = new FontFamily("Segoe Fluent Icons"), Foreground = subInkBrush }
+                Content = new FontIcon { Glyph = glyph, FontSize = 16, FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), Foreground = subInkBrush }
             };
             btn.Click += (_, __) => onClick();
             ToolTipService.SetToolTip(btn, tooltip);
             return btn;
         }
 
-        void BuildWorkingHoursCard()
+        void BuildWorkingHoursContent()
         {
-            var card = CreateCardBorder();
             var panel = new StackPanel();
-            var heading = new Grid { MinHeight = 24, Margin = new Thickness(0, 0, 0, 10) };
-            heading.Children.Add(new TextBlock { Text = "工作时段", FontSize = 14, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
-            panel.Children.Add(heading);
-            scheduleLabel = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) };
-            panel.Children.Add(scheduleLabel);
-
             var grid = new Grid { ColumnSpacing = 12 };
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -626,18 +672,20 @@ namespace OffWorkWidget.WinUI
             dayTimeSection = new StackPanel { Spacing = 8, Margin = new Thickness(0, 4, 0, 0), VerticalAlignment = VerticalAlignment.Top };
             var dayHeader = new Grid { ColumnSpacing = 8 };
             dayHeader.ColumnDefinitions.Add(new ColumnDefinition()); dayHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); dayHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            dayHeader.Children.Add(new TextBlock { Text = "按星期设置时段", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            dayHeader.Children.Add(new TextBlock { Text = "特殊工作时段", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
             dayTimeSummary = new TextBlock { FontSize = 12, Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(dayTimeSummary, 1); dayHeader.Children.Add(dayTimeSummary);
-            dayTimeChevron = CreateChevron(); Grid.SetColumn(dayTimeChevron, 2); dayHeader.Children.Add(dayTimeChevron);
+            dayTimeChevron = CreateChevron();
             var dayHeaderButton = new Button { Content = dayHeader, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), BorderThickness = new Thickness(0), Padding = new Thickness(0), MinHeight = 32, HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
+            var dayArrowSurface = CreateChevronSurface(dayHeaderButton, dayTimeChevron);
+            Grid.SetColumn(dayArrowSurface, 2); dayHeader.Children.Add(dayArrowSurface);
             dayHeaderButton.Resources["ButtonBackgroundPointerOver"] = dayHeaderButton.Background;
             dayHeaderButton.Resources["ButtonBackgroundPressed"] = dayHeaderButton.Background;
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(dayHeaderButton, "按星期设置时段，展开或收起");
             dayHeaderButton.Click += (_, __) => { dayTimeExpanded = !dayTimeExpanded; RefreshDayTimeEditor(); };
             dayTimeSection.Children.Add(dayHeaderButton);
-            dayTimeEditor = new StackPanel { Spacing = 8 };
-            var dayRow = new Grid { ColumnSpacing = 8 };
+            dayTimeEditor = new StackPanel();
+            var dayRow = new Grid { ColumnSpacing = 8, Margin = new Thickness(0, 0, 0, 8) };
             dayRow.ColumnDefinitions.Add(new ColumnDefinition()); dayRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             dayTimeDay = new ComboBox { Height = 34, MinWidth = 112, FontSize = 13, Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8), HorizontalAlignment = HorizontalAlignment.Left };
             foreach (string name in new[] { "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日" })
@@ -649,7 +697,7 @@ namespace OffWorkWidget.WinUI
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(dayTimeSwitch, "所选星期使用独立时段");
             dayTimeSwitch.Toggled += (_, __) => { if (loadingSchedule) return; dayTimeEnabled = dayTimeSwitch.IsOn; RememberDayTime(); RefreshDayTimeEditor(); };
             Grid.SetColumn(dayTimeSwitch, 1); dayRow.Children.Add(dayTimeSwitch); dayTimeEditor.Children.Add(dayRow);
-            dayTimeTimes = new Grid { ColumnSpacing = 12 };
+            dayTimeTimes = new Grid { ColumnSpacing = 12, Margin = new Thickness(0, 0, 0, 8) };
             dayTimeTimes.ColumnDefinitions.Add(new ColumnDefinition()); dayTimeTimes.ColumnDefinitions.Add(new ColumnDefinition());
             for (int i = 0; i < 2; i++)
             {
@@ -667,14 +715,14 @@ namespace OffWorkWidget.WinUI
                     value => { if (first) dayTimeStart = value; else dayTimeEnd = value; RememberDayTime(); }, first ? dayTimeStart : dayTimeEnd);
                 column.Children.Add(button); Grid.SetColumn(column, i); dayTimeTimes.Children.Add(column);
             }
-            dayTimeEditor.Children.Add(dayTimeTimes);
-            dayTimeEditor.Children.Add(new TextBlock { Text = "固定休息日不可设置；关闭开关沿用常规时间。时段仅在当天上班时生效。", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
+            dayTimeTimesReveal = new Border { Child = dayTimeTimes, Visibility = Visibility.Collapsed };
+            dayTimeEditor.Children.Add(dayTimeTimesReveal);
+            dayTimeEditor.Children.Add(new TextBlock { Text = "仅工作日生效，关闭时沿用上方时间。", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
             dayTimeSection.Children.Add(dayTimeEditor);
             dayTimeReveal = new Border { Child = dayTimeSection, Visibility = Visibility.Collapsed, Opacity = 0 };
             panel.Children.Add(dayTimeReveal);
             RefreshScheduleEditor();
-            card.Child = panel;
-            form.Children.Add(card);
+            workingHoursContent = panel;
         }
 
         void RememberSchedule()
@@ -725,7 +773,7 @@ namespace OffWorkWidget.WinUI
             if (scheduleMode != "double" && available.Count > 0 && !CanSetDayTime(editingDay))
             { RememberDayTime(); editingDay = available.OrderBy(d => (d + 6) % 7).First(); LoadDayTime(); }
             bool selectable = available.Count > 0 && CanSetDayTime(editingDay);
-            dayTimeTimes.Visibility = selectable && dayTimeEnabled ? Visibility.Visible : Visibility.Collapsed;
+            dayTimeTimesReveal.IsHitTestVisible = selectable && dayTimeEnabled;
             int count = dayTimes.Count(d => d.Enabled && CanSetDayTime(d.Day));
             dayTimeSummary.Text = available.Count == 0 ? "无每周工作日" : count == 0 ? "按需设置" : count + " 天已设置";
             loadingSchedule = true;
@@ -751,13 +799,22 @@ namespace OffWorkWidget.WinUI
         void UpdateDayTimeReveal(bool visible)
         {
             if (dayTimeReveal == null) return;
+            double contentWidth = Math.Max(1, dayTimeSection.ActualWidth > 0 ? dayTimeSection.ActualWidth : form.ActualWidth - 32);
+            double previousTimesFrom = dayTimeTimesFrom, previousTimesOpacity = dayTimeTimesOpacityFrom;
+            dayTimeTimesFrom = dayTimeTimesReveal.Visibility == Visibility.Collapsed ? 0
+                : double.IsNaN(dayTimeTimesReveal.Height) ? dayTimeTimesReveal.ActualHeight : dayTimeTimesReveal.Height;
+            dayTimeTimesOpacityFrom = dayTimeTimesReveal.Visibility == Visibility.Collapsed ? 0 : dayTimeTimesReveal.Opacity;
+            dayTimeTimes.Measure(new Windows.Foundation.Size(contentWidth, double.PositiveInfinity));
+            dayTimeTimesTo = CanSetDayTime(editingDay) && dayTimeEnabled ? dayTimeTimes.DesiredSize.Height : 0;
+            dayTimeTimesReveal.Visibility = Visibility.Visible;
+            dayTimeTimesReveal.Height = dayTimeTimesTo;
             double fullHeight = double.IsNaN(dayTimeSection.Height) ? dayTimeSection.ActualHeight : dayTimeSection.Height;
             if (visible)
             {
                 if (dayTimeEditor.Visibility == Visibility.Collapsed) dayTimeEditor.Opacity = 0;
                 dayTimeEditor.Visibility = Visibility.Visible;
                 dayTimeSection.Height = double.NaN;
-                dayTimeSection.Measure(new Windows.Foundation.Size(Math.Max(1, form.ActualWidth - 32), double.PositiveInfinity));
+                dayTimeSection.Measure(new Windows.Foundation.Size(contentWidth, double.PositiveInfinity));
                 fullHeight = dayTimeSection.DesiredSize.Height;
             }
             double headerHeight = ((FrameworkElement)dayTimeSection.Children[0]).DesiredSize.Height + dayTimeSection.Margin.Top + dayTimeSection.Margin.Bottom;
@@ -766,7 +823,12 @@ namespace OffWorkWidget.WinUI
             dayTimeEditor.IsHitTestVisible = editorOpacity > 0;
             double angle = dayTimeExpanded ? 90 : 0;
             if (animatingDayTimeReveal && Math.Abs(height - dayTimeRevealTargetHeight) < .5 && opacity == dayTimeRevealTargetOpacity && angle == dayTimeArrowTarget && editorOpacity == dayTimeEditorTargetOpacity)
-            { dayTimeSection.Height = fullHeight; return; }
+            {
+                dayTimeTimesReveal.Height = dayTimeTimesFrom;
+                dayTimeTimesFrom = previousTimesFrom; dayTimeTimesOpacityFrom = previousTimesOpacity;
+                dayTimeSection.Height = Math.Max(0, fullHeight - dayTimeSection.Margin.Top - dayTimeSection.Margin.Bottom);
+                return;
+            }
             double currentHeight = animatingDayTimeReveal ? dayTimeRevealHeight : dayTimeReveal.Visibility == Visibility.Collapsed ? 0 : dayTimeReveal.ActualHeight;
             dayTimeRevealStartHeight = currentHeight; dayTimeRevealTargetHeight = height;
             dayTimeRevealStartOpacity = dayTimeReveal.Opacity; dayTimeRevealTargetOpacity = opacity;
@@ -775,7 +837,7 @@ namespace OffWorkWidget.WinUI
             dayTimeReveal.IsHitTestVisible = visible;
             if (!root.IsLoaded || !animationSettings.AnimationsEnabled || (Math.Abs(height - currentHeight) < .5 && Math.Abs(opacity - dayTimeReveal.Opacity) < .01 && Math.Abs(editorOpacity - dayTimeEditor.Opacity) < .01))
             { FinishDayTimeReveal(); return; }
-            dayTimeSection.Height = fullHeight;
+            dayTimeSection.Height = Math.Max(0, fullHeight - dayTimeSection.Margin.Top - dayTimeSection.Margin.Bottom);
             dayTimeReveal.Visibility = Visibility.Visible;
             dayTimeRevealClock.Restart();
             if (!animatingDayTimeReveal) { animatingDayTimeReveal = true; CompositionTarget.Rendering += AnimateDayTimeReveal; }
@@ -790,6 +852,11 @@ namespace OffWorkWidget.WinUI
             double opacity = dayTimeRevealStartOpacity + (dayTimeRevealTargetOpacity - dayTimeRevealStartOpacity) * eased;
             dayTimeReveal.Height = dayTimeRevealHeight; dayTimeReveal.Opacity = opacity;
             dayTimeEditor.Opacity = dayTimeEditorStartOpacity + (dayTimeEditorTargetOpacity - dayTimeEditorStartOpacity) * eased;
+            double timesHeight = dayTimeTimesFrom + (dayTimeTimesTo - dayTimeTimesFrom) * eased;
+            dayTimeTimesReveal.Height = timesHeight;
+            dayTimeTimesReveal.Opacity = dayTimeTimesOpacityFrom + ((dayTimeTimesTo > 0 ? 1 : 0) - dayTimeTimesOpacityFrom) * eased;
+            dayTimeTimesClip.Rect = new Windows.Foundation.Rect(0, 0, Math.Max(1, dayTimeSection.ActualWidth), Math.Max(0, timesHeight));
+            dayTimeTimesReveal.Clip = dayTimeTimesClip;
             dayTimeReveal.Margin = new Thickness(0, 10 * opacity, 0, 0);
             dayTimeRevealClip.Rect = new Windows.Foundation.Rect(0, 0, Math.Max(1, form.ActualWidth - 32), Math.Max(0, dayTimeRevealHeight));
             dayTimeReveal.Clip = dayTimeRevealClip;
@@ -803,6 +870,9 @@ namespace OffWorkWidget.WinUI
             dayTimeReveal.Visibility = dayTimeRevealTargetOpacity > 0 ? Visibility.Visible : Visibility.Collapsed;
             dayTimeReveal.Opacity = dayTimeRevealTargetOpacity; dayTimeReveal.Height = double.NaN;
             dayTimeReveal.Margin = new Thickness(0, 10 * dayTimeRevealTargetOpacity, 0, 0); dayTimeReveal.Clip = null; dayTimeSection.Height = double.NaN;
+            dayTimeTimesReveal.Visibility = dayTimeTimesTo > 0 ? Visibility.Visible : Visibility.Collapsed;
+            dayTimeTimesReveal.Height = double.NaN; dayTimeTimesReveal.Clip = null;
+            dayTimeTimesReveal.Opacity = dayTimeTimesTo > 0 ? 1 : 0;
             dayTimeEditor.Opacity = dayTimeEditorTargetOpacity;
             dayTimeEditor.Visibility = dayTimeEditorTargetOpacity > 0 ? Visibility.Visible : Visibility.Collapsed;
             dayTimeChevron.RenderTransform = new RotateTransform { Angle = dayTimeArrowTarget };
@@ -835,9 +905,7 @@ namespace OffWorkWidget.WinUI
 
         void RefreshScheduleEditor()
         {
-            if (scheduleLabel == null || dayTimeTimes == null) return;
-            string name = scheduleMode == "double" ? "双休" : scheduleMode == "single" ? "单休" : scheduleMode == "alternating" ? "大小周" : "自定义";
-            scheduleLabel.Text = name + " · 常规工作时段";
+            if (dayTimeTimes == null) return;
             startTimeDisplay.Text = FormatTime(startTime); endTimeDisplay.Text = FormatTime(endTime);
             RefreshDayTimeEditor();
         }
@@ -1066,24 +1134,40 @@ namespace OffWorkWidget.WinUI
 
         void BuildAccordionGroup()
         {
-            var stack = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
-            incomeContent = new Border { Child = new Border { Child = BuildIncomeContent(), Padding = new Thickness(16, 8, 16, 18) }, Visibility = Visibility.Collapsed };
-            restContent = new Border { Child = new Border { Child = BuildRestContent(), Padding = new Thickness(16, 8, 16, 18) }, Visibility = Visibility.Collapsed };
-            careContent = new Border { Child = new Border { Child = BuildCareContent(), Padding = new Thickness(16, 8, 16, 18) }, Visibility = Visibility.Collapsed };
+            var stack = new StackPanel();
+            var restExtras = BuildRestContent();
+            var workAndRest = new StackPanel { Spacing = 14 };
+            workAndRest.Children.Add(restPlanContent);
+            workAndRest.Children.Add(workingHoursContent);
+            workAndRest.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            workAndRest.Children.Add(restExtras);
+            incomeContent = new Border { Child = new Border { Child = BuildIncomeContent(), Padding = new Thickness(16, 4, 16, 18) }, Visibility = Visibility.Collapsed };
+            restContent = new Border { Child = new Border { Child = workAndRest, Padding = new Thickness(16, 4, 16, 18) }, Visibility = Visibility.Collapsed };
+            careContent = new Border { Child = new Border { Child = BuildCareContent(), Padding = new Thickness(16, 4, 16, 18) }, Visibility = Visibility.Collapsed };
             var headers = new[] {
-                CreateAccordionHeader("薪水与小秘密", out incomeChevron, () => ToggleAccordion(1)),
-                CreateAccordionHeader("把休息安排上", out restChevron, () => ToggleAccordion(2)),
-                CreateAccordionHeader("喝口水，动一动", out careChevron, () => ToggleAccordion(3)) };
+                CreateAccordionHeader("薪资与隐私", out incomeChevron, () => ToggleAccordion(1), 0),
+                CreateAccordionHeader("工作与休息", out restChevron, () => ToggleAccordion(2), 1),
+                CreateAccordionHeader("健康提醒", out careChevron, () => ToggleAccordion(3), 2) };
             var contents = new[] { incomeContent, restContent, careContent };
-            for (int i = 0; i < 3; i++)
+            foreach (int i in new[] { 1, 0, 2 })
             {
                 var body = new StackPanel(); body.Children.Add(headers[i]); body.Children.Add(contents[i]);
-                if (i < 2) { accordionDividers[i] = CreateDivider(); accordionDividers[i].Margin = new Thickness(16, 0, 16, 0); body.Children.Add(accordionDividers[i]); }
                 accordionCards[i] = CreateCardBorder(new Thickness(0)); accordionCards[i].Child = body;
                 stack.Children.Add(accordionCards[i]);
             }
+            accordionProgress[1] = accordionStart[1] = accordionTarget[1] = 1;
+            restContent.Visibility = Visibility.Visible;
+            restChevron.RenderTransform = new RotateTransform { Angle = 90 };
             UpdateAccordionChrome();
             form.Children.Add(stack);
+        }
+        Border CreateChevronSurface(Button owner, Grid icon)
+        {
+            var clear = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            var surface = new Border { Width = 24, Height = 24, CornerRadius = new CornerRadius(12), Background = clear, Child = icon };
+            owner.PointerEntered += (_, __) => surface.Background = timeHoverBrush;
+            owner.PointerExited += (_, __) => surface.Background = clear;
+            return surface;
         }
 
         Grid CreateChevron(double angle = 0)
@@ -1098,7 +1182,7 @@ namespace OffWorkWidget.WinUI
             return icon;
         }
 
-        UIElement CreateAccordionHeader(string titleText, out Grid chevron, Action onToggle)
+        UIElement CreateAccordionHeader(string titleText, out Grid chevron, Action onToggle, int summaryIndex)
         {
             var btn = new Button
             {
@@ -1106,7 +1190,7 @@ namespace OffWorkWidget.WinUI
                 HorizontalContentAlignment = HorizontalAlignment.Stretch,
                 Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
                 BorderThickness = new Thickness(0),
-                Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(4),
+                Padding = new Thickness(12, 12, 12, 12), Margin = new Thickness(4),
                 CornerRadius = new CornerRadius(12)
             };
             var transparent = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
@@ -1122,7 +1206,12 @@ namespace OffWorkWidget.WinUI
             btn.PointerEntered += (_, __) => chevronSurface.Background = timeHoverBrush;
             btn.PointerExited += (_, __) => chevronSurface.Background = transparent;
 
-            Grid.SetColumn(title, 0); grid.Children.Add(title);
+            var labels = new StackPanel { Spacing = 2 };
+            labels.Children.Add(title);
+            var summary = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextTrimming = TextTrimming.CharacterEllipsis, Height = 18 };
+            accordionSummaries[summaryIndex] = summary;
+            labels.Children.Add(summary);
+            Grid.SetColumn(labels, 0); grid.Children.Add(labels);
             Grid.SetColumn(chevronSurface, 1); grid.Children.Add(chevronSurface);
             btn.Content = grid;
             btn.Click += (_, __) => onToggle();
@@ -1131,16 +1220,17 @@ namespace OffWorkWidget.WinUI
 
         void EnsureAccordionExpanded(int index)
         {
-            if (expandedAccordion != index) ToggleAccordion(index);
+            if (index == 2 ? !workSectionExpanded : expandedAccordion != index) ToggleAccordion(index);
         }
 
         void ToggleAccordion(int index)
         {
-            expandedAccordion = expandedAccordion == index ? 0 : index;
+            if (index == 2) workSectionExpanded = !workSectionExpanded;
+            else expandedAccordion = expandedAccordion == index ? 0 : index;
             for (int i = 0; i < 3; i++)
             {
                 accordionStart[i] = accordionProgress[i];
-                accordionTarget[i] = expandedAccordion == i + 1 ? 1 : 0;
+                accordionTarget[i] = (i == 1 ? workSectionExpanded : expandedAccordion == i + 1) ? 1 : 0;
             }
             accordionClock.Restart();
             if (!animatingAccordion) { animatingAccordion = true; CompositionTarget.Rendering += AnimateAccordion; }
@@ -1149,20 +1239,27 @@ namespace OffWorkWidget.WinUI
 
         void UpdateAccordionChrome()
         {
+            if (accordionSummaries.All(summary => summary != null))
+            {
+                string mode = scheduleMode == "double" ? "双休" : scheduleMode == "single" ? "单休" : scheduleMode == "alternating" ? "大小周" : "自定义";
+                accordionSummaries[1]!.Text = FormatTime(startTime).Replace(" ", "") + "–" + FormatTime(endTime).Replace(" ", "") + " · " + mode;
+                accordionSummaries[0]!.Text = "金额保护 · 每月 " + payDay.Text + " 日发薪";
+                var reminders = new List<string>();
+                if (water.IsOn) reminders.Add("喝水 " + FormatReminderInterval(waterMinutes));
+                if (walk.IsOn) reminders.Add("走动 " + FormatReminderInterval(walkMinutes));
+                accordionSummaries[2]!.Text = reminders.Count == 0 ? "提醒已关闭" : string.Join(" · ", reminders);
+            }
             for (int i = 0; i < 3; i++)
             {
-                double top = i == 0 ? 1 : Math.Max(accordionProgress[i - 1], accordionProgress[i]);
-                double bottom = i == 2 ? 1 : Math.Max(accordionProgress[i], accordionProgress[i + 1]);
-                accordionCards[i].CornerRadius = new CornerRadius(18 * top, 18 * top, 18 * bottom, 18 * bottom);
-                accordionCards[i].Margin = new Thickness(0, 0, 0, i < 2 ? 10 * bottom : 0);
-                if (i < 2)
+                accordionCards[i].CornerRadius = new CornerRadius(18);
+                accordionCards[i].Margin = new Thickness(0, 0, 0, 10);
+                if (accordionSummaries[i] is TextBlock summary)
                 {
-                    accordionDividers[i].Opacity = 1 - bottom;
-                    accordionDividers[i].Height = 1 - bottom;
+                    summary.Height = 18 * (1 - accordionProgress[i]);
+                    summary.Opacity = 1 - accordionProgress[i];
                 }
             }
         }
-
         void AnimateAccordion(object? sender, object args)
         {
             bool enabled = animationSettings.AnimationsEnabled;
@@ -1197,15 +1294,26 @@ namespace OffWorkWidget.WinUI
 
         void BuildDesktopLayoutCard()
         {
-            var card = CreateCardBorder(new Thickness(16, 12, 16, 10));
-            card.Child = CreateScaleRuler();
+            var card = CreateCardBorder();
+            appearanceOptions = new StackPanel { Spacing = 14 };
+            appearanceOptions.Children.Add(new TextBlock { Text = "桌面设置", FontSize = 14, Foreground = inkBrush, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+            var appearanceBody = new StackPanel { Spacing = 14 };
+            var petRow = new Grid();
+            petRow.ColumnDefinitions.Add(new ColumnDefinition());
+            petRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            petRow.Children.Add(new TextBlock { Text = "桌面宠物", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            Grid.SetColumn(petSelector, 1); petRow.Children.Add(petSelector);
+            appearanceBody.Children.Add(petRow);
+            appearanceBody.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            appearanceBody.Children.Add(CreateScaleRuler());
+            appearanceOptions.Children.Add(CreateOptionsSection("外观", appearanceBody));
+            card.Child = appearanceOptions;
             form.Children.Add(card);
         }
-
         FrameworkElement CreateScaleRuler()
         {
             var header = new Grid();
-            scaleLabel = new TextBlock { Text = "桌面布局", FontSize = 14, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
+            scaleLabel = new TextBlock { Text = "挂件大小", FontSize = 13, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
             scaleReadout = new TextBlock { TextAlignment = TextAlignment.Center, VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false, FontSize = 13, FontFamily = new FontFamily("Segoe UI"), FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush };
             header.Children.Add(scaleLabel);
             var band = new Grid { Height = 52 };
@@ -1403,25 +1511,21 @@ namespace OffWorkWidget.WinUI
 
             var eyeBtn = new Button
             {
-                Width = 24, Height = 20, Padding = new Thickness(0),
-                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
-                BorderThickness = new Thickness(0),
+                Width = 24, Height = 24, MinWidth = 0, MinHeight = 0, Padding = new Thickness(0),
+                Background = inputBackgroundBrush, Foreground = subInkBrush,
+                BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(12),
                 VerticalAlignment = VerticalAlignment.Center
             };
-            var eyeGrid = new Grid { Width = 16, Height = 14 };
-            var eyePath = new Microsoft.UI.Xaml.Shapes.Path
+            salaryVisibilityIcon = new FontIcon
             {
-                Data = (Geometry)Microsoft.UI.Xaml.Markup.XamlBindingHelper.ConvertValue(typeof(Geometry), "M1,7 C4,1 12,1 15,7 C12,13 4,13 1,7 Z M10,7 A2,2 0 1 1 6,7 A2,2 0 1 1 10,7"),
-                Stroke = subInkBrush, StrokeThickness = 1.2
+                FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontSize = 14, IsTextScaleFactorEnabled = false,
+                Glyph = salaryAuthorized ? "\uE890" : "\uED1A", Foreground = subInkBrush
             };
-            eyeSlash = new Microsoft.UI.Xaml.Shapes.Path
-            {
-                Data = (Geometry)Microsoft.UI.Xaml.Markup.XamlBindingHelper.ConvertValue(typeof(Geometry), "M2,1 L14,13"),
-                Stroke = subInkBrush, StrokeThickness = 1.4,
-                Visibility = salaryAuthorized ? Visibility.Collapsed : Visibility.Visible
-            };
-            eyeGrid.Children.Add(eyePath); eyeGrid.Children.Add(eyeSlash);
-            eyeBtn.Content = eyeGrid;
+            eyeBtn.Content = salaryVisibilityIcon;
+            eyeBtn.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+            eyeBtn.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            eyeBtn.Resources["ButtonForegroundPointerOver"] = inkBrush;
+            eyeBtn.Resources["ButtonForegroundPressed"] = inkBrush;
             eyeBtn.Click += async (_, __) =>
             {
                 if (salaryAuthorized)
@@ -1482,15 +1586,18 @@ namespace OffWorkWidget.WinUI
             durationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             durationRow.Children.Add(new TextBlock { Text = "显示时长", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
             amountDurationSeconds = Math.Clamp(current.AmountVisibleSeconds, 0, 86400);
-            amountDurationDisplay = new TextBlock { Text = FormatAmountDuration(amountDurationSeconds), Foreground = inkBrush, FontSize = 16 };
-            var durationValue = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
-            durationValue.Children.Add(amountDurationDisplay);
-            durationValue.Children.Add(new TextBlock { Text = "分:秒", FontSize = 11, Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center });
+            amountDurationDisplay = new TextBlock
+            {
+                Text = FormatAmountDuration(amountDurationSeconds), Foreground = inkBrush, FontSize = 16,
+                TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
             amountDurationButton = new Button
             {
-                Content = durationValue, Width = 136, Height = 36, CornerRadius = new CornerRadius(8),
-                Background = inputBackgroundBrush, BorderThickness = new Thickness(0),
-                HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center
+                Content = amountDurationDisplay, Width = 136, Height = 36, CornerRadius = new CornerRadius(8),
+                Background = inputBackgroundBrush, BorderThickness = new Thickness(0), Padding = new Thickness(0),
+                HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center
             };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(amountDurationButton, "金额显示时长，分钟和秒");
             amountDurationButton.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
@@ -1511,36 +1618,43 @@ namespace OffWorkWidget.WinUI
 
             var pwdBtns = new Grid { ColumnSpacing = 10 };
             pwdBtns.ColumnDefinitions.Add(new ColumnDefinition());
-            pwdBtns.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            pwdBtns.ColumnDefinitions.Add(new ColumnDefinition());
             var changePwd = new Button
             {
-                Content = "管理密码", Width = 136, Height = 34, CornerRadius = new CornerRadius(8),
+                Content = "管理密码", FontSize = 13, MinWidth = 0, Height = 34, CornerRadius = new CornerRadius(8),
                 Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0),
-                HorizontalAlignment = HorizontalAlignment.Left, Padding = new Thickness(12, 4, 12, 4)
+                HorizontalAlignment = HorizontalAlignment.Stretch, Padding = new Thickness(12, 4, 12, 4)
             };
             changePwd.Click += async (_, __) =>
             {
                 if (privacyPromptOpen) return;
                 privacyPromptOpen = true;
-                try { if (!await PrivacyPrompts.ChangeAsync(root.XamlRoot, privacy)) LockSalaryEditor(); }
+                try { if (!await PrivacyPrompts.ChangeAsync(root.XamlRoot, privacy, root.ActualTheme)) LockSalaryEditor(); }
                 catch (Exception ex) { error.Text = ex.Message; error.Visibility = Visibility.Visible; }
                 finally { ReconcilePrivacyAfterDialog(); privacyPromptOpen = false; }
             };
             pwdBtns.Children.Add(changePwd);
 
-            var forgotPwd = new HyperlinkButton
+            var forgotPwd = new Button
             {
-                Content = "忘记密码", FontSize = 12, Height = 34, CornerRadius = new CornerRadius(8),
-                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Foreground = subInkBrush, BorderThickness = new Thickness(0),
-                HorizontalAlignment = HorizontalAlignment.Right, Padding = new Thickness(4, 0, 0, 0)
+                Content = "忘记密码", FontSize = 13, MinWidth = 0, Height = 34, CornerRadius = new CornerRadius(8),
+                Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0),
+                HorizontalAlignment = HorizontalAlignment.Stretch, Padding = new Thickness(12, 4, 12, 4)
             };
+            foreach (var action in new[] { changePwd, forgotPwd })
+            {
+                action.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+                action.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+                action.Resources["ButtonForegroundPointerOver"] = inkBrush;
+                action.Resources["ButtonForegroundPressed"] = inkBrush;
+            }
             forgotPwd.Click += async (_, __) =>
             {
                 if (privacyPromptOpen) return;
                 privacyPromptOpen = true;
                 try
                 {
-                    if (await PrivacyPrompts.ResetAsync(root.XamlRoot, privacy))
+                    if (await PrivacyPrompts.ResetAsync(root.XamlRoot, privacy, root.ActualTheme))
                     {
                         current.Salary = privacy.LoadSalary();
                         hideSalary();
@@ -1594,13 +1708,13 @@ namespace OffWorkWidget.WinUI
             privacyPromptOpen = true;
             try
             {
-                bool unlocked = await PrivacyPrompts.UnlockAsync(root.XamlRoot, privacy);
+                bool unlocked = await PrivacyPrompts.UnlockAsync(root.XamlRoot, privacy, root.ActualTheme);
                 if (ReconcilePrivacyAfterDialog() && unlocked)
                 {
                     salaryAuthorized = true;
                     salary.IsReadOnly = false;
                     salary.Text = salaryDraft ?? privacy.LoadSalary().ToString(CultureInfo.InvariantCulture);
-                    eyeSlash.Visibility = Visibility.Collapsed;
+                    salaryVisibilityIcon.Glyph = "\uE890";
                     salary.Focus(FocusState.Programmatic);
                 }
                 else if (!unlocked)
@@ -1619,7 +1733,7 @@ namespace OffWorkWidget.WinUI
         {
             var panel = new StackPanel { Spacing = 10 };
 
-            var presets = new Grid { ColumnSpacing = 6 };
+            var presets = new Grid { ColumnSpacing = 2 };
             restPresetButtons.Clear();
             string[] presetNames = { "双休", "单休", "大小周", "自定义" };
             for (int i = 0; i < presetNames.Length; i++)
@@ -1630,13 +1744,13 @@ namespace OffWorkWidget.WinUI
                 {
                     Content = presetNames[i], MinHeight = 32, CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0),
                     Padding = new Thickness(4, 4, 4, 4), MinWidth = 0, FontSize = 13, HorizontalAlignment = HorizontalAlignment.Stretch,
-                    Background = inputBackgroundBrush, Foreground = inkBrush
+                    Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Foreground = inkBrush
                 };
                 foreach (string state in new[] { "", "PointerOver", "Pressed" })
                 {
-                    preset.Resources["ToggleButtonBackgroundChecked" + state] = accentBlue;
-                    preset.Resources["ToggleButtonForegroundChecked" + state] = new SolidColorBrush(Microsoft.UI.Colors.White);
-                    preset.Resources["ToggleButtonBorderBrushChecked" + state] = accentBlue;
+                    preset.Resources["ToggleButtonBackgroundChecked" + state] = selectionBackgroundBrush;
+                    preset.Resources["ToggleButtonForegroundChecked" + state] = inkBrush;
+                    preset.Resources["ToggleButtonBorderBrushChecked" + state] = selectionBackgroundBrush;
                 }
                 preset.Click += (_, __) =>
                 {
@@ -1646,8 +1760,7 @@ namespace OffWorkWidget.WinUI
                 };
                 restPresetButtons.Add(preset); Grid.SetColumn(preset, i); presets.Children.Add(preset);
             }
-            panel.Children.Add(presets);
-            panel.Children.Add(new TextBlock { Text = "上方工作时段随方案切换，分别保存", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
+            panel.Children.Add(new Border { Background = inputBackgroundBrush, CornerRadius = new CornerRadius(10), Padding = new Thickness(3), Child = presets });
 
             alternatingWeekRow = new Grid { ColumnSpacing = 8 };
             alternatingWeekRow.ColumnDefinitions.Add(new ColumnDefinition());
@@ -1687,16 +1800,16 @@ namespace OffWorkWidget.WinUI
                 };
                 foreach (string state in new[] { "", "PointerOver", "Pressed" })
                 {
-                    cb.Resources["ToggleButtonBackgroundChecked" + state] = accentBlue;
-                    cb.Resources["ToggleButtonForegroundChecked" + state] = new SolidColorBrush(Microsoft.UI.Colors.White);
-                    cb.Resources["ToggleButtonBorderBrushChecked" + state] = accentBlue;
+                    cb.Resources["ToggleButtonBackgroundChecked" + state] = selectionBackgroundBrush;
+                    cb.Resources["ToggleButtonForegroundChecked" + state] = inkBrush;
+                    cb.Resources["ToggleButtonBorderBrushChecked" + state] = selectionBackgroundBrush;
                 }
                 void UpdateDay()
                 {
                     bool selected = cb.IsChecked == true;
-                    cb.Background = selected ? accentBlue : inputBackgroundBrush;
-                    cb.Foreground = selected ? new SolidColorBrush(Microsoft.UI.Colors.White) : inkBrush;
-                    cb.BorderBrush = selected ? accentBlue : dividerBrush;
+                    cb.Background = selected ? selectionBackgroundBrush : inputBackgroundBrush;
+                    cb.Foreground = inkBrush;
+                    cb.BorderBrush = selected ? selectionBackgroundBrush : dividerBrush;
                     string description = day + (selected ? "：休息日" : "：工作日");
                     Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(cb, description);
                     ToolTipService.SetToolTip(cb, description);
@@ -1726,8 +1839,10 @@ namespace OffWorkWidget.WinUI
             restWeekHint = new TextBlock { FontSize = 12, LineHeight = 19, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
             panel.Children.Add(restWeekHint);
             UpdateRestPresets();
+            restPlanContent = panel;
+            panel = new StackPanel { Spacing = 10 };
 
-            panel.Children.Add(new Border { Height = 1, Background = dividerBrush, Margin = new Thickness(0, 4, 0, 4) });
+
 
             var holidayRow = new Grid();
             holidayRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1736,7 +1851,7 @@ namespace OffWorkWidget.WinUI
             holidays = CreateGreenSwitch(current.UseChinaHolidays);
             Grid.SetColumn(holidayTitle, 0); holidayRow.Children.Add(holidayTitle);
             Grid.SetColumn(holidays, 1); holidayRow.Children.Add(holidays);
-            panel.Children.Add(holidayRow);
+
 
             var holidayStatusRow = new Grid();
             holidayStatusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -1755,10 +1870,20 @@ namespace OffWorkWidget.WinUI
             };
             Grid.SetColumn(holidayStatus, 0); holidayStatusRow.Children.Add(holidayStatus);
             Grid.SetColumn(updateBtn, 1); holidayStatusRow.Children.Add(updateBtn);
-            panel.Children.Add(holidayStatusRow);
 
-            panel.Children.Add(new Border { Height = 1, Background = dividerBrush, Margin = new Thickness(0, 4, 0, 4) });
-            var adjustmentBody = new StackPanel { Spacing = 10, Visibility = Visibility.Collapsed };
+
+
+            var adjustmentBody = new StackPanel { Spacing = 10 };
+            adjustmentBody.Children.Add(holidayRow);
+            adjustmentBody.Children.Add(holidayStatusRow);
+            adjustmentBody.Children.Add(new Border { Height = 1, Background = dividerBrush, Margin = new Thickness(0, 4, 0, 4) });
+            adjustmentBody.Children.Add(new TextBlock { Text = "手动调休", FontSize = 14, FontWeight = Microsoft.UI.Text.FontWeights.Medium, Foreground = inkBrush });
+            var adjustmentReveal = new Border { Child = adjustmentBody, Padding = new Thickness(0, 10, 0, 0), Visibility = Visibility.Collapsed };
+            var adjustmentClip = new RectangleGeometry();
+            var adjustmentClock = new Stopwatch();
+            var adjustmentRotation = new RotateTransform();
+            bool adjustmentOpen = false, adjustmentAnimating = false;
+            double adjustmentHeight = 0, adjustmentFrom = 0, adjustmentTo = 0, adjustmentOpacityFrom = 0, adjustmentAngleFrom = 0;
             var adjustmentHeader = new Button
             {
                 Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), BorderThickness = new Thickness(0),
@@ -1771,20 +1896,67 @@ namespace OffWorkWidget.WinUI
             adjustmentTitle.ColumnDefinitions.Add(new ColumnDefinition());
             adjustmentTitle.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             adjustmentTitle.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            adjustmentTitle.Children.Add(new TextBlock { Text = "手动调休", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            adjustmentTitle.Children.Add(new TextBlock { Text = "调休", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
             adjustmentSummary = new TextBlock { FontSize = 12, Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center };
             Grid.SetColumn(adjustmentSummary, 1); adjustmentTitle.Children.Add(adjustmentSummary);
-            var adjustmentChevron = CreateChevron(); Grid.SetColumn(adjustmentChevron, 2); adjustmentTitle.Children.Add(adjustmentChevron);
+            var adjustmentChevron = CreateChevron();
+            var adjustmentArrowSurface = CreateChevronSurface(adjustmentHeader, adjustmentChevron);
+            Grid.SetColumn(adjustmentArrowSurface, 2); adjustmentTitle.Children.Add(adjustmentArrowSurface);
+            adjustmentChevron.RenderTransform = adjustmentRotation;
+            void FinishAdjustmentReveal()
+            {
+                CompositionTarget.Rendering -= AnimateAdjustmentReveal;
+                adjustmentAnimating = false; adjustmentClock.Stop();
+                adjustmentHeight = adjustmentTo;
+                adjustmentReveal.Visibility = adjustmentOpen ? Visibility.Visible : Visibility.Collapsed;
+                adjustmentReveal.Height = double.NaN; adjustmentReveal.Clip = null;
+                adjustmentBody.Height = double.NaN;
+                adjustmentReveal.Opacity = adjustmentOpen ? 1 : 0;
+                adjustmentRotation.Angle = adjustmentOpen ? 90 : 0;
+            }
+            void AnimateAdjustmentReveal(object? sender, object args)
+            {
+                double progress = animationSettings.AnimationsEnabled ? Math.Clamp(adjustmentClock.Elapsed.TotalMilliseconds / 260, 0, 1) : 1;
+                double eased = progress * progress * (3 - 2 * progress);
+                adjustmentHeight = adjustmentFrom + (adjustmentTo - adjustmentFrom) * eased;
+                adjustmentReveal.Height = adjustmentHeight;
+                adjustmentReveal.Opacity = adjustmentOpacityFrom + ((adjustmentOpen ? 1 : 0) - adjustmentOpacityFrom) * eased;
+                adjustmentClip.Rect = new Windows.Foundation.Rect(0, 0, Math.Max(1, panel.ActualWidth), Math.Max(0, adjustmentHeight));
+                adjustmentReveal.Clip = adjustmentClip;
+                adjustmentRotation.Angle = adjustmentAngleFrom + ((adjustmentOpen ? 90 : 0) - adjustmentAngleFrom) * eased;
+                if (progress >= 1) FinishAdjustmentReveal();
+            }
+            void UpdateAdjustmentReveal()
+            {
+                adjustmentFrom = adjustmentAnimating ? adjustmentHeight : adjustmentReveal.Visibility == Visibility.Collapsed ? 0 : adjustmentReveal.ActualHeight;
+                adjustmentBody.Height = double.NaN;
+                adjustmentBody.Measure(new Windows.Foundation.Size(Math.Max(1, panel.ActualWidth), double.PositiveInfinity));
+                double naturalHeight = adjustmentBody.DesiredSize.Height + adjustmentReveal.Padding.Top + adjustmentReveal.Padding.Bottom;
+                adjustmentTo = adjustmentOpen ? naturalHeight : 0;
+                adjustmentOpacityFrom = adjustmentReveal.Visibility == Visibility.Collapsed ? 0 : adjustmentReveal.Opacity;
+                adjustmentAngleFrom = adjustmentRotation.Angle;
+                adjustmentReveal.IsHitTestVisible = adjustmentOpen;
+                if (!root.IsLoaded || !animationSettings.AnimationsEnabled)
+                { FinishAdjustmentReveal(); return; }
+                adjustmentBody.Height = Math.Max(0, naturalHeight - adjustmentReveal.Padding.Top - adjustmentReveal.Padding.Bottom);
+                adjustmentReveal.Visibility = Visibility.Visible;
+                adjustmentClock.Restart();
+                if (!adjustmentAnimating) { adjustmentAnimating = true; CompositionTarget.Rendering += AnimateAdjustmentReveal; }
+                AnimateAdjustmentReveal(null, null!);
+            }
+            Closed += (_, __) => { CompositionTarget.Rendering -= AnimateAdjustmentReveal; adjustmentClock.Stop(); };
+            refreshAdjustmentReveal = () => { if (adjustmentOpen) UpdateAdjustmentReveal(); };
             adjustmentHeader.Content = adjustmentTitle;
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(adjustmentHeader, "手动调休，展开编辑");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(adjustmentHeader, "调休，展开编辑");
             adjustmentHeader.Click += (_, __) =>
             {
-                bool open = adjustmentBody.Visibility != Visibility.Visible;
-                adjustmentBody.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
-                adjustmentChevron.RenderTransform = new RotateTransform { Angle = open ? 90 : 0 };
-                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(adjustmentHeader, open ? "手动调休，收起编辑" : "手动调休，展开编辑");
+                bool open = adjustmentOpen = !adjustmentOpen;
+                UpdateAdjustmentReveal();
+
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(adjustmentHeader, open ? "调休，收起编辑" : "调休，展开编辑");
             };
-            panel.Children.Add(adjustmentHeader);
+            var adjustmentGroup = new StackPanel();
+            adjustmentGroup.Children.Add(adjustmentHeader);
             adjustmentBody.Children.Add(new TextBlock { Text = "手动安排优先于每周规则和节假日", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
 
             var adjustGrid = new Grid { ColumnSpacing = 8, RowSpacing = 6 };
@@ -1795,9 +1967,29 @@ namespace OffWorkWidget.WinUI
 
             var from = new CalendarDatePicker { Date = DateTimeOffset.Now.Date, PlaceholderText = "开始日期", Height = 38, FontSize = 13, Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8), HorizontalAlignment = HorizontalAlignment.Stretch };
             var to = new CalendarDatePicker { Date = DateTimeOffset.Now.Date, PlaceholderText = "结束日期", Height = 38, FontSize = 13, Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8), HorizontalAlignment = HorizontalAlignment.Stretch };
+            var compactCalendar = new Style { TargetType = typeof(CalendarView), BasedOn = (Style)Application.Current.Resources["DefaultCalendarViewStyle"] };
+            compactCalendar.Setters.Add(new Setter(FrameworkElement.WidthProperty, 240d));
+            compactCalendar.Setters.Add(new Setter(FrameworkElement.HeightProperty, 292d));
+            compactCalendar.Setters.Add(new Setter(FrameworkElement.MinWidthProperty, 0d));
+            compactCalendar.Setters.Add(new Setter(FrameworkElement.MinHeightProperty, 0d));
+            compactCalendar.Setters.Add(new Setter(CalendarView.DayItemFontSizeProperty, 13d));
+            compactCalendar.Setters.Add(new Setter(CalendarView.MonthYearItemFontSizeProperty, 13d));
+            compactCalendar.Setters.Add(new Setter(CalendarView.DayItemMarginProperty, new Thickness(0)));
+            var compactDay = new Style { TargetType = typeof(CalendarViewDayItem), BasedOn = (Style)Application.Current.Resources[typeof(CalendarViewDayItem)] };
+            compactDay.Setters.Add(new Setter(FrameworkElement.MinWidthProperty, 32d));
+            compactDay.Setters.Add(new Setter(FrameworkElement.MinHeightProperty, 32d));
+            compactDay.Setters.Add(new Setter(FrameworkElement.MarginProperty, new Thickness(0)));
+            compactDay.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
+            compactCalendar.Setters.Add(new Setter(CalendarView.CalendarViewDayItemStyleProperty, compactDay));
             foreach (var picker in new[] { from, to })
             {
                 picker.MinWidth = 0;
+                picker.CalendarViewStyle = compactCalendar;
+
+
+
+
+
                 picker.Resources["CalendarDatePickerBackgroundPointerOver"] = timeHoverBrush;
                 picker.Resources["CalendarDatePickerBackgroundPressed"] = timePressedBrush;
             }
@@ -1835,7 +2027,8 @@ namespace OffWorkWidget.WinUI
             adjustmentBody.Children.Add(adjustGrid);
             adjustmentBody.Children.Add(adjErr);
             adjustmentBody.Children.Add(adjustmentRows);
-            panel.Children.Add(adjustmentBody);
+            adjustmentGroup.Children.Add(adjustmentReveal);
+            panel.Children.Add(adjustmentGroup);
             RenderAdjustments();
 
             return panel;
@@ -1866,13 +2059,13 @@ namespace OffWorkWidget.WinUI
             int count = OffWorkWidget.Logic.RestDayCount(mask);
             int choice = alternatingWeekends ? 2 : customRestPreset ? 3 : count == 2 ? 0 : count == 1 ? 1 : 3;
             alternatingWeekRow.Visibility = alternatingWeekends ? Visibility.Visible : Visibility.Collapsed;
-            restWeekHint.Text = alternatingWeekends ? "单双休隔周交替，蓝色为本周休息日" : "选中日期为休息日，可自由选择星期";
+            restWeekHint.Text = alternatingWeekends ? "单双休隔周交替，选中日期为本周休息日" : "选择休息日";
             for (int i = 0; i < restPresetButtons.Count; i++)
             {
                 var preset = restPresetButtons[i]; bool selected = i == choice;
                 preset.IsChecked = selected;
-                preset.Background = selected ? accentBlue : inputBackgroundBrush;
-                preset.Foreground = selected ? new SolidColorBrush(Microsoft.UI.Colors.White) : inkBrush;
+                preset.Background = selected ? selectionBackgroundBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+                preset.Foreground = inkBrush;
             }
             RefreshDayTimeEditor();
         }
@@ -1891,13 +2084,27 @@ namespace OffWorkWidget.WinUI
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                 var txt = new TextBlock { Text = low + (low == high ? "" : " 至 " + high) + (ordered[i].IsWorkday ? "  上班" : "  休息"), FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
-                var del = new Button { Content = "恢复默认", Height = 26, Padding = new Thickness(8, 2, 8, 2), CornerRadius = new CornerRadius(6), Background = inputBackgroundBrush, FontSize = 12 };
+                row.ColumnSpacing = 10;
+                txt.TextWrapping = TextWrapping.Wrap;
+                var del = new Button
+                {
+                    Content = "撤销安排", Height = 30, MinWidth = 0, FontSize = 12,
+                    Padding = new Thickness(10, 2, 10, 2), CornerRadius = new CornerRadius(8),
+                    BorderThickness = new Thickness(0), Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                    Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center
+                };
+                del.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+                del.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+                del.Resources["ButtonForegroundPointerOver"] = inkBrush;
+                del.Resources["ButtonForegroundPressed"] = inkBrush;
+                ToolTipService.SetToolTip(del, "撤销这段日期的手动安排，按每周规则和节假日安排计算。保存后生效。");
                 del.Click += (_, __) => { adjustments.RemoveAll(a => string.CompareOrdinal(a.Date, low) >= 0 && string.CompareOrdinal(a.Date, high) <= 0); RenderAdjustments(); };
                 Grid.SetColumn(txt, 0); row.Children.Add(txt);
                 Grid.SetColumn(del, 1); row.Children.Add(del);
                 adjustmentRows.Children.Add(row);
                 i = j + 1;
             }
+            refreshAdjustmentReveal?.Invoke();
         }
 
         FrameworkElement BuildCareContent()
@@ -1945,22 +2152,134 @@ namespace OffWorkWidget.WinUI
             return button;
         }
 
-        void BuildTopmostCard()
+        internal void RefreshMouseClickThrough(bool enabled)
         {
-            var card = CreateCardBorder();
+            current.MouseClickThrough = enabled;
+            if (mouseClickThrough != null) mouseClickThrough.IsOn = enabled;
+        }
+
+        void BuildWindowOptionsCard()
+        {
             var row = new Grid();
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var title = new TextBlock { Text = "始终置顶", FontSize = 14, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
+            var title = new TextBlock { Text = "始终置顶", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
             topmost = CreateGreenSwitch(current.Topmost);
             Grid.SetColumn(title, 0); row.Children.Add(title);
             Grid.SetColumn(topmost, 1); row.Children.Add(topmost);
-
-            card.Child = row;
-            form.Children.Add(card);
+            var behavior = new StackPanel { Spacing = 14 };
+            behavior.Children.Add(row);
+            behavior.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            var throughRow = new Grid { ColumnSpacing = 12 };
+            throughRow.ColumnDefinitions.Add(new ColumnDefinition());
+            throughRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var throughLabels = new StackPanel { Spacing = 4 };
+            throughLabels.Children.Add(new TextBlock { Text = "鼠标穿透", FontSize = 14, Foreground = inkBrush });
+            throughLabels.Children.Add(new TextBlock
+            {
+                Text = "从托盘关闭后可操作挂件",
+                FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap
+            });
+            mouseClickThrough = CreateGreenSwitch(current.MouseClickThrough);
+            mouseClickThrough.VerticalAlignment = VerticalAlignment.Center;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(mouseClickThrough, "鼠标穿透");
+            throughRow.Children.Add(throughLabels);
+            Grid.SetColumn(mouseClickThrough, 1); throughRow.Children.Add(mouseClickThrough);
+            behavior.Children.Add(throughRow);
+            behavior.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            behavior.Children.Add(BuildStartupRow());
+            appearanceOptions.Children.Add(CreateDivider());
+            appearanceOptions.Children.Add(CreateOptionsSection("使用偏好", behavior));
         }
 
+        FrameworkElement CreateOptionsSection(string title, FrameworkElement content)
+        {
+            var section = new StackPanel();
+            var header = new Button
+            {
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), BorderThickness = new Thickness(0),
+                Padding = new Thickness(0), MinHeight = 36, HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch
+            };
+            header.Resources["ButtonBackgroundPointerOver"] = header.Background;
+            header.Resources["ButtonBackgroundPressed"] = header.Background;
+            var heading = new Grid();
+            heading.ColumnDefinitions.Add(new ColumnDefinition());
+            heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            heading.Children.Add(new TextBlock { Text = title, FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            var arrow = CreateChevron();
+            var rotation = (RotateTransform)arrow.RenderTransform;
+            var arrowSurface = CreateChevronSurface(header, arrow);
+            Grid.SetColumn(arrowSurface, 1); heading.Children.Add(arrowSurface);
+            header.Content = heading;
+            var reveal = new Border { Child = content, Padding = new Thickness(0, 10, 0, 4), Visibility = Visibility.Collapsed };
+            var clip = new RectangleGeometry();
+            var clock = new Stopwatch();
+            bool open = false, animating = false;
+            double height = 0, from = 0, target = 0, fromOpacity = 0, fromAngle = 0;
+            void Finish()
+            {
+                CompositionTarget.Rendering -= Animate;
+                clock.Stop(); animating = false; height = target;
+                reveal.Height = double.NaN; content.Height = double.NaN; reveal.Clip = null;
+                reveal.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
+                reveal.Opacity = open ? 1 : 0; rotation.Angle = open ? 90 : 0;
+            }
+            void Animate(object? sender, object args)
+            {
+                double p = animationSettings.AnimationsEnabled ? Math.Clamp(clock.Elapsed.TotalMilliseconds / 260, 0, 1) : 1;
+                double eased = p * p * (3 - 2 * p);
+                height = from + (target - from) * eased;
+                reveal.Height = height; reveal.Opacity = fromOpacity + ((open ? 1 : 0) - fromOpacity) * eased;
+                rotation.Angle = fromAngle + ((open ? 90 : 0) - fromAngle) * eased;
+                clip.Rect = new Windows.Foundation.Rect(0, 0, Math.Max(1, section.ActualWidth), Math.Max(0, height));
+                reveal.Clip = clip;
+                if (p >= 1) Finish();
+            }
+            header.Click += (_, __) =>
+            {
+                open = !open;
+                from = animating ? height : reveal.Visibility == Visibility.Collapsed ? 0 : reveal.ActualHeight;
+                content.Height = double.NaN;
+                content.Measure(new Windows.Foundation.Size(Math.Max(1, section.ActualWidth), double.PositiveInfinity));
+                double natural = content.DesiredSize.Height;
+                target = open ? natural + reveal.Padding.Top + reveal.Padding.Bottom : 0;
+                fromOpacity = reveal.Visibility == Visibility.Collapsed ? 0 : reveal.Opacity;
+                fromAngle = rotation.Angle;
+                reveal.IsHitTestVisible = open;
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(header, title + (open ? "，收起" : "，展开"));
+                if (!animationSettings.AnimationsEnabled) { Finish(); return; }
+                content.Height = natural; reveal.Visibility = Visibility.Visible;
+                clock.Restart();
+                if (!animating) { animating = true; CompositionTarget.Rendering += Animate; }
+                Animate(null, null!);
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(header, title + "，展开");
+            Closed += (_, __) => { CompositionTarget.Rendering -= Animate; clock.Stop(); };
+            section.Children.Add(header); section.Children.Add(reveal);
+            return section;
+        }
+        Grid BuildStartupRow()
+        {
+            var row = new Grid { ColumnSpacing = 12 };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var labels = new StackPanel { Spacing = 4 };
+            labels.Children.Add(new TextBlock { Text = "开机启动", FontSize = 14, Foreground = inkBrush });
+            var hint = new TextBlock { Text = "登录后自动显示挂件", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
+            labels.Children.Add(hint);
+            bool canRead = true;
+            try { startupInitiallyEnabled = StartupRegistration.IsEnabled(); }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+            { canRead = false; hint.Text = "无法读取启动项，请检查系统权限后重试。"; }
+            startup = CreateGreenSwitch(startupInitiallyEnabled);
+            startup.IsEnabled = canRead;
+            startup.VerticalAlignment = VerticalAlignment.Center;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(startup, "开机启动");
+            row.Children.Add(labels);
+            Grid.SetColumn(startup, 1); row.Children.Add(startup);
+            return row;
+        }
         void BuildFooter()
         {
             var footer = new Border
@@ -1976,17 +2295,20 @@ namespace OffWorkWidget.WinUI
             var actions = new Grid { ColumnSpacing = 10 };
             actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var save = new Button
             {
-                Content = "保存设置",
+                Content = "保存",
                 FontSize = 14, Padding = new Thickness(12, 0, 12, 0),
                 Height = 38, CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(0),
                 Background = accentBlue, Foreground = new SolidColorBrush(Microsoft.UI.Colors.White),
                 FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
                 HorizontalAlignment = HorizontalAlignment.Stretch
             };
+            save.Resources["ButtonBackgroundPointerOver"] = accentBlue;
+            save.Resources["ButtonBackgroundPressed"] = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0, 105, 225));
+            save.Resources["ButtonForegroundPointerOver"] = save.Foreground;
+            save.Resources["ButtonForegroundPressed"] = save.Foreground;
             save.Click += Save;
             Grid.SetColumn(save, 0); actions.Children.Add(save);
 
@@ -1997,19 +2319,27 @@ namespace OffWorkWidget.WinUI
                 Background = footerActionBrush, Foreground = inkBrush,
                 HorizontalAlignment = HorizontalAlignment.Stretch
             };
-            cancel.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
-            cancel.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            cancel.Resources["ButtonBackgroundPointerOver"] = selectionBackgroundBrush;
+            cancel.Resources["ButtonBackgroundPressed"] = selectionBackgroundBrush;
             cancel.Resources["ButtonForegroundPointerOver"] = inkBrush;
             cancel.Resources["ButtonForegroundPressed"] = inkBrush;
-            cancel.Click += (_, __) => Close();
+            footerCancel = cancel;
+            cancel.Click += (_, __) => CloseSettings();
             Grid.SetColumn(cancel, 1); actions.Children.Add(cancel);
 
             backToTop = CreateHeaderIconButton("\uE74A", "回到顶部", () => settingsScroll.ChangeView(null, 0, null, false));
-            backToTop.Width = 36; backToTop.Height = 38; backToTop.CornerRadius = new CornerRadius(10);
-            backToTop.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-            backToTop.Resources["ButtonBackgroundPointerOver"] = footerActionBrush;
-            backToTop.Resources["ButtonBackgroundPressed"] = footerActionBrush; backToTop.Visibility = Visibility.Collapsed;
-            Grid.SetColumn(backToTop, 2); actions.Children.Add(backToTop);
+            backToTop.Width = backToTop.Height = 36; backToTop.CornerRadius = new CornerRadius(18);
+            backToTop.VerticalAlignment = VerticalAlignment.Center;
+            backToTop.HorizontalAlignment = HorizontalAlignment.Right;
+            backToTop.RenderTransformOrigin = new Windows.Foundation.Point(1, .5);
+            backToTop.RenderTransform = footerArrowScale;
+            backToTop.BorderThickness = new Thickness(0);
+            backToTop.Background = footerActionBrush;
+            backToTop.Resources["ButtonBackgroundPointerOver"] = selectionBackgroundBrush;
+            backToTop.Resources["ButtonBackgroundPressed"] = selectionBackgroundBrush;
+            backToTop.Opacity = 0; backToTop.IsEnabled = false; backToTop.IsHitTestVisible = false; backToTop.IsTabStop = false;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(backToTop, Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Raw);
+            Grid.SetColumn(backToTop, 1); actions.Children.Add(backToTop);
             panel.Children.Add(actions);
             footer.Child = panel;
             footerFade.StartPoint = new Windows.Foundation.Point(0, 0); footerFade.EndPoint = new Windows.Foundation.Point(0, 1);
@@ -2089,7 +2419,7 @@ namespace OffWorkWidget.WinUI
             salaryAuthorized = false;
             salary.IsReadOnly = true;
             salary.Text = "****";
-            if (eyeSlash != null) eyeSlash.Visibility = Visibility.Visible;
+            if (salaryVisibilityIcon != null) salaryVisibilityIcon.Glyph = "\uED1A";
         }
 
         bool ReconcilePrivacyAfterDialog()
@@ -2121,10 +2451,14 @@ namespace OffWorkWidget.WinUI
 
             if (endTime <= startTime)
             {
+                EnsureAccordionExpanded(2);
                 error.Text = "下班时间须晚于上班时间。"; error.Visibility = Visibility.Visible; return;
             }
             if (dayTimeEnabled && dayTimeEnd <= dayTimeStart)
-            { error.Text = "所选星期的下班时间须晚于上班时间。"; error.Visibility = Visibility.Visible; return; }
+            {
+                dayTimeExpanded = true; RefreshDayTimeEditor(); EnsureAccordionExpanded(2);
+                error.Text = "所选星期的下班时间须晚于上班时间。"; error.Visibility = Visibility.Visible; return;
+            }
 
             decimal salaryValue = current.Salary;
             string salaryInput = salaryAuthorized ? salary.Text : salaryDraft ?? string.Empty;
@@ -2206,6 +2540,7 @@ namespace OffWorkWidget.WinUI
                 WaterMinutes = waterVal,
                 WalkMinutes = walkVal,
                 Topmost = topmost.IsOn,
+                MouseClickThrough = mouseClickThrough.IsOn,
                 X = current.X,
                 Y = current.Y
             };
@@ -2214,7 +2549,21 @@ namespace OffWorkWidget.WinUI
             {
                 OffWorkWidget.Logic.Validate(next);
                 saveSettings(next);
-                Close();
+                if (startup.IsEnabled && startup.IsOn != startupInitiallyEnabled)
+                {
+                    try
+                    {
+                        StartupRegistration.SetEnabled(startup.IsOn);
+                        startupInitiallyEnabled = startup.IsOn;
+                    }
+                    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+                    {
+                        error.Text = "其他设置已保存，但开机启动设置失败：" + ex.Message;
+                        error.Visibility = Visibility.Visible;
+                        return;
+                    }
+                }
+                CloseSettings();
             }
             catch (Exception ex)
             {

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,7 +8,6 @@ using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
 using Windows.Graphics.Imaging;
-using Windows.Storage.Streams;
 using WinRT;
 
 namespace OffWorkWidget.WinUI;
@@ -15,34 +15,75 @@ namespace OffWorkWidget.WinUI;
 // Alpha-preserving capture for transparent underlying windows. Never requests capture consent.
 internal static class CompositorWindowCapture
 {
-    internal sealed class Frame
+    internal sealed class Frame : IDisposable
     {
+        int references = 1;
+        readonly bool pooled;
         internal int Width { get; }
         internal int Height { get; }
+        internal int PixelLeft { get; }
+        internal int PixelTop { get; }
+        internal int PixelWidth { get; }
+        internal int PixelHeight { get; }
+        internal long PixelCount => (long)PixelWidth * PixelHeight;
         // Premultiplied BGRA8. Consumers must treat this published snapshot as read-only.
         internal byte[] PixelsBGRA { get; }
         internal DateTime CaptureStartedUtc { get; }
         internal DateTime CapturedAtUtc { get; }
         internal Frame(int width, int height, byte[] pixels, DateTime started)
-        { Width = width; Height = height; PixelsBGRA = pixels; CaptureStartedUtc = started; CapturedAtUtc = DateTime.UtcNow; }
+            : this(width, height, pixels, started, 0, 0, width, height) { }
+        internal Frame(int width, int height, byte[] pixels, DateTime started, int left, int top, int pixelWidth, int pixelHeight, bool pooled = false)
+        { Width = width; Height = height; PixelsBGRA = pixels; CaptureStartedUtc = started; CapturedAtUtc = DateTime.UtcNow;
+            PixelLeft = left; PixelTop = top; PixelWidth = pixelWidth; PixelHeight = pixelHeight; this.pooled = pooled; }
+        internal bool Retain()
+        {
+            int old;
+            do { old = Volatile.Read(ref references); if (old == 0) return false; }
+            while (Interlocked.CompareExchange(ref references, old + 1, old) != old);
+            return true;
+        }
+        // Each successful TryGetFrame acquisition releases one reader reference.
+        public void Dispose()
+        { if (Interlocked.Decrement(ref references) == 0 && pooled) ArrayPool<byte>.Shared.Return(PixelsBGRA); }
+    }
+
+    sealed class Region
+    {
+        internal readonly int X, Y, Width, Height;
+        internal Region(int x, int y, int width, int height) { X = x; Y = y; Width = width; Height = height; }
     }
 
     const long PixelBudget = 12_000_000;
     static readonly object gate = new object();
     static readonly Dictionary<IntPtr, Source> sources = new Dictionary<IntPtr, Source>();
+    static readonly Dictionary<IntPtr, long> retryAfter = new Dictionary<IntPtr, long>();
+    const int FrameIntervalMilliseconds = 100, FailureRetryMilliseconds = 5000;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
     static string? lastError;
+    static long revision;
+    internal static long Revision => Interlocked.Read(ref revision);
     internal static string? LastError => Volatile.Read(ref lastError);
 
     // First use starts capture on a worker and returns immediately, without waiting for a frame.
     internal static bool TryGetFrame(IntPtr hwnd, out Frame? frame)
+        => TryGetFrame(hwnd, null, out frame);
+
+    internal static bool TryGetFrame(IntPtr hwnd, int x, int y, int width, int height, out Frame? frame)
+        => TryGetFrame(hwnd, new Region(x, y, width, height), out frame);
+
+    static bool TryGetFrame(IntPtr hwnd, Region? region, out Frame? frame)
     {
         frame = null;
         if (hwnd == IntPtr.Zero) return false;
         Source source;
         lock (gate)
         {
+            if (retryAfter.TryGetValue(hwnd, out long retry))
+            {
+                if (Environment.TickCount64 < retry) return false;
+                retryAfter.Remove(hwnd);
+            }
             if (sources.TryGetValue(hwnd, out var expired) && expired.IsExpired)
             { sources.Remove(hwnd); _ = Task.Run(expired.Dispose); }
             if (!sources.TryGetValue(hwnd, out source!))
@@ -61,7 +102,7 @@ internal static class CompositorWindowCapture
                 sources.Add(hwnd, source);
                 _ = Task.Run(source.Initialize);
             }
-            source.Touch();
+            source.Touch(region);
         }
         frame = source.Latest;
         return frame != null;
@@ -70,11 +111,18 @@ internal static class CompositorWindowCapture
     internal static void ReleaseAll()
     {
         Source[] removed;
-        lock (gate) { removed = new List<Source>(sources.Values).ToArray(); sources.Clear(); }
+        lock (gate) { removed = new List<Source>(sources.Values).ToArray(); sources.Clear(); retryAfter.Clear(); }
         foreach (var source in removed) _ = Task.Run(source.Dispose);
     }
 
     internal static void Reset() => ReleaseAll();
+
+    internal static void RequestRefresh(IntPtr hwnd)
+    {
+        Source? source;
+        lock (gate) sources.TryGetValue(hwnd, out source);
+        source?.RequestRefresh();
+    }
 
     static void Reap()
     {
@@ -106,7 +154,13 @@ internal static class CompositorWindowCapture
         int poolWidth, poolHeight, widthInset, heightInset;
         bool disposed, inFlight, closed;
         Frame? latest;
+        Region? requestedRegion;
+        NativeCaptureCrop? crop;
+        bool cropDisabled, fastCapture;
+        long contentActiveUntil;
+        bool regionRefresh;
         Direct3D11CaptureFrame? pending;
+        Direct3D11CaptureFrame? retained;
         IDirect3DDevice? device;
         GraphicsCaptureItem? item;
         Direct3D11CaptureFramePool? pool;
@@ -114,9 +168,12 @@ internal static class CompositorWindowCapture
         internal IntPtr Handle { get; }
         internal long LastUse => Interlocked.Read(ref lastUse);
         internal Source(IntPtr hwnd) { Handle = hwnd; }
-        internal void Touch()
+        internal void Touch(Region? region)
         {
+            Volatile.Write(ref requestedRegion, region);
             long now = Environment.TickCount64;
+            if (Volatile.Read(ref fastCapture) && now >= Volatile.Read(ref contentActiveUntil))
+                _ = Task.Run(() => { lock (sync) { if (Environment.TickCount64 >= contentActiveUntil) SetCaptureRate(false); } });
             Interlocked.Exchange(ref lastUse, now);
             long previous = Interlocked.Read(ref lastSizeCheck);
             if (now - previous >= 100 && Interlocked.CompareExchange(ref lastSizeCheck, now, previous) == previous)
@@ -130,7 +187,7 @@ internal static class CompositorWindowCapture
                 if (!GetWindowRect(Handle, out var bounds)) return;
                 lock (sync)
                 {
-                    if (disposed || pool == null || inFlight) return;
+                    if (disposed || pool == null) return;
                     int width = bounds.Right - bounds.Left - widthInset, height = bounds.Bottom - bounds.Top - heightInset;
                     if (width <= 0 || height <= 0 || (long)width * height > PixelBudget || (width == poolWidth && height == poolHeight)) return;
                     // Some layered windows keep an old-size capture item after resizing. Recreate the
@@ -139,10 +196,58 @@ internal static class CompositorWindowCapture
                     Dispose();
                 }
             }
-            catch (Exception ex) { Volatile.Write(ref closed, true); Volatile.Write(ref lastError, ex.Message); Dispose(); }
+            catch (Exception ex) { Fail(ex); }
+        }
+        void Fail(Exception error)
+        {
+            // A denied/unsupported source must not recreate D3D devices every sampling tick.
+            lock (gate)
+            {
+                if (sources.TryGetValue(Handle, out var current) && ReferenceEquals(current, this))
+                {
+                    if (retryAfter.Count >= 128)
+                    {
+                        IntPtr oldest = IntPtr.Zero; long expiry = long.MaxValue;
+                        foreach (var entry in retryAfter)
+                            if (entry.Value < expiry) { oldest = entry.Key; expiry = entry.Value; }
+                        retryAfter.Remove(oldest);
+                    }
+                    retryAfter[Handle] = Environment.TickCount64 + FailureRetryMilliseconds;
+                }
+            }
+            Volatile.Write(ref closed, true);
+            Volatile.Write(ref lastError, error.Message);
+            Dispose();
         }
         internal bool IsExpired => Volatile.Read(ref closed) || Environment.TickCount64 - Interlocked.Read(ref lastUse) >= 3000;
-        internal Frame? Latest => Volatile.Read(ref disposed) ? null : Volatile.Read(ref latest);
+        internal Frame? Latest
+        {
+            get
+            {
+                while (!Volatile.Read(ref disposed))
+                {
+                    var frame = Volatile.Read(ref latest);
+                    if (frame == null) return null;
+                    if (frame.Retain()) return frame;
+                }
+                return null;
+            }
+        }
+
+        internal void RequestRefresh()
+        {
+            _ = Task.Run(() =>
+            {
+                lock (sync)
+                {
+                    if (disposed) return;
+                    regionRefresh = true;
+                    if (inFlight || retained == null) return;
+                    inFlight = true;
+                    _ = Task.Run(ReadFramesAsync);
+                }
+            });
+        }
 
         internal void Initialize()
         {
@@ -157,9 +262,11 @@ internal static class CompositorWindowCapture
                 newItem = CreateItem(Handle);
                 if (newItem.Size.Width <= 0 || newItem.Size.Height <= 0 || (long)newItem.Size.Width * newItem.Size.Height > PixelBudget)
                     throw new InvalidOperationException("Window capture exceeds the pixel budget.");
-                newPool = Direct3D11CaptureFramePool.CreateFreeThreaded(newDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, newItem.Size);
+                // One retained frame for recropping, one being read, and one pending producer frame.
+                newPool = Direct3D11CaptureFramePool.CreateFreeThreaded(newDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 3, newItem.Size);
                 newSession = newPool.CreateCaptureSession(newItem);
                 newSession.IsCursorCaptureEnabled = false;
+                LimitCaptureRate(newSession);
                 // If this ABI is unavailable, fail closed rather than changing consent or using black-keying.
                 var border = newSession.As<IGraphicsCaptureSession3>();
                 try { border.IsBorderRequired = false; }
@@ -179,7 +286,7 @@ internal static class CompositorWindowCapture
                     session.StartCapture();
                 }
             }
-            catch (Exception ex) { Volatile.Write(ref closed, true); Volatile.Write(ref lastError, ex.Message); Dispose(); }
+            catch (Exception ex) { Fail(ex); }
             finally { newSession?.Dispose(); newPool?.Dispose(); newDevice?.Dispose(); if (newItem != null) ((IWinRTObject)newItem).NativeObject.Dispose(); }
         }
 
@@ -201,7 +308,7 @@ internal static class CompositorWindowCapture
                     inFlight = true;
                     _ = Task.Run(ReadFramesAsync);
                 }
-                catch (Exception ex) { Volatile.Write(ref closed, true); Volatile.Write(ref lastError, ex.Message); Dispose(); }
+                catch (Exception ex) { Fail(ex); }
             }
         }
 
@@ -211,60 +318,141 @@ internal static class CompositorWindowCapture
             {
                 while (true)
                 {
-                    int delay = (int)Math.Max(0, 100 - (Environment.TickCount64 - lastRead));
+                    bool fast = !cropDisabled && crop != null && Environment.TickCount64 < contentActiveUntil;
+                    SetCaptureRate(fast);
+                    bool refreshRequested;
+                    lock (sync)
+                    {
+                        // Do not hold the reader active in a timer wait when no newer frame exists.
+                        if (disposed || (pending == null && !regionRefresh)) return;
+                        refreshRequested = regionRefresh;
+                    }
+                    int delay = refreshRequested || fast ? 0 : (int)Math.Max(0, FrameIntervalMilliseconds - (Environment.TickCount64 - lastRead));
                     if (delay > 0) await Task.Delay(delay);
                     Direct3D11CaptureFrame? captured;
                     lock (sync)
                     {
-                        if (disposed || pending == null) return;
-                        captured = pending; pending = null;
+                        if (disposed) return;
+                        if (pending != null)
+                        {
+                            retained?.Dispose(); retained = pending; pending = null;
+                        }
+                        else if (!regionRefresh || retained == null) return;
+                        captured = retained; regionRefresh = false;
                         lastRead = Environment.TickCount64;
                     }
-                    try
                     {
                         var size = captured.ContentSize;
                         if (size.Width <= 0 || size.Height <= 0 || (long)size.Width * size.Height > PixelBudget) continue;
-                        using var bitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(captured.Surface, BitmapAlphaMode.Premultiplied);
-                        int width = bitmap.PixelWidth, height = bitmap.PixelHeight;
-                        if (width != size.Width || height != size.Height)
+                        var surface = captured.Surface;
+                        var original = surface.Description;
+                        if (original.Width != size.Width || original.Height != size.Height)
+                        { Volatile.Write(ref closed, true); Dispose(); return; }
+                        int left = 0, top = 0, pixelWidth = size.Width, pixelHeight = size.Height;
+                        bool cropped = false;
+                        var region = Volatile.Read(ref requestedRegion);
+                        if (!cropDisabled && region != null &&
+                            WindowBackdropCapture.TryGetCaptureOrigin(Handle, size.Width, size.Height, out int originX, out int originY))
                         {
-                            Volatile.Write(ref closed, true);
-                            Dispose();
-                            return;
+                            pixelWidth = Math.Min(size.Width, region.Width + 192);
+                            pixelHeight = Math.Min(size.Height, region.Height + 192);
+                            left = Math.Clamp(region.X - originX - 96, 0, size.Width - pixelWidth);
+                            top = Math.Clamp(region.Y - originY - 96, 0, size.Height - pixelHeight);
+                            try
+                            {
+                                crop ??= new NativeCaptureCrop(device!);
+                                crop.Copy(surface, left, top, pixelWidth, pixelHeight);
+                                cropped = true;
+                            }
+                            catch (Exception error)
+                            {
+                                DisableCrop(error);
+                                left = top = 0; pixelWidth = size.Width; pixelHeight = size.Height;
+                            }
                         }
+                        int width = pixelWidth, height = pixelHeight;
                         long count = (long)width * height;
                         if (count <= 0 || count > PixelBudget) continue;
-                        var buffer = new Windows.Storage.Streams.Buffer(checked((uint)(count * 4)));
-                        bitmap.CopyToBuffer(buffer);
-                        var pixels = new byte[buffer.Length];
-                        using (var reader = DataReader.FromBuffer(buffer)) reader.ReadBytes(pixels);
-                        // An evicted source releases its pixel reservation on a worker.
-                        // Retain a static source's only frame while that release completes.
-                        for (int retry = 0; retry < 20; retry++)
+                        byte[] pixels = ArrayPool<byte>.Shared.Rent(checked((int)(count * 4)));
+                        bool published = false;
+                        try
                         {
-                            lock (sync)
+                            if (cropped)
                             {
-                                if (disposed) return;
-                                long previous = latest == null ? 0 : (long)latest.Width * latest.Height;
-                                if (Reserve(count - previous))
-                                { Volatile.Write(ref latest, new Frame(width, height, pixels, started)); break; }
+                                try { crop!.ReadPixels(pixels); }
+                                catch (Exception error)
+                                {
+                                    DisableCrop(error); cropped = false;
+                                    left = top = 0; width = size.Width; height = size.Height;
+                                    count = (long)width * height;
+                                    var fullPixels = ArrayPool<byte>.Shared.Rent(checked((int)(count * 4)));
+                                    ArrayPool<byte>.Shared.Return(pixels); pixels = fullPixels;
+                                }
                             }
-                            await Task.Delay(100);
+                            if (!cropped)
+                            {
+                                using var bitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(surface, BitmapAlphaMode.Premultiplied);
+                                if (bitmap.PixelWidth != width || bitmap.PixelHeight != height)
+                                { Volatile.Write(ref closed, true); Dispose(); return; }
+                                NativeCaptureCrop.CopyPixels(bitmap, pixels);
+                            }
+                            // An evicted source releases its pixel reservation on a worker.
+                            // Retain a static source's only frame while that release completes.
+                            for (int retry = 0; retry < 20; retry++)
+                            {
+                                lock (sync)
+                                {
+                                    if (disposed) return;
+                                    var previousFrame = latest;
+                                    long previous = previousFrame?.PixelCount ?? 0;
+                                    if (Reserve(count - previous))
+                                    {
+                                        bool changed = previousFrame == null || previousFrame.Width != size.Width || previousFrame.Height != size.Height ||
+                                            previousFrame.PixelLeft != left || previousFrame.PixelTop != top || previousFrame.PixelWidth != width ||
+                                            previousFrame.PixelHeight != height || !pixels.AsSpan(0, (int)(count * 4)).SequenceEqual(previousFrame.PixelsBGRA.AsSpan(0, (int)(count * 4)));
+                                        Volatile.Write(ref latest, new Frame(size.Width, size.Height, pixels, started, left, top, width, height, true));
+                                        published = true;
+                                        previousFrame?.Dispose();
+                                        if (changed)
+                                        {
+                                            if (cropped) contentActiveUntil = Environment.TickCount64 + 350;
+                                            Interlocked.Increment(ref revision);
+                                        }
+                                        break;
+                                    }
+                                }
+                                await Task.Delay(100);
+                            }
                         }
+                        finally { if (!published) ArrayPool<byte>.Shared.Return(pixels); }
                     }
-                    finally { captured?.Dispose(); }
                 }
             }
-            catch (Exception ex) { Volatile.Write(ref closed, true); Volatile.Write(ref lastError, ex.Message); Dispose(); }
+            catch (Exception ex) { Fail(ex); }
             finally
             {
                 lock (sync)
                 {
                     inFlight = false;
                     if (disposed) ReleaseResources();
-                    else if (pending != null) { inFlight = true; _ = Task.Run(ReadFramesAsync); }
+                    else if (pending != null || (regionRefresh && retained != null)) { inFlight = true; _ = Task.Run(ReadFramesAsync); }
                 }
             }
+        }
+        void SetCaptureRate(bool fast)
+        {
+            lock (sync)
+            {
+                if (disposed || session == null || fastCapture == fast) return;
+                LimitCaptureRate(session, fast ? 0 : FrameIntervalMilliseconds);
+                Volatile.Write(ref fastCapture, fast);
+            }
+        }
+        void DisableCrop(Exception error)
+        {
+            Volatile.Write(ref lastError, "GPU crop fallback: " + error.Message);
+            cropDisabled = true; crop?.Dispose(); crop = null;
+            SetCaptureRate(false);
         }
         public void Dispose()
         {
@@ -273,7 +461,7 @@ internal static class CompositorWindowCapture
                 if (disposed) return;
                 disposed = true;
                 pending?.Dispose(); pending = null;
-                if (latest != null) { Interlocked.Add(ref cachedPixels, -(long)latest.Width * latest.Height); latest = null; }
+                if (latest != null) { Interlocked.Add(ref cachedPixels, -latest.PixelCount); latest.Dispose(); latest = null; }
                 if (!inFlight) ReleaseResources();
             }
         }
@@ -283,13 +471,28 @@ internal static class CompositorWindowCapture
             if (item != null) { try { item.Closed -= ItemClosed; } catch { } }
             if (pool != null) { try { pool.FrameArrived -= FrameArrived; } catch { } }
             try { session?.Dispose(); } catch { }
+            retained?.Dispose(); retained = null;
             try { pool?.Dispose(); } catch { }
+            try { crop?.Dispose(); } catch { }
             try { device?.Dispose(); } catch { }
             if (item != null) { try { ((IWinRTObject)item).NativeObject.Dispose(); } catch { } }
-            session = null; pool = null; device = null; item = null;
+            session = null; pool = null; device = null; item = null; crop = null;
         }
     }
 
+    static void LimitCaptureRate(GraphicsCaptureSession capture, int milliseconds = FrameIntervalMilliseconds)
+    {
+        if (!Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+            "Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval")) return;
+        try
+        {
+            var timing = capture.As<IGraphicsCaptureSession5>();
+            try { timing.MinUpdateInterval = TimeSpan.FromMilliseconds(milliseconds).Ticks; }
+            finally { if (Marshal.IsComObject(timing)) Marshal.ReleaseComObject(timing); }
+        }
+        catch (Exception error) when (error is COMException || error is InvalidCastException || error is NotImplementedException)
+        { /* Older capture implementations retain the CPU readback limit. */ }
+    }
     static IDirect3DDevice CreateDevice()
     {
         IntPtr native = IntPtr.Zero, context = IntPtr.Zero, dxgi = IntPtr.Zero, wrapped = IntPtr.Zero;
@@ -334,6 +537,14 @@ internal static class CompositorWindowCapture
         }
     }
 
+    [ComImport, Guid("67c0ea62-1f85-5061-925a-239be0ac09cb"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IGraphicsCaptureSession5
+    {
+        void GetIids(out uint count, out IntPtr values);
+        void GetRuntimeClassName(out IntPtr value);
+        void GetTrustLevel(out int value);
+        long MinUpdateInterval { get; set; }
+    }
     [ComImport, Guid("f2cdd966-22ae-5ea1-9596-3a289344c3be"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IGraphicsCaptureSession3
     {

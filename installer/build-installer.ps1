@@ -4,7 +4,12 @@ $root = Split-Path $PSScriptRoot -Parent
 if (!$OutputDir) { $OutputDir = Join-Path (Split-Path $root -Parent) '下班倒计时-安装包' }
 if (!$PayloadDir) { $PayloadDir = Join-Path $root 'publish' }
 if (!$CompilerPath) {
-    $candidates = @($env:ISCC, (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'), (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'))
+    $candidates = @(
+        $env:ISCC,
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path (Split-Path (Split-Path $root -Parent) -Parent) 'work\installer-release\tools\InnoSetup\ISCC.exe')
+    )
     $CompilerPath = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 }
 if (!$CompilerPath -or !(Test-Path -LiteralPath $CompilerPath)) { throw '请安装 Inno Setup 6.7.3 或更新版本，并通过 -CompilerPath 指定 ISCC.exe。' }
@@ -27,6 +32,9 @@ $arguments = @("/DPayloadDir=$PayloadDir", "/DOutputDir=$OutputDir", "/DAppVersi
 if ($InstallerQATest) { $arguments += '/DInstallerQATest' }
 & $CompilerPath @arguments (Join-Path $PSScriptRoot 'OffWorkWidget.iss')
 if ($LASTEXITCODE -ne 0) { throw '安装包编译失败。' }
+if (!$InstallerQATest) {
+    Copy-Item -LiteralPath $redist -Destination (Join-Path $OutputDir 'VC_redist.x64.exe') -Force
+}
 $name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } else { "下班倒计时-Setup-$version-x64.exe" }
 $artifact = Join-Path $OutputDir $name
 $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
