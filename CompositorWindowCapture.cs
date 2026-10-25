@@ -108,6 +108,13 @@ internal static class CompositorWindowCapture
         return frame != null;
     }
 
+    // A newly starting GPU source has not failed. Do not synchronously repaint
+    // its owner window just because the first compositor frame is still pending.
+    internal static bool IsStarting(IntPtr hwnd)
+    {
+        lock (gate) return sources.TryGetValue(hwnd, out var source) && source.IsStarting;
+    }
+
     internal static void ReleaseAll()
     {
         Source[] removed;
@@ -150,6 +157,7 @@ internal static class CompositorWindowCapture
     {
         readonly object sync = new object();
         readonly DateTime started = DateTime.UtcNow;
+        readonly long createdAt = Environment.TickCount64;
         long lastUse = Environment.TickCount64, lastRead, lastSizeCheck;
         int poolWidth, poolHeight, widthInset, heightInset;
         bool disposed, inFlight, closed;
@@ -221,6 +229,8 @@ internal static class CompositorWindowCapture
             Volatile.Write(ref lastError, error.Message);
             Dispose();
         }
+        internal bool IsStarting => !Volatile.Read(ref disposed) && !Volatile.Read(ref closed) &&
+            Environment.TickCount64 - createdAt < 500;
         internal bool IsExpired => Volatile.Read(ref closed) || Environment.TickCount64 - Interlocked.Read(ref lastUse) >= 3000;
         internal Frame? Latest
         {

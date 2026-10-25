@@ -466,6 +466,13 @@ internal static class WindowBackdropCapture
                     uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
                     return uncovered.Count > 0;
                 }
+                // Keep the previous complete scene during GPU warm-up. PrintWindow
+                // can synchronously stall the source app's UI (notably Qt windows).
+                if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.IsStarting(window))
+                {
+                    pendingRegion = true;
+                    return false;
+                }
                 // PrintWindow flattens transparent screenshot/glass windows onto black.
                 // Only ordinary opaque windows may use it while compositor capture warms up.
                 if (requiresAlpha) return true;
