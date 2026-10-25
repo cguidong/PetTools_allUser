@@ -44,6 +44,16 @@ public sealed class MainWindow : Window
     readonly ScaleTransform contentScale = new ScaleTransform();
     readonly Border notice;
     readonly Canvas coins = new Canvas { IsHitTestVisible = false };
+    readonly Canvas coinOverlay = new Canvas { IsHitTestVisible = false };
+    readonly Microsoft.UI.Xaml.Controls.Primitives.Popup coinPopup = new()
+    {
+        ShouldConstrainToRootBounds = false, IsLightDismissEnabled = false, IsHitTestVisible = false
+    };
+    const double CoinHeadroom = 90;
+    bool trackingCoins;
+    readonly TranslateTransform petClickLift = new TranslateTransform();
+    Storyboard? petClickAnimation;
+    int emittedCoins;
     readonly TextBlock caption = new TextBlock { FontSize = 14, CharacterSpacing = 15, FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.Normal };
     readonly TextBlock countdown = new TextBlock { FontSize = 36, FontWeight = Microsoft.UI.Text.FontWeights.Medium, FontFamily = new FontFamily("Segoe UI"), Margin = new Thickness(0, 4, 0, 10) };
     readonly TextBlock rest = new TextBlock(), pay = new TextBlock(), earned = new TextBlock();
@@ -79,7 +89,6 @@ public sealed class MainWindow : Window
     double statsTone = 1, statsFromTone = 1, statsTargetTone = 1;
     readonly Windows.UI.ViewManagement.UISettings uiSettings = new Windows.UI.ViewManagement.UISettings();
     readonly SolidColorBrush foreground = new SolidColorBrush(Colors.White);
-    readonly Random random = new Random();
     readonly AppWindow native;
     readonly GlassBackdrop glass;
     readonly DesktopGlassSource desktopSource;
@@ -188,7 +197,8 @@ public sealed class MainWindow : Window
         foregroundLayer.Children.Add(card);
         card.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         BuildCard();
-        surface.Children.Add(coins);
+        coinOverlay.Children.Add(coins);
+        coinPopup.Child = coinOverlay;
         coins.RenderTransform = contentScale;
         notice = new Border { Child = reminder, CornerRadius = new CornerRadius(14), Padding = new Thickness(12, 6, 12, 6), Background = new SolidColorBrush(Windows.UI.Color.FromArgb(235, 38, 38, 42)), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(16, 10, 0, 0), Visibility = Visibility.Collapsed };
         notice.RenderTransform = contentScale;
@@ -388,20 +398,28 @@ public sealed class MainWindow : Window
         stats.SizeChanged += (_, __) => SynchronizeStatsGeometry();
         text.Children.Add(stats);
         body.Children.Add(text);
-        Grid.SetColumn(pet, 1); body.Children.Add(pet);
+        var petHost = new Grid
+        {
+            Background = new SolidColorBrush(Colors.Transparent), VerticalAlignment = VerticalAlignment.Bottom
+        };
+        petHost.Children.Add(pet);
+        Grid.SetColumn(petHost, 1); body.Children.Add(petHost);
         card.Child = body;
-        pet.Tapped += (_, e) => { EmitCoin(); e.Handled = true; };
+        petHost.Tapped += (_, e) => { EmitCoin(); e.Handled = true; };
+        petHost.DoubleTapped += (_, e) => { e.Handled = true; };
         pet.RenderTransformOrigin = new Point(.5, 1);
         var petTransform = new CompositeTransform();
-        pet.RenderTransform = petTransform;
+        var petTransforms = new TransformGroup();
+        petTransforms.Children.Add(petTransform);
+        petTransforms.Children.Add(petClickLift);
+        pet.RenderTransform = petTransforms;
         pet.PointerEntered += (_, __) => { petTransform.ScaleX = 1.035; petTransform.ScaleY = 1.035; };
         pet.PointerExited += (_, __) => { petTransform.ScaleX = 1; petTransform.ScaleY = 1; };
-        pet.RightTapped += (_, e) => { ShowContextMenu(e.GetPosition(surface)); e.Handled = true; };
+        petHost.RightTapped += (_, e) => { ShowContextMenu(e.GetPosition(surface)); e.Handled = true; };
         var breathe = new DoubleAnimation { From = 0, To = -2, Duration = new Duration(TimeSpan.FromSeconds(2.8)), AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } };
         Storyboard.SetTarget(breathe, petTransform); Storyboard.SetTargetProperty(breathe, "TranslateY");
         var breathing = new Storyboard(); breathing.Children.Add(breathe);
         pet.Loaded += (_, __) => breathing.Begin();
-        ToolTipService.SetToolTip(pet, "点击爆金币 · 双击卡片打开设置");
     }
 
     StackPanel Stat(string title, TextBlock value)
@@ -1279,18 +1297,125 @@ public sealed class MainWindow : Window
         settingsWindow.Activate();
     }
 
+    void PositionCoinLayer()
+    {
+        double scale = PhysicalScale;
+        var origin = surface.TransformToVisual(hostSurface).TransformPoint(new Point(0, 0));
+        coinOverlay.Width = surface.Width;
+        coinOverlay.Height = surface.Height + CoinHeadroom * scale;
+        coins.Width = surface.Width / scale;
+        coins.Height = surface.Height / scale + CoinHeadroom;
+        coinPopup.HorizontalOffset = origin.X;
+        coinPopup.VerticalOffset = origin.Y - CoinHeadroom * scale;
+    }
+
+    void TrackCoinLayer(object? sender, object args)
+    {
+        if (disposed || !IsWindowVisible(hwnd) || IsIconic(hwnd)) { CloseCoinLayer(); return; }
+        PositionCoinLayer();
+    }
+
+    void CloseCoinLayer()
+    {
+        CompositionTarget.Rendering -= TrackCoinLayer;
+        trackingCoins = false;
+        coinPopup.IsOpen = false;
+        coins.Children.Clear();
+    }
+
     void EmitCoin()
     {
-        var coin = new TextBlock { Text = "🪙", FontSize = 24 };
-        var petOrigin = pet.TransformToVisual(card).TransformPoint(new Point(0, 0));
-        double x = (petOrigin.X + pet.ActualWidth * .5) / PhysicalScale - 24 + random.Next(-14, 15), y = 80;
-        Canvas.SetLeft(coin, x); Canvas.SetTop(coin, y); coins.Children.Add(coin);
-        var transform = new TranslateTransform(); coin.RenderTransform = transform;
-        var animation = new DoubleAnimation { From = 0, To = -55, Duration = new Duration(TimeSpan.FromMilliseconds(950)), EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
-        Storyboard.SetTarget(animation, transform); Storyboard.SetTargetProperty(animation, "Y");
-        var fade = new DoubleAnimation { From = 1, To = 0, BeginTime = TimeSpan.FromMilliseconds(500), Duration = new Duration(TimeSpan.FromMilliseconds(450)) };
-        Storyboard.SetTarget(fade, coin); Storyboard.SetTargetProperty(fade, "Opacity");
-        var storyboard = new Storyboard(); storyboard.Children.Add(animation); storyboard.Children.Add(fade); storyboard.Completed += (_, __) => coins.Children.Remove(coin); storyboard.Begin();
+        if (!trackingCoins)
+        {
+            coinPopup.XamlRoot = surface.XamlRoot;
+            PositionCoinLayer();
+            coinPopup.IsOpen = true;
+            trackingCoins = true;
+            CompositionTarget.Rendering += TrackCoinLayer;
+        }
+        var gold = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(.35, 1) };
+        gold.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 255, 237, 151), Offset = 0 });
+        gold.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 242, 178, 49), Offset = 1 });
+        var coin = new Border
+        {
+            Width = 27, Height = 27, CornerRadius = new CornerRadius(14),
+            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 217, 153, 36)),
+            BorderThickness = new Thickness(1.5), Background = gold, RenderTransformOrigin = new Point(.5, .5)
+        };
+        var ring = new Border
+        {
+            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 243, 177)),
+            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(12), Margin = new Thickness(2),
+            Child = new TextBlock
+            {
+                Text = "￥", FontSize = 16, FontFamily = new FontFamily("Microsoft YaHei"),
+                FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+                Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 184, 121, 22)),
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            }
+        };
+        coin.Child = ring;
+        // The popup has a different visual root: map via the main surface, then
+        // convert both axes to the logical coordinates of the scaled coin canvas.
+        var head = pet.TransformToVisual(surface).TransformPoint(new Point(pet.ActualWidth * .49, pet.ActualHeight * .04));
+        double left = head.X / PhysicalScale - 13.5;
+        double top = CoinHeadroom + head.Y / PhysicalScale - 27;
+        double landing = CoinHeadroom - 27 - top;
+        Canvas.SetLeft(coin, left); Canvas.SetTop(coin, top);
+        var transform = new CompositeTransform(); coin.RenderTransform = transform;
+        coins.Children.Add(coin);
+        var storyboard = new Storyboard();
+        void Motion(DependencyObject target, string property, params (int At, double Value, EasingMode? Ease)[] keys)
+        {
+            var motion = new DoubleAnimationUsingKeyFrames();
+            foreach (var key in keys)
+            {
+                var frame = new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(key.At)), Value = key.Value };
+                if (key.Ease is EasingMode ease) frame.EasingFunction = new QuadraticEase { EasingMode = ease };
+                motion.KeyFrames.Add(frame);
+            }
+            Storyboard.SetTarget(motion, target); Storyboard.SetTargetProperty(motion, property);
+            storyboard.Children.Add(motion);
+        }
+        Motion(transform, "TranslateY", (0, 0, null), (280, landing - 42, EasingMode.EaseOut),
+            (530, landing, EasingMode.EaseIn), (670, landing - 14, EasingMode.EaseOut),
+            (810, landing, EasingMode.EaseIn), (900, landing - 5, EasingMode.EaseOut), (990, landing, EasingMode.EaseIn));
+        double direction = ++emittedCoins % 2 == 0 ? 1 : -1;
+        Motion(transform, "TranslateX", (0, 0, null), (530, 12 * direction, null), (1100, 18 * direction, EasingMode.EaseOut));
+        Motion(transform, "ScaleX", (0, 1, null), (130, .25, null), (280, 1, null), (410, .3, null),
+            (530, 1, null), (565, 1.12, null), (620, 1, null));
+        Motion(transform, "ScaleY", (0, 1, null), (520, 1, null), (550, .78, null), (620, 1, null),
+            (800, 1, null), (825, .9, null), (870, 1, null));
+        Motion(coin, "Opacity", (0, 1, null), (1050, 1, null), (1300, 0, null));
+
+        var impact = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 36, Height = 5, Opacity = 0, StrokeThickness = 1,
+            Stroke = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 225, 136)),
+            RenderTransformOrigin = new Point(.5, .5)
+        };
+        Canvas.SetLeft(impact, left + 13.5 + 12 * direction - 18);
+        Canvas.SetTop(impact, CoinHeadroom - 2.5);
+        var impactScale = new ScaleTransform(); impact.RenderTransform = impactScale;
+        coins.Children.Insert(coins.Children.Count - 1, impact);
+        Motion(impact, "Opacity", (0, 0, null), (515, 0, null), (545, .65, null), (880, 0, null));
+        Motion(impactScale, "ScaleX", (0, .35, null), (530, .35, null), (880, 1.8, EasingMode.EaseOut));
+        storyboard.Completed += (_, __) =>
+        {
+            coins.Children.Remove(coin); coins.Children.Remove(impact);
+            if (coins.Children.Count == 0) CloseCoinLayer();
+        };
+        storyboard.Begin();
+
+        // A separate transform keeps click feedback independent of breathing/hover.
+        petClickAnimation?.Stop();
+        var lift = new DoubleAnimation
+        {
+            From = 0, To = -2, AutoReverse = true, Duration = new Duration(TimeSpan.FromMilliseconds(100)),
+            EasingFunction = new SineEase { EasingMode = EasingMode.EaseOut }
+        };
+        Storyboard.SetTarget(lift, petClickLift); Storyboard.SetTargetProperty(lift, "Y");
+        petClickAnimation = new Storyboard(); petClickAnimation.Children.Add(lift); petClickAnimation.Begin();
     }
 
     bool isDragging, endingDrag, dragMoved;
@@ -1303,7 +1428,7 @@ public sealed class MainWindow : Window
         var point = e.GetCurrentPoint(surface);
         if (!point.Properties.IsLeftButtonPressed) return;
         for (DependencyObject? source = e.OriginalSource as DependencyObject; source != null && source != card; source = VisualTreeHelper.GetParent(source))
-            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase || source is Image) return;
+            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase || source is Image || ReferenceEquals(source, pet.Parent)) return;
 
         if (layoutTransitionActive) CompleteLayoutTransition();
         if (scalePreviewHostActive) { EndScalePreviewHost(); ApplyWidgetSize(); }
@@ -1617,6 +1742,7 @@ public sealed class MainWindow : Window
         if (disposed) return;
         try { EndDrag(null); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
         disposed = true;
+        CloseCoinLayer();
 
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
         timer?.Stop();
@@ -1655,6 +1781,8 @@ public sealed class MainWindow : Window
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out Win32Point lpPoint);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? title);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr window, ref Win32Point point);
     [DllImport("comctl32.dll")] static extern IntPtr DefSubclassProc(IntPtr hwnd, uint message, nuint wParam, nint lParam);
