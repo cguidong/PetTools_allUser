@@ -29,7 +29,7 @@ internal sealed class DesktopGlassSource : IDisposable
     int displayedWidth, displayedHeight;
     byte[]? spareScenePixels, sceneScratchPixels;
     internal Action? BeforeRender;
-    bool disposed, frozen, inFlight, paused;
+    bool disposed, frozen, inFlight, paused, layoutProbeInFlight;
     WindowBackdropCapture.Frame? atlas;
     int atlasX, atlasY, atlasVersion, displayedVersion, displayedX = int.MinValue, displayedY;
     byte[] pixels = Array.Empty<byte>();
@@ -98,24 +98,34 @@ internal sealed class DesktopGlassSource : IDisposable
         BeforeRender?.Invoke();
         if (followMovingHost) RequestFrame();
         else UpdateBackgroundMotion();
-        RenderLatest();
+        if (visualDrag) RenderLatest();
     }
 
-    void UpdateBackgroundMotion()
+    async void UpdateBackgroundMotion()
     {
-        if (disposed || frozen || paused || inFlight || !IsActive || visualDrag || preparingWindowMove ||
+        if (disposed || frozen || paused || inFlight || layoutProbeInFlight || !IsActive || visualDrag || preparingWindowMove ||
             !IsWindowVisible(handle) || IsIconic(handle)) return;
         long now = Environment.TickCount64;
-        if (now >= backgroundMotionUntil && now - lastLayoutProbe < BackgroundMotionInterval) return;
+        int interval = now < backgroundMotionUntil ? BackgroundMotionInterval : 50;
+        if (now - lastLayoutProbe < interval) return;
         lastLayoutProbe = now;
         if (!TryGetRenderBounds(out int x, out int y, out int width, out int height)) return;
-        ulong next = WindowBackdropCapture.GetLayoutStamp(handle, x - 48, y - 48, width + 96, height + 96);
-        long nextContent = CompositorWindowCapture.Revision;
-        if ((hasLayoutStamp && next != layoutStamp) || nextContent != contentRevision) backgroundMotionUntil = now + 180;
-        layoutStamp = next;
-        contentRevision = nextContent;
-        hasLayoutStamp = true;
-        if (now < backgroundMotionUntil) RequestFrame();
+        layoutProbeInFlight = true;
+        try
+        {
+            // Enumeration and cross-process DWM queries must never delay pointer/render work.
+            ulong next = await Task.Run(() => WindowBackdropCapture.GetLayoutStamp(handle, x - 48, y - 48, width + 96, height + 96));
+            if (disposed || frozen || paused || visualDrag || preparingWindowMove) return;
+            long nextContent = CompositorWindowCapture.Revision;
+            now = Environment.TickCount64;
+            if ((hasLayoutStamp && next != layoutStamp) || nextContent != contentRevision) backgroundMotionUntil = now + 180;
+            layoutStamp = next;
+            contentRevision = nextContent;
+            hasLayoutStamp = true;
+            if (now < backgroundMotionUntil) RequestFrame();
+        }
+        catch (Exception ex) { if (!disposed) LastError = ex.GetType().Name; }
+        finally { layoutProbeInFlight = false; }
     }
 
     internal void BeginVisualDrag(int x, int y, int width, int height)
@@ -234,31 +244,36 @@ internal sealed class DesktopGlassSource : IDisposable
         bool compareScene = left == atlasX && top == atlasY;
         ulong sceneLayout = 0;
         long sceneContent = 0;
-        if (followMovingHost)
-        {
-            sceneLayout = WindowBackdropCapture.GetLayoutStamp(handle, left, top, right - left, bottom - top);
-            sceneContent = CompositorWindowCapture.Revision;
-            // Pure movement inside the same scene only changes the sampling transform.
-            // Keep the low-rate refresh for source lifetime and capture recovery.
-            if (hasCapturedSceneStamp && compareScene && previous != null &&
-                previous.Width == right - left && previous.Height == bottom - top &&
-                sceneLayout == capturedLayoutStamp && sceneContent == capturedContentRevision &&
-                DateTime.UtcNow - lastCapture < TimeSpan.FromMilliseconds(CaptureInterval)) return;
-        }
+        bool movingScene = followMovingHost;
+        bool capturedStamp = hasCapturedSceneStamp;
+        ulong previousLayout = capturedLayoutStamp;
+        long previousContent = capturedContentRevision;
+        bool recentlyCaptured = DateTime.UtcNow - lastCapture < TimeSpan.FromMilliseconds(CaptureInterval);
         inFlight = true;
-        lastCapture = DateTime.UtcNow;
         try
         {
             var captured = await Task.Run(() =>
             {
+                if (movingScene)
+                {
+                    sceneLayout = WindowBackdropCapture.GetLayoutStamp(handle, left, top, right - left, bottom - top);
+                    sceneContent = CompositorWindowCapture.Revision;
+                    // Only transform the existing texture when its screen-anchored scene is unchanged.
+                    if (capturedStamp && compareScene && previous != null &&
+                        previous.Width == right - left && previous.Height == bottom - top &&
+                        sceneLayout == previousLayout && sceneContent == previousContent && recentlyCaptured)
+                        return (Frame: previous, Unchanged: true, Scratch: scratchBuffer, Skipped: true);
+                }
                 int byteCount = checked((right - left) * (bottom - top) * 4);
                 var scratch = scratchBuffer?.Length != byteCount ? new byte[byteCount] : scratchBuffer;
                 var fresh = WindowBackdropCapture.CaptureAt(handle, left, top, right - left, bottom - top, outputBuffer, scratch);
                 bool unchanged = compareScene && fresh.Success && previous != null &&
                     fresh.Width == previous.Width && fresh.Height == previous.Height &&
                     fresh.PixelsBGRA.AsSpan().SequenceEqual(previous.PixelsBGRA);
-                return (Frame: fresh, Unchanged: unchanged, Scratch: scratch);
+                return (Frame: fresh, Unchanged: unchanged, Scratch: scratch, Skipped: false);
             });
+            if (captured.Skipped) return;
+            lastCapture = DateTime.UtcNow;
             var frame = captured.Frame;
             if (disposed || frozen || !IsActive) return;
             if (!frame.Success) { if (!frame.PendingRegion) LastError = frame.Error; return; }

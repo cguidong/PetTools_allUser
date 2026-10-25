@@ -537,7 +537,7 @@ internal static class WindowBackdropCapture
                 byte[]? deskSlice = null;
                 if (deskHost != IntPtr.Zero && GetWindowVisualBounds(deskHost, out Rect deskBounds))
                 {
-                    deskSlice = CaptureWindowSlice(deskHost, deskBounds, target, sliceBuffer);
+                    deskSlice = CaptureDesktopSlice(deskHost, deskBounds, target, sliceBuffer);
                 }
 
                 // Check if deskSlice has wallpaper content
@@ -881,8 +881,44 @@ internal static class WindowBackdropCapture
     private static bool refreshingSnapshot;
     private const int SnapshotPixelBudget = 12_000_000;
 
+    private static byte[]? CaptureDesktopSlice(IntPtr window, Rect bounds, Rect target, byte[]? reusable)
+    {
+        int width = target.Right - target.Left, height = target.Bottom - target.Top;
+        // Observe the shell without asking Explorer to repaint an entire monitor.
+        // Retain the compatibility snapshot only as a bounded fallback.
+        if (CompositorWindowCapture.TryGetFrame(window, target.Left, target.Top, width, height, out var frame) && frame != null)
+        {
+            using var lease = frame;
+            if (TryGetCompositorBounds(window, frame.Width, frame.Height, out var origin))
+            {
+                var crop = new Rect(origin.Left + frame.PixelLeft, origin.Top + frame.PixelTop,
+                    origin.Left + frame.PixelLeft + frame.PixelWidth, origin.Top + frame.PixelTop + frame.PixelHeight);
+                if (Intersect(target, origin, out var needed) && needed.Left >= crop.Left && needed.Top >= crop.Top &&
+                    needed.Right <= crop.Right && needed.Bottom <= crop.Bottom)
+                {
+                    int length = checked(width * height * 4);
+                    byte[] slice = reusable?.Length == length ? reusable : new byte[length];
+                    Array.Clear(slice);
+                    for (int y = needed.Top; y < needed.Bottom; y++)
+                        Buffer.BlockCopy(frame.PixelsBGRA, ((y - crop.Top) * frame.PixelWidth + needed.Left - crop.Left) * 4,
+                            slice, ((y - target.Top) * width + needed.Left - target.Left) * 4, (needed.Right - needed.Left) * 4);
+                    // The legacy desktop compositor expects opaque RGB. A transparent
+                    // shell surface needs its compatibility snapshot to avoid black fringes.
+                    bool opaque = true;
+                    for (int y = needed.Top; opaque && y < needed.Bottom; y++)
+                        for (int x = needed.Left; x < needed.Right; x++)
+                            if (slice[((y - target.Top) * width + x - target.Left) * 4 + 3] != 255)
+                            { opaque = false; break; }
+                    if (opaque) return slice;
+                }
+                else CompositorWindowCapture.RequestRefresh(window);
+            }
+        }
+        return CaptureWindowSlice(window, bounds, target, reusable, minimumRefreshMilliseconds: 1000);
+    }
+
     private static byte[]? CaptureWindowSlice(IntPtr window, Rect bounds, Rect target, byte[]? reusable = null,
-        List<Rect>? trayCoverage = null, List<Rect>? windowCoverage = null)
+        List<Rect>? trayCoverage = null, List<Rect>? windowCoverage = null, int minimumRefreshMilliseconds = 100)
     {
         if (!GetWindowRect(window, out bounds)) return null;
         int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
@@ -896,6 +932,10 @@ internal static class WindowBackdropCapture
         long now = Environment.TickCount64;
         lock (snapshotLock)
         {
+            var expired = new List<IntPtr>();
+            foreach (var entry in snapshots)
+                if (now - entry.Value.Used >= 10000 || !IsWindow(entry.Key)) expired.Add(entry.Key);
+            foreach (var key in expired) snapshots.Remove(key);
             snapshots.TryGetValue(window, out snapshot);
             if (snapshot != null && (snapshot.Width != width || snapshot.Height != height))
             {
@@ -931,7 +971,7 @@ internal static class WindowBackdropCapture
         lock (snapshotLock)
         {
             snapshot.Used = now;
-            if (!refreshingSnapshot && now - snapshot.Updated >= 100)
+            if (!refreshingSnapshot && now - snapshot.Updated >= minimumRefreshMilliseconds)
             {
                 refreshingSnapshot = true;
                 var pending = snapshot;

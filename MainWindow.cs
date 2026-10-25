@@ -1018,9 +1018,12 @@ public sealed class MainWindow : Window
         var ink = Windows.UI.Color.FromArgb(255, Mix(24, 255), Mix(26, 255), Mix(30, 255));
         if (statsForeground.Color != ink) statsForeground.Color = ink;
         byte eyeTone = Mix(0, 255);
-        eyeBackground.Color = Windows.UI.Color.FromArgb(16, eyeTone, eyeTone, eyeTone);
-        eyeHoverBackground.Color = Windows.UI.Color.FromArgb(36, eyeTone, eyeTone, eyeTone);
-        eyePressedBackground.Color = Windows.UI.Color.FromArgb(52, eyeTone, eyeTone, eyeTone);
+        var eyeColor = Windows.UI.Color.FromArgb(16, eyeTone, eyeTone, eyeTone);
+        if (eyeBackground.Color != eyeColor) eyeBackground.Color = eyeColor;
+        var hoverColor = Windows.UI.Color.FromArgb(36, eyeTone, eyeTone, eyeTone);
+        if (eyeHoverBackground.Color != hoverColor) eyeHoverBackground.Color = hoverColor;
+        var pressedColor = Windows.UI.Color.FromArgb(52, eyeTone, eyeTone, eyeTone);
+        if (eyePressedBackground.Color != pressedColor) eyePressedBackground.Color = pressedColor;
         var tint = Windows.UI.Color.FromArgb(210, Mix(245, 40), Mix(245, 40), Mix(248, 44));
         if (statsBackground.Color != tint) statsBackground.Color = tint;
         if (statsGlass.FallbackColor != tint) statsGlass.FallbackColor = tint;

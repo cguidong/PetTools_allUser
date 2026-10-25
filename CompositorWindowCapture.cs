@@ -57,7 +57,7 @@ internal static class CompositorWindowCapture
     static readonly object gate = new object();
     static readonly Dictionary<IntPtr, Source> sources = new Dictionary<IntPtr, Source>();
     static readonly Dictionary<IntPtr, long> retryAfter = new Dictionary<IntPtr, long>();
-    const int FrameIntervalMilliseconds = 100, FailureRetryMilliseconds = 5000;
+    const int FrameIntervalMilliseconds = 100, FastFrameIntervalMilliseconds = 8, FailureRetryMilliseconds = 5000;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
     static string? lastError;
@@ -159,6 +159,7 @@ internal static class CompositorWindowCapture
         bool cropDisabled, fastCapture;
         long contentActiveUntil;
         bool regionRefresh;
+        int refreshScheduled;
         Direct3D11CaptureFrame? pending;
         Direct3D11CaptureFrame? retained;
         IDirect3DDevice? device;
@@ -236,16 +237,21 @@ internal static class CompositorWindowCapture
 
         internal void RequestRefresh()
         {
+            if (Interlocked.Exchange(ref refreshScheduled, 1) != 0) return;
             _ = Task.Run(() =>
             {
-                lock (sync)
+                try
                 {
-                    if (disposed) return;
-                    regionRefresh = true;
-                    if (inFlight || retained == null) return;
-                    inFlight = true;
-                    _ = Task.Run(ReadFramesAsync);
+                    lock (sync)
+                    {
+                        if (disposed) return;
+                        regionRefresh = true;
+                        if (inFlight || retained == null) return;
+                        inFlight = true;
+                        _ = Task.Run(ReadFramesAsync);
+                    }
                 }
+                finally { Volatile.Write(ref refreshScheduled, 0); }
             });
         }
 
@@ -327,7 +333,8 @@ internal static class CompositorWindowCapture
                         if (disposed || (pending == null && !regionRefresh)) return;
                         refreshRequested = regionRefresh;
                     }
-                    int delay = refreshRequested || fast ? 0 : (int)Math.Max(0, FrameIntervalMilliseconds - (Environment.TickCount64 - lastRead));
+                    int interval = refreshRequested || fast ? FastFrameIntervalMilliseconds : FrameIntervalMilliseconds;
+                    int delay = (int)Math.Max(0, interval - (Environment.TickCount64 - lastRead));
                     if (delay > 0) await Task.Delay(delay);
                     Direct3D11CaptureFrame? captured;
                     lock (sync)
@@ -344,7 +351,7 @@ internal static class CompositorWindowCapture
                     {
                         var size = captured.ContentSize;
                         if (size.Width <= 0 || size.Height <= 0 || (long)size.Width * size.Height > PixelBudget) continue;
-                        var surface = captured.Surface;
+                        using var surface = captured.Surface;
                         var original = surface.Description;
                         if (original.Width != size.Width || original.Height != size.Height)
                         { Volatile.Write(ref closed, true); Dispose(); return; }
@@ -444,7 +451,7 @@ internal static class CompositorWindowCapture
             lock (sync)
             {
                 if (disposed || session == null || fastCapture == fast) return;
-                LimitCaptureRate(session, fast ? 0 : FrameIntervalMilliseconds);
+                LimitCaptureRate(session, fast ? FastFrameIntervalMilliseconds : FrameIntervalMilliseconds);
                 Volatile.Write(ref fastCapture, fast);
             }
         }
