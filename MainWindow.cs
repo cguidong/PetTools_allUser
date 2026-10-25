@@ -394,7 +394,7 @@ public sealed class MainWindow : Window
         pet.RightTapped += (_, e) =>
         {
             var menu = CreateWidgetMenu();
-            foreach (string id in new[] { "cat", "samoyed", "polar-bear" })
+            foreach (string id in new[] { "red-panda", "cow-cat", "corgi", "panda", "polar-bear" })
             {
                 string selected = id;
                 Add(menu, PetName(id), () => SelectPet(selected));
@@ -423,12 +423,19 @@ public sealed class MainWindow : Window
         rest.FontSize = Math.Round(pay.FontSize * logicalSize / 22 * dpi) / dpi;
         rest.FontWeight = unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium;
     }
-    static string PetName(string id) => id == "samoyed" ? "萨摩耶" : id == "polar-bear" ? "大白熊" : "小猫";
+    static string PetName(string id) => id switch { "red-panda" => "小熊猫", "corgi" => "柯基", "panda" => "熊猫", "polar-bear" => "北极熊", _ => "奶牛猫" };
+    static string NormalizePet(string id) => id == "cat" ? "cow-cat" : id == "samoyed" ? "corgi" : id == "red-panda" || id == "cow-cat" || id == "corgi" || id == "panda" || id == "polar-bear" ? id : "cow-cat";
+
+    void PreviewPet(string id)
+    {
+        id = NormalizePet(id);
+        petRevision++; walkTimer?.Stop(); settings.PetId = id; LoadPet();
+        if (DateTime.Now < reminderUntil) _ = StartWalk();
+    }
 
     void SelectPet(string id)
     {
-        petRevision++; walkTimer?.Stop(); settings.PetId = id; LoadPet();
-        if (DateTime.Now < reminderUntil) _ = StartWalk();
+        PreviewPet(id);
         Save();
     }
 
@@ -449,7 +456,7 @@ public sealed class MainWindow : Window
     void ApplySettings()
     {
         settings.Calendar = calendar;
-        if (settings.PetId != "cat" && settings.PetId != "samoyed" && settings.PetId != "polar-bear") settings.PetId = "cat";
+        settings.PetId = NormalizePet(settings.PetId);
         ApplyWidgetSize();
         ApplyMouseClickThrough();
         LoadPet(); reminders.Reset(); Refresh();
@@ -1224,7 +1231,7 @@ public sealed class MainWindow : Window
     {
         if (exiting || disposed) return;
         if (settingsWindow != null) { settingsWindow.Activate(); return; }
-        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, SelectPet, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
+        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, PreviewPet, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
         settingsWindow.Closed += (_, __) =>
         {
             settingsWindow = null;

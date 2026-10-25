@@ -95,3 +95,7 @@ Microsoft Visual C++ v14 x64 运行库已经嵌入安装器，也保留在发布
 ## 1.0.7 版本发布
 
 项目版本提升为 1.0.7（OffWorkWidget.WinUI.csproj、OffWorkWidget.iss），重新自包含发布至 publish 并通过 Inno Setup 编译生成安装包 下班倒计时-Setup-1.0.7-x64.exe、同名 ZIP 包及 SHA256 校验文件。安装包已输出至 下班倒计时-安装包 目录。
+
+## 2026-10-25 五宠版重打包与安装验证
+
+用当前五宠 publish 重打正式 1.0.7 安装包，80,949,974 字节，SHA256 `43DDE8EFD8E619212CF111582569141920167ABC8DFED2F02EA91E5AAA1DC865`。正式包与 QA 包分别在临时目录实际安装：版本 1.0.7，525 个载荷文件逐一 SHA256 与 publish 一致，开始菜单快捷方式、卸载项正常；安装版读取现有 `%LOCALAPPDATA%\OffWorkWidget` 配置，运行前后 settings.xml/privacy.db 哈希不变。QA 安装版与便携版使用同一隔离配置完成双向同步：熊猫 → 安装版保存北极熊 → 便携版读取并保存小熊猫 → 安装版读取小熊猫；卸载后安装目录、快捷方式和卸载项清除，配置保留。安装包 ZIP 已同步。VC++ 首次授权/重启分支和代码签名仍未在干净系统验证。

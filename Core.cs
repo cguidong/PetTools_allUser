@@ -38,7 +38,7 @@ namespace OffWorkWidget
         public bool MouseClickThrough = false;
         public bool NightMode = false;
         public bool AutomaticAppearance = true;
-        public string PetId = "cat";
+        public string PetId = "cow-cat";
         public bool UseChinaHolidays = true;
         internal ChinaHolidayCalendar Calendar;
         public int RestDays = 65; // Sunday = bit 0, Saturday = bit 6.

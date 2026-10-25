@@ -46,7 +46,7 @@ namespace OffWorkWidget.WinUI
         TextBlock adjustmentSummary = null!;
         Microsoft.UI.Dispatching.DispatcherQueueTimer? scrollRailTimer;
 
-        bool windowClosed;
+        bool windowClosed, petCommitted;
         TimeSpan startTime, endTime;
         TimeSpan dayTimeStart, dayTimeEnd;
         bool dayTimeEnabled, loadingSchedule;
@@ -114,6 +114,9 @@ namespace OffWorkWidget.WinUI
         readonly SolidColorBrush headerBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush footerBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush footerActionBrush = new SolidColorBrush();
+        readonly SolidColorBrush petWheelSurfaceBrush = new SolidColorBrush();
+        readonly RadialGradientBrush petWheelFade = new RadialGradientBrush();
+        Border? footerBar;
         readonly LinearGradientBrush footerFade = new LinearGradientBrush();
         readonly LinearGradientBrush headerFade = new LinearGradientBrush();
         readonly Border headerFadeLayer = new Border { Height = 24, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Opacity = 0 };
@@ -130,6 +133,7 @@ namespace OffWorkWidget.WinUI
         bool salaryAuthorized, automatic, night, privacyPromptOpen;
         string? salaryDraft;
         string petId;
+        readonly string initialPetId;
         decimal observedSalary;
         IntPtr hwnd;
         readonly AppWindow native;
@@ -155,7 +159,7 @@ namespace OffWorkWidget.WinUI
         {
             this.current = current; this.privacy = privacy; this.toggleSalaryLayout = toggleSalaryLayout;
             this.hideSalary = hideSalary; this.selectPet = selectPet; this.saveSettings = saveSettings; this.previewScale = previewScale;
-            automatic = current.AutomaticAppearance; night = current.NightMode; petId = current.PetId; observedSalary = current.Salary;
+            automatic = current.AutomaticAppearance; night = current.NightMode; petId = current.PetId; initialPetId = petId; observedSalary = current.Salary;
             alternatingWeekends = current.AlternatingWeekends;
             doubleRestWeekStart = DateTime.TryParseExact(current.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime anchor)
                 ? OffWorkWidget.Logic.WeekStart(anchor) : OffWorkWidget.Logic.WeekStart(DateTime.Today);
@@ -239,6 +243,7 @@ namespace OffWorkWidget.WinUI
             ApplyThemeBrushes();
             Closed += (_, __) =>
             {
+                RevertPetPreview();
                 windowClosed = true; scrollRailTimer?.Stop();
                 CancelScaleGesture(); scaleInput?.ReleasePointerCaptures();
                 CompositionTarget.Rendering -= AnimateAccordion; animatingAccordion = false;
@@ -250,8 +255,16 @@ namespace OffWorkWidget.WinUI
             };
         }
 
+        void RevertPetPreview()
+        {
+            if (petCommitted || petId == initialPetId) return;
+            petId = initialPetId;
+            selectPet(petId);
+        }
+
         void CloseSettings()
         {
+            RevertPetPreview();
             // Hide the composed frame before Closed disconnects its backdrop and rounded clip.
             native.Hide();
             Close();
@@ -355,10 +368,16 @@ namespace OffWorkWidget.WinUI
         void ApplyThemeBrushes()
         {
             bool dark = root.ActualTheme == ElementTheme.Dark;
-            pageBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 16 : 255), 28, 28, 30) : Windows.UI.Color.FromArgb((byte)(automatic ? 20 : 255), 242, 242, 247);
+            // Automatic appearance keeps the window's acrylic backdrop, but moves the
+            // milky surface that used to belong to flyouts onto the page itself.
+            pageBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 80 : 255), 40, 40, 44) : Windows.UI.Color.FromArgb((byte)(automatic ? 115 : 255), 255, 255, 255);
             root.Background = pageBackgroundBrush;
             footerActionBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 58, 58, 60) : Windows.UI.Color.FromArgb(255, 229, 229, 234);
             footerBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb((byte)(automatic ? 190 : 255), 28, 28, 30) : Windows.UI.Color.FromArgb((byte)(automatic ? 210 : 255), 242, 242, 247);
+            petWheelSurfaceBrush.Color = automatic
+                ? (dark ? Windows.UI.Color.FromArgb(160, 35, 35, 38) : Windows.UI.Color.FromArgb(255, 255, 255, 255))
+                : (dark ? Windows.UI.Color.FromArgb(180, 44, 44, 46) : Windows.UI.Color.FromArgb(255, 255, 255, 255));
+            UpdatePetWheelFade();
             if (footerFade.GradientStops.Count == 2)
             {
                 var c = footerBackgroundBrush.Color;
@@ -396,6 +415,17 @@ namespace OffWorkWidget.WinUI
             }
             ClearFrameBackground();
         }
+
+        void UpdatePetWheelFade()
+        {
+            if (petWheelFade.GradientStops.Count != 3) return;
+            var c = petWheelSurfaceBrush.Color;
+            var clear = Windows.UI.Color.FromArgb(0, c.R, c.G, c.B);
+            petWheelFade.GradientStops[0].Color = c;
+            petWheelFade.GradientStops[1].Color = c;
+            petWheelFade.GradientStops[2].Color = clear;
+        }
+
 
         Grid CreateScrollSurface()
         {
@@ -521,11 +551,16 @@ namespace OffWorkWidget.WinUI
 
         void BuildPetSelector()
         {
+            string[] ids = { "red-panda", "cow-cat", "corgi", "panda", "polar-bear" };
+            int count = ids.Length, repeats = 7, visibleRows = 3;
+            double rowHeight = 50, viewportHeight = rowHeight * visibleRows;
+            double padding = (viewportHeight - rowHeight) / 2;
+
             var petBtn = new Button
             {
                 Padding = new Thickness(6, 4, 6, 4),
                 CornerRadius = new CornerRadius(14),
-                Background = cardBackgroundBrush,
+                Background = inputBackgroundBrush,
                 BorderThickness = new Thickness(0),
                 VerticalAlignment = VerticalAlignment.Center
             };
@@ -536,56 +571,213 @@ namespace OffWorkWidget.WinUI
             petStack.Children.Add(petThumb); petStack.Children.Add(petArrow);
             petBtn.Content = petStack;
 
-            var petPanel = new StackPanel { Width = 176, Spacing = 4 };
-            var petMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.BottomEdgeAlignedRight, Content = petPanel };
-            var menuStyle = new Style(typeof(FlyoutPresenter));
-            menuStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8)));
-            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(16)));
-            menuStyle.Setters.Add(new Setter(Control.BackgroundProperty, cardBackgroundBrush));
-            menuStyle.Setters.Add(new Setter(Control.BorderBrushProperty, dividerBrush));
-            menuStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-            petMenu.FlyoutPresenterStyle = menuStyle;
-            var petRows = new List<(string Id, Button Button, FontIcon Check)>();
-            foreach (string id in new[] { "cat", "samoyed", "polar-bear" })
+            var petImages = new Dictionary<string, BitmapImage>();
+            foreach (string id in ids) petImages[id] = PetImage(id);
+
+            var wheelRows = new StackPanel();
+            wheelRows.Children.Add(new Border { Height = padding });
+            var rowBorders = new List<Border>();
+            var wheelViewer = new ScrollViewer
             {
-                string selected = id;
-                var row = new Grid { ColumnSpacing = 10 };
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });
-                row.ColumnDefinitions.Add(new ColumnDefinition());
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
-                row.Children.Add(new Image { Source = PetImage(id), Width = 32, Height = 34 });
-                var name = new TextBlock { Text = PetName(id), FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
-                var check = new FontIcon { Glyph = "\uE73E", FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontSize = 13, Foreground = accentBlue };
-                Grid.SetColumn(name, 1); row.Children.Add(name); Grid.SetColumn(check, 2); row.Children.Add(check);
-                var item = new Button { Content = row, Height = 46, Padding = new Thickness(8, 4, 8, 4), CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch };
-                item.FocusVisualPrimaryBrush = accentBlue; item.FocusVisualPrimaryThickness = new Thickness(1.5);
-                item.Resources["ButtonBackgroundPointerOver"] = inputBackgroundBrush;
-                item.Resources["ButtonBackgroundPressed"] = timePressedBrush;
-                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item, "选择" + PetName(id));
-                item.Click += (_, __) =>
+                Height = viewportHeight, Content = wheelRows,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                HorizontalScrollMode = ScrollMode.Disabled,
+                VerticalScrollMode = ScrollMode.Enabled,
+                VerticalSnapPointsType = SnapPointsType.None,
+                VerticalSnapPointsAlignment = Microsoft.UI.Xaml.Controls.Primitives.SnapPointsAlignment.Center,
+                IsTabStop = true, UseSystemFocusVisuals = false
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wheelViewer, "桌面宠物选择");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(wheelViewer, "PetWheel");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(wheelViewer, "上下滚动选择宠物，点击宠物或设置页空白处完成选择");
+            Action<int>? finishRow = null;
+            for (int index = 0; index < count * repeats; index++)
+            {
+                int wheelIndex = index;
+                string id = ids[index % count];
+                var content = new StackPanel { Spacing = 1, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                content.Children.Add(new Image { Source = petImages[id], Width = 28, Height = 32, HorizontalAlignment = HorizontalAlignment.Center });
+                content.Children.Add(new TextBlock { Text = PetName(id), FontSize = 12, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Center });
+                var row = new Border { Height = rowHeight, Child = content, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0 };
+                row.Tapped += (_, __) =>
                 {
-                    petId = selected;
-                    petThumb.Source = PetImage(selected);
-                    selectPet(selected);
-                    petMenu.Hide();
+                    wheelViewer.ChangeView(null, wheelIndex * rowHeight, null, false);
+                    finishRow?.Invoke(wheelIndex);
                 };
-                petRows.Add((id, item, check)); petPanel.Children.Add(item);
+                rowBorders.Add(row); wheelRows.Children.Add(row);
             }
+            wheelRows.Children.Add(new Border { Height = padding });
+
+            petWheelFade.Center = new Windows.Foundation.Point(.5, .5);
+            petWheelFade.GradientOrigin = new Windows.Foundation.Point(.5, .5);
+            petWheelFade.RadiusX = .46;
+            petWheelFade.RadiusY = .46;
+            petWheelFade.GradientStops.Add(new GradientStop { Offset = 0 });
+            petWheelFade.GradientStops.Add(new GradientStop { Offset = .5 });
+            petWheelFade.GradientStops.Add(new GradientStop { Offset = 1 });
+
+            var wheelHost = new Grid
+            {
+                Height = viewportHeight,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent)
+            };
+            wheelHost.Children.Add(wheelViewer);
+            wheelHost.AddHandler(UIElement.PointerWheelChangedEvent, new PointerEventHandler((_, args) =>
+            {
+                int delta = args.GetCurrentPoint(wheelViewer).Properties.MouseWheelDelta;
+                if (delta == 0) return;
+                int current = (int)Math.Round(wheelViewer.VerticalOffset / rowHeight);
+                int direction = delta > 0 ? -1 : 1;
+                int target = Math.Clamp(current + direction, 0, count * repeats - 1);
+                wheelViewer.ChangeView(null, target * rowHeight, null, false);
+                args.Handled = true;
+            }), true);
+
+            bool initialized = false;
+            int previousFirst = 0, previousLast = -1;
+            void ApplyPet(string id)
+            {
+                if (id == petId) return;
+                petId = id;
+                petThumb.Source = petImages[id];
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(petBtn, "当前：" + PetName(id));
+                selectPet(id);
+            }
+            void UpdateWheelSelection()
+            {
+                double position = wheelViewer.VerticalOffset / rowHeight;
+                int index = Math.Clamp((int)Math.Round(position), 0, count * repeats - 1);
+                ApplyPet(ids[index % count]);
+                for (int i = previousFirst; i <= previousLast; i++) rowBorders[i].Opacity = 0;
+                int first = Math.Max(0, (int)Math.Floor(position) - 3);
+                int last = Math.Min(rowBorders.Count - 1, (int)Math.Ceiling(position) + 3);
+                for (int i = first; i <= last; i++)
+                    rowBorders[i].Opacity = Math.Max(0, 1 - Math.Abs(i - position) * .7);
+                previousFirst = first; previousLast = last;
+            }
+            EventHandler<object>? initialize = null;
+            initialize = (_, __) =>
+            {
+                if (wheelViewer.ExtentHeight <= viewportHeight) return;
+                initialized = true;
+                wheelViewer.LayoutUpdated -= initialize;
+                wheelViewer.ChangeView(null, (count * 3 + Math.Max(0, Array.IndexOf(ids, petId))) * rowHeight, null, false);
+                UpdateWheelSelection();
+            };
+            wheelViewer.LayoutUpdated += initialize;
+            wheelViewer.ViewChanged += (_, args) =>
+            {
+                if (!initialized) return;
+                UpdateWheelSelection();
+                if (!args.IsIntermediate)
+                {
+                    int index = (int)Math.Round(wheelViewer.VerticalOffset / rowHeight);
+                    if (Math.Abs(wheelViewer.VerticalOffset - index * rowHeight) > .1)
+                    {
+                        wheelViewer.ChangeView(null, index * rowHeight, null, false);
+                        return;
+                    }
+                    if (index < count || index >= count * (repeats - 1))
+                        wheelViewer.ChangeView(null, (count * 3 + index % count) * rowHeight, null, false);
+                }
+            };
+            wheelViewer.KeyDown += (_, args) =>
+            {
+                int step = args.Key == Windows.System.VirtualKey.Up ? -1 : args.Key == Windows.System.VirtualKey.Down ? 1 : 0;
+                if (step == 0) return;
+                wheelViewer.ChangeView(null, wheelViewer.VerticalOffset + step * rowHeight, null, false);
+                args.Handled = true;
+            };
+
+            var panel = new StackPanel { Width = 132 };
+            panel.Children.Add(wheelHost);
+            var focusSink = new Button
+            {
+                Width = 1, Height = 1, Opacity = 0, IsTabStop = true,
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                BorderThickness = new Thickness(0), Padding = new Thickness(0),
+                HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(focusSink,
+                Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Raw);
+            var flyoutRoot = new Grid();
+            flyoutRoot.Children.Add(panel);
+            flyoutRoot.Children.Add(focusSink);
+
+            var petMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left };
+            var menuSurface = new Border
+            {
+                CornerRadius = new CornerRadius(16), Padding = new Thickness(8),
+                Background = petWheelFade, Child = flyoutRoot
+            };
+            petMenu.Content = menuSurface;
+            var menuStyle = new Style(typeof(FlyoutPresenter));
+            menuStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
+            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(16)));
+            menuStyle.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Microsoft.UI.Colors.Transparent)));
+            menuStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+            petMenu.FlyoutPresenterStyle = menuStyle;
+            finishRow = wheelIndex =>
+            {
+                ApplyPet(ids[wheelIndex % count]);
+                petMenu.Hide();
+            };
+
             bool petKeyboardOpen = false;
-            petMenu.Opened += (_, __) => petRows.First(row => row.Id == petId).Button.Focus(petKeyboardOpen ? FocusState.Keyboard : FocusState.Pointer);
             petMenu.Opening += (_, __) =>
             {
                 petKeyboardOpen = petBtn.FocusState == FocusState.Keyboard;
-                petPanel.RequestedTheme = root.ActualTheme;
-                foreach (var row in petRows)
+                panel.RequestedTheme = root.ActualTheme;
+            };
+            petMenu.Opened += (_, __) =>
+            {
+                wheelViewer.ChangeView(null, (count * 3 + Math.Max(0, Array.IndexOf(ids, petId))) * rowHeight, null, false);
+                focusSink.Focus(petKeyboardOpen ? FocusState.Keyboard : FocusState.Pointer);
+            };
+            focusSink.KeyDown += (_, args) =>
+            {
+                int step = args.Key == Windows.System.VirtualKey.Up ? -1
+                    : args.Key == Windows.System.VirtualKey.Down ? 1 : 0;
+                if (step != 0)
                 {
-                    bool selected = row.Id == petId;
-                    row.Button.Background = selected ? inputBackgroundBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-                    row.Check.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
+                    wheelViewer.ChangeView(null, wheelViewer.VerticalOffset + step * rowHeight, null, false);
+                    args.Handled = true;
+                }
+                else if (args.Key == Windows.System.VirtualKey.Escape)
+                {
+                    petMenu.Hide();
+                    args.Handled = true;
                 }
             };
-            petBtn.Flyout = petMenu;
+
+            void ShowPetMenu()
+            {
+                // Prefer a vertically centered flyout to the left of the selector;
+                // if that would cross the fixed footer, align its bottom instead.
+                const double popupHeight = 172;
+                double anchorCenter = 0, footerTop = root.ActualHeight;
+                try
+                {
+                    var origin = petBtn.TransformToVisual(root).TransformPoint(default);
+                    anchorCenter = origin.Y + petBtn.ActualHeight / 2;
+                    if (footerBar != null)
+                        footerTop = footerBar.TransformToVisual(root).TransformPoint(default).Y;
+                }
+                catch (ArgumentException)
+                {
+                }
+                bool centeredFits = anchorCenter + popupHeight / 2 <= footerTop - 4;
+                petMenu.Placement = centeredFits
+                    ? Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left
+                    : Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.LeftEdgeAlignedBottom;
+                petMenu.ShowAt(petBtn);
+            }
+            petBtn.Click += (_, __) => { if (petMenu.IsOpen) petMenu.Hide(); else ShowPetMenu(); };
             ToolTipService.SetToolTip(petBtn, "切换桌面宠物");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(petBtn, "桌面宠物");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(petBtn, "PetSelector");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(petBtn, "当前：" + PetName(petId));
             petSelector = petBtn;
         }
 
@@ -644,6 +836,7 @@ namespace OffWorkWidget.WinUI
             };
             btn.Click += (_, __) => onClick();
             ToolTipService.SetToolTip(btn, tooltip);
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(btn, tooltip);
             return btn;
         }
 
@@ -2289,6 +2482,7 @@ namespace OffWorkWidget.WinUI
                 BorderThickness = new Thickness(0),
                 Padding = new Thickness(16, 10, 16, 12)
             };
+            footerBar = footer;
             var panel = new StackPanel { Spacing = 8 };
             panel.Children.Add(error);
 
@@ -2549,6 +2743,7 @@ namespace OffWorkWidget.WinUI
             {
                 OffWorkWidget.Logic.Validate(next);
                 saveSettings(next);
+                petCommitted = true;
                 if (startup.IsEnabled && startup.IsOn != startupInitiallyEnabled)
                 {
                     try
@@ -2573,7 +2768,7 @@ namespace OffWorkWidget.WinUI
         }
 
         static BitmapImage PetImage(string id) => new BitmapImage(new Uri("ms-appx:///assets/" + id + ".png"));
-        static string PetName(string id) => id == "samoyed" ? "萨摩耶" : id == "polar-bear" ? "大白熊" : "小猫";
+        static string PetName(string id) => id switch { "red-panda" => "小熊猫", "corgi" => "柯基", "panda" => "熊猫", "polar-bear" => "北极熊", _ => "奶牛猫" };
 
         [StructLayout(LayoutKind.Sequential)] struct ClientRect { internal int Left, Top, Right, Bottom; }
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
