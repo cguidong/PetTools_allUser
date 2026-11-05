@@ -29,7 +29,7 @@ public partial class App : Application
         catch(Exception ex)
         {
             RecordFailure(ex);
-            MessageBox(IntPtr.Zero,"启动失败，诊断已记录到 %LOCALAPPDATA%\\OffWorkWidget\\diagnostics\\startup-errors.log。\n错误代码："+ex.HResult.ToString("X8"),"下班倒计时",0x10);
+            MessageBox(IntPtr.Zero,"启动失败，诊断已记录到 %LOCALAPPDATA%\\OffWorkWidget\\diagnostics\\startup-errors.log。\n错误代码："+ex.HResult.ToString("X8"),"有盼",0x10);
             Exit();
         }
     }

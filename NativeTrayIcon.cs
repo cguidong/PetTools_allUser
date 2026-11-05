@@ -20,13 +20,12 @@ internal sealed class NativeTrayIcon : IDisposable
     IntPtr icon;
     bool disposed, added, version4;
     TrayMenuWindow? menu;
-    readonly Func<bool> isDark, isClickThrough;
+    readonly Func<bool> isClickThrough;
 
     internal NativeTrayIcon(IntPtr hwnd, string path, Action showAction,
-        Action settingsAction, Action exitAction, Func<bool> isDark, Action toggleClickThrough, Func<bool> isClickThrough)
+        Action settingsAction, Action exitAction, Action toggleClickThrough, Func<bool> isClickThrough)
     {
         this.hwnd = hwnd;
-        this.isDark = isDark;
         this.toggleClickThrough = toggleClickThrough;
         this.isClickThrough = isClickThrough;
         iconPath = path;
@@ -52,7 +51,7 @@ internal sealed class NativeTrayIcon : IDisposable
     {
         Size = (uint)Marshal.SizeOf<NotifyIconData>(), Window = hwnd, Id = IconId,
         Flags = 0x87, CallbackMessage = callbackMessage, Icon = icon,
-        Tip = "下班倒计时 · 多宠物", Info = "", InfoTitle = ""
+        Tip = "有盼 · 多宠物", Info = "", InfoTitle = ""
     };
 
     void AddIcon()
@@ -135,7 +134,7 @@ internal sealed class NativeTrayIcon : IDisposable
             Shell_NotifyIconW(NimSetFocus, ref data);
         });
         menu.SetClickThrough(isClickThrough());
-        menu.ShowAt(anchor.X, anchor.Y, isDark());
+        menu.ShowAt(anchor.X, anchor.Y, SystemTheme.IsDark());
     }
     public void Dispose()
     {

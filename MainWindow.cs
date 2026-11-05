@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
@@ -49,6 +50,8 @@ public sealed class MainWindow : Window
     double PhysicalScale => Math.Clamp(EffectiveScale, .5, 1.5) * ScaleReference;
     readonly string dataFolder;
     readonly bool smoke;
+    bool smokeLayoutCycle, smokeScaleCycle, smokeScaleFast;
+    DispatcherQueueTimer? cycleStartTimer, cycleTimer;
     readonly PrivacyStore privacy;
     readonly ChinaHolidayCalendar calendar;
     readonly Grid surface = new Grid();
@@ -148,12 +151,34 @@ public sealed class MainWindow : Window
     readonly SolidColorBrush eyePressedBackground = new(Windows.UI.Color.FromArgb(48, 0, 0, 0));
     readonly StackPanel salaryArea = new StackPanel { Spacing = 5 };
     readonly Grid statsRow = new Grid();
-    readonly Grid wishPanel = new Grid { Visibility = Visibility.Collapsed, IsHitTestVisible = false };
-    readonly TextBlock wishName = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1, FontFamily = new FontFamily("Microsoft YaHei"), IsTextScaleFactorEnabled = false };
-    readonly TextBlock wishAmount = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1, TextAlignment = TextAlignment.Right, FontFamily = new FontFamily("Segoe UI"), IsTextScaleFactorEnabled = false };
-    readonly ProgressBar wishProgress = new ProgressBar { Minimum = 0, Maximum = 100, MinHeight = 0, IsHitTestVisible = false };
+    readonly InteractiveCursorGrid statsPages = new InteractiveCursorGrid { Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+    readonly InteractiveCursorGrid statsLayout = new InteractiveCursorGrid();
+    readonly StackPanel statsDots = new StackPanel { Orientation = Orientation.Vertical, Spacing = 4, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 0, 0) };
+    readonly System.Collections.Generic.List<Microsoft.UI.Xaml.Shapes.Ellipse> statsDotShapes = new();
+    readonly System.Collections.Generic.List<FrameworkElement> statsPageItems = new();
+    readonly System.Collections.Generic.List<FrameworkElement> statsCorePages = new();
+    readonly System.Collections.Generic.List<StackPanel> wishPagePanels = new();
+    readonly System.Collections.Generic.List<TextBlock> wishPageNames = new();
+    readonly System.Collections.Generic.List<TextBlock> wishPagePercents = new();
+    readonly System.Collections.Generic.List<Grid> wishBarHosts = new();
+    readonly System.Collections.Generic.List<Border> wishBarTracks = new();
+    readonly System.Collections.Generic.List<Border> wishBarFills = new();
+    readonly System.Collections.Generic.List<ColumnDefinition> wishBarFillColumns = new();
+    readonly System.Collections.Generic.List<ColumnDefinition> wishBarRestColumns = new();
+    bool statsWishMode;
+    string statsWishSignature = "";
+    int statsWishCount, statsDotActiveIndex = -1;
+    int statsPageIndex, statsAvailablePages;
+    bool statsPageAnimating;
+    int statsPageQueued = -1;
+    Storyboard? statsPageStory, statsDotStory, statsDragStory;
+    readonly RectangleGeometry statsPageClip = new();
+    double statsDragStartY, statsDragOffset;
+    bool statsDragging, statsDragMoved, statsDragSettling;
+    int statsDragCurrent, statsDragAdjacent = -1, statsDragDirection;
+    uint statsDragPointerId;
     readonly Border stats = new Border { CornerRadius = new CornerRadius(16), Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(-8, 0, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
-    readonly Image pet = new Image { Width = 132, Height = 150, Stretch = Stretch.Uniform, VerticalAlignment = VerticalAlignment.Bottom };
+    readonly Image pet = new Image { Width = 132, Height = 150, Stretch = Stretch.Uniform, VerticalAlignment = VerticalAlignment.Bottom, IsHitTestVisible = false };
     readonly Image waterPetOverlay = new Image { Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Visibility = Visibility.Collapsed };
     PetAnimationPlayer? petAnimation;
     PetAnimationPlayer? reminderAnimation;
@@ -165,6 +190,7 @@ public sealed class MainWindow : Window
     PetAnimationPlayer? napAnimation;
     bool napActive, napPending;
     int napRevision;
+    DateTime napEndAt = DateTime.MinValue;
     DispatcherQueueTimer? petHoverTimer;
     delegate IntPtr KeyboardHookProc(int code, IntPtr message, IntPtr data);
     KeyboardHookProc? petEnterHookProc;
@@ -198,6 +224,7 @@ public sealed class MainWindow : Window
     readonly IntPtr hwnd;
     NativeTrayIcon? tray;
     WinUIEx.Messaging.WindowMessageMonitor? sessionMonitor;
+    static readonly IntPtr handCursor = LoadCursor(IntPtr.Zero, (IntPtr)32649 /* IDC_HAND */);
     bool sessionNotificationRegistered;
     double nextSessionRegistrationAttempt;
     SettingsWindow? settingsWindow;
@@ -228,7 +255,7 @@ public sealed class MainWindow : Window
         dataFolder = Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") ?? (smoke ? Path.Combine(Path.GetTempPath(), "OffWorkWidget-WinUI-smoke") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"));
         Directory.CreateDirectory(dataFolder);
         GlassProfile.Configure(dataFolder);
-        Title = "下班倒计时";
+        Title = "有盼";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         // Resize/presenter setup can expose native backing before XAML is ready.
         SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
@@ -303,6 +330,12 @@ public sealed class MainWindow : Window
                 if (arg.StartsWith("--smoke-scale=") && double.TryParse(arg.Substring(14), NumberStyles.Float, CultureInfo.InvariantCulture, out double size)) settings.Scale = Math.Clamp(size, .5, 1.5);
                 if (arg == "--smoke-dark") { settings.AutomaticAppearance = false; settings.NightMode = true; }
             }
+        }
+        foreach (string arg in Environment.GetCommandLineArgs())
+        {
+            if (arg == "--smoke-layout-cycle") smokeLayoutCycle = true;
+            if (arg == "--smoke-scale-cycle") smokeScaleCycle = true;
+            if (arg == "--smoke-scale-fast") smokeScaleFast = true;
         }
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(null);
@@ -390,7 +423,17 @@ public sealed class MainWindow : Window
         card.PointerCaptureLost += OnCardPointerCaptureLost;
         card.PointerCanceled += OnCardPointerCaptureLost;
         Activated += (_, args) => { if (args.WindowActivationState == WindowActivationState.Deactivated) { EndDrag(null); glass.SetInteraction(0, 0, false); } };
-        surface.DoubleTapped += (_, __) => OpenSettings();
+        surface.DoubleTapped += (_, e) =>
+        {
+            var position = e.GetPosition(stats);
+            if (settings.WishEnabled && position.X >= 0 && position.Y >= 0 &&
+                position.X < stats.ActualWidth && position.Y < stats.ActualHeight)
+            {
+                e.Handled = true;
+                return;
+            }
+            OpenSettings();
+        };
         native.Closing += (_, e) => { if (!exiting) { EndDrag(null); e.Cancel = true; HideWidget(); } };
         Closed += (_, __) => DisposeResources();
         sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(this);
@@ -425,6 +468,7 @@ public sealed class MainWindow : Window
             }
             Refresh();
             UpdateAppearance();
+            KeepCoinCursor();
             if (emittedCoins > 0) coinScoreBadge.Visibility = elapsed.ElapsedMilliseconds - coinScoreLastAt < 10000 ? Visibility.Visible : Visibility.Collapsed;
         };
         walkTimer = DispatcherQueue.CreateTimer();
@@ -459,6 +503,19 @@ public sealed class MainWindow : Window
             };
             end.Start();
         }
+        if (smokeLayoutCycle || smokeScaleCycle)
+        {
+            cycleStartTimer = DispatcherQueue.CreateTimer();
+            cycleStartTimer.Interval = TimeSpan.FromSeconds(2.5);
+            cycleStartTimer.IsRepeating = false;
+            cycleStartTimer.Tick += (_, __) =>
+            {
+                GlassProfile.Event("cycle-start-timer");
+                if (smokeLayoutCycle) RunSmokeLayoutCycle();
+                else RunSmokeScaleCycle();
+            };
+            cycleStartTimer.Start();
+        }
         // XAML opacity cannot hide the parent HWND's cold native backing.
         // Mask the whole window before its first Activate/Show, until the real
         // content viewport and transparent backing are initialized.
@@ -466,37 +523,23 @@ public sealed class MainWindow : Window
         SetLayeredWindowAttributes(hwnd, 0, 0, 2 /* LWA_ALPHA */);
     }
 
-    static void Add(MenuFlyout menu, string title, Action action)
-    {
-        var item = new MenuFlyoutItem { Text = title };
-        item.Click += (_, __) => action();
-        menu.Items.Add(item);
-    }
-
-    MenuFlyout? widgetMenu;
-    ElementTheme widgetMenuTheme;
-    bool widgetMenuHighContrast, widgetMenuOpen;
+    WidgetMenuWindow? widgetMenu;
+    bool widgetMenuOpen;
     long widgetMenuShownAt;
-    Windows.UI.ViewManagement.AccessibilitySettings? menuAccessibility;
 
-    MenuFlyout EnsureWidgetMenu()
+    WidgetMenuWindow EnsureWidgetMenu()
     {
-        ElementTheme theme = settings.AutomaticAppearance ? surface.ActualTheme
-            : settings.NightMode ? ElementTheme.Dark : ElementTheme.Light;
-        menuAccessibility ??= new Windows.UI.ViewManagement.AccessibilitySettings();
-        bool highContrast = menuAccessibility.HighContrast;
-        if (widgetMenu != null && widgetMenuTheme == theme && widgetMenuHighContrast == highContrast)
-            return widgetMenu;
-        var menu = CreateWidgetMenu(theme, highContrast);
-        Add(menu, "设置", OpenSettings);
-        Add(menu, "隐藏到托盘", HideWidget);
-        Add(menu, "退出", Exit);
-        menu.Opened += (_, __) => { if (ReferenceEquals(widgetMenu, menu)) widgetMenuOpen = true; };
-        menu.Closed += (_, __) => { if (ReferenceEquals(widgetMenu, menu)) widgetMenuOpen = false; };
-        widgetMenu = menu;
-        widgetMenuTheme = theme;
-        widgetMenuHighContrast = highContrast;
-        return menu;
+        if (widgetMenu != null) return widgetMenu;
+        widgetMenu = new WidgetMenuWindow(command =>
+        {
+            switch (command)
+            {
+                case 1: OpenSettings(); break;
+                case 2: HideWidget(); break;
+                case 3: Exit(); break;
+            }
+        }, () => widgetMenuOpen = false);
+        return widgetMenu;
     }
 
     void WarmWidgetMenu()
@@ -504,42 +547,6 @@ public sealed class MainWindow : Window
         if (disposed || exiting) return;
         try { EnsureWidgetMenu(); }
         catch (Exception ex) { Debug.WriteLine("右键菜单预热失败：" + ex.Message); }
-    }
-
-    MenuFlyout CreateWidgetMenu(ElementTheme theme, bool highContrast)
-    {
-        // Popup theme resources may retain the app theme, so set the menu palette explicitly.
-        bool dark = theme == ElementTheme.Dark;
-        var systemColors = new Windows.UI.ViewManagement.UISettings();
-        var background = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.Window)
-            : dark ? Windows.UI.Color.FromArgb(255, 39, 39, 42) : Windows.UI.Color.FromArgb(255, 250, 250, 252);
-        var foreground = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.WindowText)
-            : dark ? Windows.UI.Color.FromArgb(255, 242, 242, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
-        var hover = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.Highlight)
-            : dark ? Windows.UI.Color.FromArgb(255, 60, 60, 65) : Windows.UI.Color.FromArgb(255, 232, 232, 237);
-        var border = highContrast ? foreground : dark ? Windows.UI.Color.FromArgb(255, 68, 68, 74) : Windows.UI.Color.FromArgb(255, 218, 218, 224);
-        var ink = new SolidColorBrush(foreground);
-        var hoverInk = highContrast ? new SolidColorBrush(systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.HighlightText)) : ink;
-        var menu = new MenuFlyout();
-        var style = new Style(typeof(MenuFlyoutPresenter));
-        style.Setters.Add(new Setter(FrameworkElement.RequestedThemeProperty, theme));
-        style.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(background)));
-        style.Setters.Add(new Setter(Control.ForegroundProperty, ink));
-        style.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(border)));
-        menu.MenuFlyoutPresenterStyle = style;
-        menu.Opening += (_, __) =>
-        {
-            foreach (var item in menu.Items)
-            {
-                item.RequestedTheme = theme;
-                item.Foreground = ink;
-                item.Resources["MenuFlyoutItemBackgroundPointerOver"] = new SolidColorBrush(hover);
-                item.Resources["MenuFlyoutItemBackgroundPressed"] = new SolidColorBrush(hover);
-                item.Resources["MenuFlyoutItemForegroundPointerOver"] = hoverInk;
-                item.Resources["MenuFlyoutItemForegroundPressed"] = hoverInk;
-            }
-        };
-        return menu;
     }
     void BuildCard()
     {
@@ -551,11 +558,9 @@ public sealed class MainWindow : Window
         var text = new StackPanel { Spacing = 0, VerticalAlignment = VerticalAlignment.Center };
         caption.Foreground = foreground; countdown.Foreground = foreground;
         text.Children.Add(caption); text.Children.Add(countdown);
-        var row = statsRow;
-        for (int i = 0; i < 3; i++) row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var restColumn = Stat("距休息", rest); var payColumn = Stat("距发薪", pay);
-        restColumn.VerticalAlignment = VerticalAlignment.Center;
-        Grid.SetColumn(payColumn, 1); row.Children.Add(restColumn); row.Children.Add(payColumn);
+        var restPage = Stat("距休息", rest); var payPage = Stat("距发薪", pay);
+        restPage.IsHitTestVisible = false;
+        payPage.IsHitTestVisible = false;
         var salaryHeader = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
         var salaryTitle = new TextBlock { Text = "今天赚了", FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = statsForeground, VerticalAlignment = VerticalAlignment.Center };
         statTitles.Add(salaryTitle);
@@ -579,29 +584,81 @@ public sealed class MainWindow : Window
         salaryHeader.Children.Add(earningsEye);
         salaryArea.Children.Add(salaryHeader); salaryArea.Children.Add(new Border { Child = earned });
         earned.FontSize = 20; earned.FontFamily = new FontFamily("Segoe UI"); earned.FontWeight = Microsoft.UI.Text.FontWeights.Medium; earned.Foreground = statsForeground;
+        for (int i = 0; i < 8; i++)
+        {
+            var wishHeading = new TextBlock
+            {
+                FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = statsForeground, IsTextScaleFactorEnabled = false,
+                TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var wishValue = new TextBlock
+            {
+                FontFamily = new FontFamily("Segoe UI"), FontWeight = Microsoft.UI.Text.FontWeights.Medium,
+                Foreground = statsForeground, IsTextScaleFactorEnabled = false,
+                HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center
+            };
+            var wishRow = new Grid { IsHitTestVisible = false };
+            wishRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            wishRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            wishRow.Children.Add(wishHeading);
+            Grid.SetColumn(wishValue, 1); wishRow.Children.Add(wishValue);
+            var wishBar = new Grid { Height = 5, VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false };
+            var wishTrack = new Border { Background = statsForeground, Opacity = .16, CornerRadius = new CornerRadius(2.5) };
+            var wishFillGrid = new Grid();
+            var fillColumn = new ColumnDefinition { Width = new GridLength(0, GridUnitType.Star) };
+            var restColumn = new ColumnDefinition { Width = new GridLength(100, GridUnitType.Star) };
+            wishFillGrid.ColumnDefinitions.Add(fillColumn); wishFillGrid.ColumnDefinitions.Add(restColumn);
+            var wishFill = new Border { Background = statsForeground, Opacity = .9, CornerRadius = new CornerRadius(2.5) };
+            wishFillGrid.Children.Add(wishFill);
+            wishBar.Children.Add(wishTrack); wishBar.Children.Add(wishFillGrid);
+
+            var wishPage = new StackPanel
+            {
+                Spacing = 4, Margin = new Thickness(12, 0, 12, 0),
+                HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Center,
+                Opacity = 0, IsHitTestVisible = false,
+                RenderTransformOrigin = new Point(.5, .5), RenderTransform = new CompositeTransform()
+            };
+            wishPage.Children.Add(wishRow);
+            wishPage.Children.Add(wishBar);
+            statTitles.Add(wishHeading);
+            wishPagePanels.Add(wishPage); wishPageNames.Add(wishHeading); wishPagePercents.Add(wishValue);
+            wishBarHosts.Add(wishBar); wishBarTracks.Add(wishTrack); wishBarFills.Add(wishFill);
+            wishBarFillColumns.Add(fillColumn); wishBarRestColumns.Add(restColumn);
+            statsPages.Children.Add(wishPage);
+        }
+        statsCorePages.Add(restPage); statsCorePages.Add(payPage); statsCorePages.Add(salaryArea);
+        var row = statsRow;
+        for (int i = 0; i < 3; i++) row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        restPage.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(payPage, 1); row.Children.Add(restPage); row.Children.Add(payPage);
         Grid.SetColumn(salaryArea, 2); row.Children.Add(salaryArea);
         foreach (FrameworkElement column in row.Children) column.HorizontalAlignment = HorizontalAlignment.Center;
 
+        statsLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        statsLayout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        statsLayout.Children.Add(statsPages);
+        Grid.SetColumn(statsDots, 1); statsLayout.Children.Add(statsDots);
+        statsDots.Visibility = Visibility.Collapsed;
 
-        stats.Background = statsGlass; stats.Child = row;
-        stats.SizeChanged += (_, __) => SynchronizeStatsGeometry();
+        statsPages.Children.Insert(0, statsRow);
+        statsPageItems.Add(statsRow); statsAvailablePages = 1; statsPageIndex = 0;
+        statsRow.Opacity = 1; statsRow.IsHitTestVisible = true;
+        stats.Background = statsGlass; stats.Child = statsLayout;
+        statsPages.Clip = statsPageClip;
+        statsPages.SizeChanged += (_, __) => UpdateStatsPageClip();
+        stats.SizeChanged += (_, __) => { SynchronizeStatsGeometry(); UpdateStatsPageClip(); };
+        stats.PointerWheelChanged += OnStatsPointerWheelChanged;
         text.Children.Add(stats);
         body.Children.Add(text);
-        var petHost = new Grid
+        var petHost = new HandCursorGrid
         {
             Background = new SolidColorBrush(Colors.Transparent), VerticalAlignment = VerticalAlignment.Bottom
         };
         petHost.Children.Add(pet);
         Grid.SetColumn(petHost, 1); body.Children.Add(petHost);
-        wishPanel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star) });
-        wishPanel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) });
-        wishPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        wishPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        wishName.Foreground = foreground; wishAmount.Foreground = foreground;
-        wishPanel.Children.Add(wishName);
-        Grid.SetColumn(wishAmount, 1); wishPanel.Children.Add(wishAmount);
-        Grid.SetRow(wishProgress, 1); Grid.SetColumnSpan(wishProgress, 2); wishPanel.Children.Add(wishProgress);
-        Grid.SetRow(wishPanel, 1); Grid.SetColumnSpan(wishPanel, 2); body.Children.Add(wishPanel);
         card.Child = body;
         petHost.PointerPressed += (_, __) => suppressPetTap = false;
         petHost.Tapped += (_, e) => { if (!suppressPetTap) EmitCoin(); suppressPetTap = false; e.Handled = true; };
@@ -631,6 +688,408 @@ public sealed class MainWindow : Window
         return panel;
     }
 
+    void UpdateStatsPager()
+    {
+        if (statsCorePages.Count == 0) return;
+        var wishes = ValidWishes();
+        statsWishCount = Math.Min(wishes.Count, wishPagePanels.Count);
+        bool wanted = settings.WishEnabled && statsWishCount > 0;
+        bool busy = statsPageAnimating || statsDragging || statsDragSettling;
+        if (wanted && !busy) UpdateWishPageValues(wishes);
+        if (wanted != statsWishMode)
+        {
+            if (wanted) EnterWishPager();
+            else ExitWishPager();
+        }
+        if (!wanted || busy) return;
+
+        string signature = "";
+        for (int i = 0; i < statsWishCount; i++) signature += wishes[i].Name + "|" + wishes[i].Target.ToString(CultureInfo.InvariantCulture) + ";";
+        if (signature != statsWishSignature || statsPageItems.Count == 0)
+        {
+            statsWishSignature = signature;
+            RewireStatsPages(reset: statsPageItems.Count == 0);
+        }
+    }
+
+    void EnterWishPager()
+    {
+        statsWishMode = true;
+        statsPages.Interactive = true;
+        statsLayout.Interactive = true;
+        StopStatsPageAnimation();
+        statsRow.HorizontalAlignment = HorizontalAlignment.Stretch;
+        statsRow.VerticalAlignment = VerticalAlignment.Stretch;
+        salaryArea.Visibility = settings.ShowSalaryLayout ? Visibility.Visible : Visibility.Collapsed;
+        statsRow.ColumnDefinitions[2].Width = settings.ShowSalaryLayout ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+        statsPageIndex = 0;
+        statsDots.Visibility = Visibility.Visible;
+        RewireStatsPages(reset: true);
+        SynchronizeStatsGeometry();
+    }
+
+    void ExitWishPager()
+    {
+        statsWishMode = false;
+        statsPages.Interactive = false;
+        statsLayout.Interactive = false;
+        StopStatsPageAnimation();
+        statsWishSignature = "";
+        statsWishCount = 0;
+        statsRow.Opacity = 1; statsRow.IsHitTestVisible = true;
+        if (statsRow.RenderTransform is CompositeTransform transform)
+        {
+            transform.TranslateY = 0;
+            transform.ScaleX = transform.ScaleY = 1;
+        }
+        foreach (var page in wishPagePanels) { page.Opacity = 0; page.IsHitTestVisible = false; }
+        salaryArea.Visibility = settings.ShowSalaryLayout ? Visibility.Visible : Visibility.Collapsed;
+        salaryArea.Opacity = 1;
+        statsRow.ColumnDefinitions[2].Width = settings.ShowSalaryLayout ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+        statsPageItems.Clear(); statsPageItems.Add(statsRow);
+        statsAvailablePages = 1; statsPageIndex = 0;
+        statsDots.Children.Clear(); statsDotShapes.Clear(); statsDots.Visibility = Visibility.Collapsed;
+        SynchronizeStatsGeometry();
+    }
+
+    void UpdateWishPageValues(System.Collections.Generic.List<WishEntry> wishes)
+    {
+        decimal pool = Logic.EarnedSinceLastPayday(DateTime.Now, settings);
+        for (int i = 0; i < statsWishCount && i < wishes.Count; i++)
+            pool += Math.Max(0, wishes[i].Saved);
+        bool split = settings.WishAllocation == "split";
+        decimal remaining = pool;
+        decimal share = split && statsWishCount > 0 ? pool / statsWishCount : 0;
+        for (int i = 0; i < statsWishCount && i < wishes.Count; i++)
+        {
+            var wish = wishes[i];
+            string fullName = string.IsNullOrWhiteSpace(wish.Name) ? "小心愿" : wish.Name.Trim();
+            string displayName = fullName.Length > 5 ? fullName.Substring(0, 5) + "…" : fullName;
+            if (wishPageNames[i].Text != displayName) wishPageNames[i].Text = displayName;
+            string tip = fullName.Length > 5 ? fullName : null;
+            if (!Equals(ToolTipService.GetToolTip(wishPageNames[i]), tip)) ToolTipService.SetToolTip(wishPageNames[i], tip);
+            decimal target = Math.Max(0, wish.Target);
+            decimal available = split ? share : remaining;
+            decimal progress = target > 0 ? Math.Min(target, available) : 0;
+            if (!split) remaining = Math.Max(0, remaining - progress);
+            int percent = target > 0 ? (int)Math.Floor(progress / target * 100) : 0;
+            string text = percent.ToString(CultureInfo.InvariantCulture) + "%";
+            if (wishPagePercents[i].Text != text) wishPagePercents[i].Text = text;
+            var fillWidth = new GridLength(percent, GridUnitType.Star);
+            if (!wishBarFillColumns[i].Width.Equals(fillWidth)) wishBarFillColumns[i].Width = fillWidth;
+            var restWidth = new GridLength(100 - percent, GridUnitType.Star);
+            if (!wishBarRestColumns[i].Width.Equals(restWidth)) wishBarRestColumns[i].Width = restWidth;
+        }
+    }
+
+    void RewireStatsPages(bool reset)
+    {
+        statsPageItems.Clear();
+        statsPageItems.Add(statsRow);
+        for (int i = 0; i < statsWishCount; i++) statsPageItems.Add(wishPagePanels[i]);
+        statsAvailablePages = statsPageItems.Count;
+        foreach (var page in wishPagePanels)
+            if (!statsPageItems.Contains(page)) { page.Opacity = 0; page.IsHitTestVisible = false; }
+        RebuildStatsDots(statsAvailablePages);
+        if (reset || statsPageIndex >= statsAvailablePages) statsPageIndex = 0;
+        ShowStatsPage(statsPageIndex, animate: false);
+    }
+
+    void RebuildStatsDots(int count)
+    {
+        statsDots.Children.Clear(); statsDotShapes.Clear();
+        statsDotActiveIndex = -1;
+        if (count <= 1) { statsDots.Visibility = Visibility.Collapsed; return; }
+        statsDots.Visibility = Visibility.Visible;
+        for (int i = 0; i < count; i++)
+        {
+            var dot = new Microsoft.UI.Xaml.Shapes.Ellipse
+            {
+                Fill = statsForeground, Opacity = .3, IsHitTestVisible = false,
+                RenderTransformOrigin = new Point(.5, .5), RenderTransform = new CompositeTransform()
+            };
+            statsDotShapes.Add(dot); statsDots.Children.Add(dot);
+        }
+        ApplyDotTypography();
+        UpdateStatsDotState();
+    }
+
+    void ApplyDotTypography()
+    {
+        int count = statsDotShapes.Count;
+        if (count == 0) return;
+        double scale = PhysicalScale, dpi = GetDpiForWindow(hwnd) / 96.0;
+        double Size(double logical) => Math.Round(logical * scale * dpi) / dpi;
+        double size = count > 8 ? 3.4 : count > 5 ? 4.4 : 5.2;
+        double gap = count > 8 ? 3.0 : 4.8;
+        statsDots.Width = Size(12);
+        statsDots.Spacing = Size(gap);
+        statsDots.Margin = new Thickness(Size(8), 0, 0, 0);
+        foreach (var dot in statsDotShapes) { dot.Width = dot.Height = Size(size); dot.HorizontalAlignment = HorizontalAlignment.Center; }
+    }
+
+    void UpdateStatsDotState()
+    {
+        for (int i = 0; i < statsDotShapes.Count; i++)
+            statsDotShapes[i].Opacity = i == statsPageIndex ? .95 : .3;
+        if (statsDotActiveIndex != statsPageIndex)
+        {
+            statsDotActiveIndex = statsPageIndex;
+            PopStatsDot(statsPageIndex);
+        }
+    }
+
+    void PopStatsDot(int index)
+    {
+        if (index < 0 || index >= statsDotShapes.Count) return;
+        if (statsDotShapes[index].RenderTransform is not CompositeTransform transform) return;
+        transform.ScaleX = transform.ScaleY = 1;
+        if (!uiSettings.AnimationsEnabled) return;
+        var story = new Storyboard();
+        AddDotPop(story, transform, "ScaleX");
+        AddDotPop(story, transform, "ScaleY");
+        statsDotStory?.Stop();
+        statsDotStory = story;
+        story.Begin();
+    }
+
+    static void AddDotPop(Storyboard story, CompositeTransform target, string property)
+    {
+        var animation = new DoubleAnimationUsingKeyFrames();
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero), Value = 1 });
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(90)), Value = 1.25, EasingFunction = new SineEase { EasingMode = EasingMode.EaseOut } });
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(320)), Value = 1, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } });
+        Storyboard.SetTarget(animation, target);
+        Storyboard.SetTargetProperty(animation, property);
+        story.Children.Add(animation);
+    }
+
+    static CompositeTransform PagerTransform(FrameworkElement page)
+    {
+        if (page.RenderTransform is CompositeTransform transform) return transform;
+        transform = new CompositeTransform();
+        page.RenderTransform = transform;
+        page.RenderTransformOrigin = new Point(.5, .5);
+        return transform;
+    }
+
+    void StopStatsPageAnimation()
+    {
+        statsPageStory?.Stop(); statsPageStory = null;
+        statsPageAnimating = false; statsPageQueued = -1;
+    }
+
+    double StatsPagePitch => Math.Max(20, statsPages.ActualHeight) + 8 * PhysicalScale;
+
+    void UpdateStatsPageClip()
+    {
+        statsPageClip.Rect = new Rect(0, 0, Math.Max(0, statsPages.ActualWidth), Math.Max(0, statsPages.ActualHeight));
+    }
+
+    void ResetStatsPageVisual(FrameworkElement page)
+    {
+        var transform = PagerTransform(page);
+        transform.TranslateY = 0; transform.ScaleX = transform.ScaleY = 1;
+        page.Opacity = 0; page.IsHitTestVisible = false;
+    }
+
+    void NormalizeStatsPages()
+    {
+        foreach (var page in statsPageItems) ResetStatsPageVisual(page);
+        if (statsPageIndex >= 0 && statsPageIndex < statsPageItems.Count)
+        {
+            var current = statsPageItems[statsPageIndex];
+            current.Opacity = 1; current.IsHitTestVisible = true;
+        }
+    }
+
+    void BeginStatsDrag()
+    {
+        StopStatsPageAnimation();
+        statsDragStory?.Stop(); statsDragStory = null;
+        statsDragSettling = false;
+        statsDragCurrent = statsPageIndex;
+        statsDragAdjacent = -1; statsDragDirection = 0; statsDragOffset = 0; statsDragMoved = false;
+        UpdateStatsPageClip();
+        NormalizeStatsPages();
+        var current = statsPageItems[statsDragCurrent];
+        current.Opacity = 1; current.IsHitTestVisible = false;
+    }
+
+    void UpdateStatsDrag(double y)
+    {
+        int count = statsAvailablePages;
+        if (count <= 1) return;
+        double pitch = StatsPagePitch;
+        double dy = Math.Clamp(y - statsDragStartY, -pitch, pitch);
+        statsDragOffset = dy;
+        if (Math.Abs(dy) > 4) statsDragMoved = true;
+        int direction = dy < 0 ? -1 : dy > 0 ? 1 : 0;
+        if (direction != statsDragDirection)
+        {
+            if (statsDragAdjacent >= 0 && statsDragAdjacent < statsPageItems.Count)
+                ResetStatsPageVisual(statsPageItems[statsDragAdjacent]);
+            statsDragDirection = direction;
+            statsDragAdjacent = direction == 0 ? -1 : (statsDragCurrent + (direction < 0 ? 1 : -1) + count) % count;
+            if (statsDragAdjacent >= 0)
+            {
+                var adjacentPage = statsPageItems[statsDragAdjacent];
+                adjacentPage.Opacity = 1; adjacentPage.IsHitTestVisible = false;
+            }
+        }
+        var current = statsPageItems[statsDragCurrent];
+        var currentTransform = PagerTransform(current);
+        currentTransform.TranslateY = dy; currentTransform.ScaleX = currentTransform.ScaleY = 1;
+        current.Opacity = 1; current.IsHitTestVisible = false;
+        if (statsDragAdjacent >= 0)
+        {
+            var adjacentPage = statsPageItems[statsDragAdjacent];
+            var adjacentTransform = PagerTransform(adjacentPage);
+            adjacentTransform.TranslateY = dy - direction * pitch;
+            adjacentTransform.ScaleX = adjacentTransform.ScaleY = 1;
+            adjacentPage.Opacity = 1; adjacentPage.IsHitTestVisible = false;
+        }
+    }
+
+    void EndStatsDragRelease(Pointer? pointer, bool allowClick, int clickDirection = 0)
+    {
+        if (!statsDragging) return;
+        statsDragging = false;
+        if (pointer != null) card.ReleasePointerCapture(pointer);
+        if (statsAvailablePages <= 1) { NormalizeStatsPages(); return; }
+        if (!statsDragMoved)
+        {
+            NormalizeStatsPages();
+            if (allowClick) ShowStatsPage(statsPageIndex + (clickDirection == 0 ? 1 : clickDirection), true);
+            return;
+        }
+        double pitch = StatsPagePitch;
+        bool commit = statsDragAdjacent >= 0 && Math.Abs(statsDragOffset) >= pitch * .3;
+        int target = commit ? statsDragAdjacent : statsDragCurrent;
+        var current = statsPageItems[statsDragCurrent];
+        var currentTransform = PagerTransform(current);
+        var adjacent = statsDragAdjacent >= 0 ? statsPageItems[statsDragAdjacent] : null;
+        var adjacentTransform = adjacent != null ? PagerTransform(adjacent) : null;
+        double currentTarget = commit ? (statsDragDirection < 0 ? -pitch : pitch) : 0;
+        double adjacentTarget = commit ? 0 : (statsDragDirection < 0 ? pitch : -pitch);
+        var story = new Storyboard();
+        var ease = new QuinticEase { EasingMode = EasingMode.EaseOut };
+        var currentAnimation = new DoubleAnimation { From = currentTransform.TranslateY, To = currentTarget, Duration = new Duration(TimeSpan.FromMilliseconds(commit ? 340 : 240)), EasingFunction = ease };
+        Storyboard.SetTarget(currentAnimation, currentTransform); Storyboard.SetTargetProperty(currentAnimation, "TranslateY"); story.Children.Add(currentAnimation);
+        if (adjacentTransform != null)
+        {
+            var adjacentAnimation = new DoubleAnimation { From = adjacentTransform.TranslateY, To = adjacentTarget, Duration = new Duration(TimeSpan.FromMilliseconds(commit ? 340 : 240)), EasingFunction = new QuinticEase { EasingMode = EasingMode.EaseOut } };
+            Storyboard.SetTarget(adjacentAnimation, adjacentTransform); Storyboard.SetTargetProperty(adjacentAnimation, "TranslateY"); story.Children.Add(adjacentAnimation);
+        }
+        statsDragStory = story; statsDragSettling = true;
+        story.Completed += (_, __) =>
+        {
+            statsDragStory = null; statsDragSettling = false;
+            foreach (var page in statsPageItems) ResetStatsPageVisual(page);
+            var visible = statsPageItems[commit ? target : statsDragCurrent];
+            visible.Opacity = 1; visible.IsHitTestVisible = true;
+            if (commit) { statsPageIndex = target; UpdateStatsDotState(); }
+            statsDragDirection = 0; statsDragAdjacent = -1; statsDragOffset = 0; statsDragMoved = false;
+        };
+        story.Begin();
+    }
+
+    void ShowStatsPage(int index, bool animate)
+    {
+        if (statsDragging || statsDragSettling) return;
+        int count = statsAvailablePages;
+        if (count <= 0) return;
+        index = ((index % count) + count) % count;
+        statsDragStory?.Stop(); statsDragStory = null;
+        UpdateStatsPageClip();
+        if (!animate || !uiSettings.AnimationsEnabled)
+        {
+            StopStatsPageAnimation();
+            for (int i = 0; i < count; i++)
+            {
+                var page = statsPageItems[i];
+                var transform = PagerTransform(page);
+                page.Opacity = i == index ? 1 : 0;
+                page.IsHitTestVisible = i == index;
+                transform.TranslateY = 0; transform.ScaleX = transform.ScaleY = 1;
+            }
+            statsPageIndex = index; UpdateStatsDotState(); return;
+        }
+        if (statsPageAnimating) { statsPageQueued = index; return; }
+        if (index == statsPageIndex) { UpdateStatsDotState(); return; }
+        var outgoing = statsPageItems[statsPageIndex];
+        var incoming = statsPageItems[index];
+        int step = index > statsPageIndex ? 1 : -1;
+        if (statsPageIndex == count - 1 && index == 0) step = 1;
+        else if (statsPageIndex == 0 && index == count - 1) step = -1;
+        double pitch = StatsPagePitch;
+        for (int i = 0; i < count; i++)
+        {
+            var page = statsPageItems[i];
+            if (page == outgoing || page == incoming) continue;
+            ResetStatsPageVisual(page);
+        }
+        var outTransform = PagerTransform(outgoing);
+        var inTransform = PagerTransform(incoming);
+        outTransform.TranslateY = 0; outTransform.ScaleX = outTransform.ScaleY = 1;
+        inTransform.TranslateY = step > 0 ? pitch : -pitch; inTransform.ScaleX = inTransform.ScaleY = 1;
+        outgoing.Opacity = 1; outgoing.IsHitTestVisible = false;
+        incoming.Opacity = 1; incoming.IsHitTestVisible = false;
+        var story = new Storyboard();
+        var slideOut = new DoubleAnimation { From = 0, To = step > 0 ? -pitch : pitch, Duration = new Duration(TimeSpan.FromMilliseconds(380)), EasingFunction = new QuinticEase { EasingMode = EasingMode.EaseInOut } };
+        Storyboard.SetTarget(slideOut, outTransform); Storyboard.SetTargetProperty(slideOut, "TranslateY"); story.Children.Add(slideOut);
+        var slideIn = new DoubleAnimation { From = step > 0 ? pitch : -pitch, To = 0, Duration = new Duration(TimeSpan.FromMilliseconds(380)), EasingFunction = new QuinticEase { EasingMode = EasingMode.EaseInOut } };
+        Storyboard.SetTarget(slideIn, inTransform); Storyboard.SetTargetProperty(slideIn, "TranslateY"); story.Children.Add(slideIn);
+        statsPageStory = story; statsPageAnimating = true;
+        story.Completed += (_, __) =>
+        {
+            outgoing.Opacity = 0; outTransform.TranslateY = 0;
+            incoming.Opacity = 1; inTransform.TranslateY = 0; incoming.IsHitTestVisible = true;
+            statsPageIndex = index; statsPageAnimating = false; statsPageStory = null;
+            UpdateStatsDotState();
+            int queued = statsPageQueued; statsPageQueued = -1;
+            if (queued >= 0 && queued != statsPageIndex) ShowStatsPage(queued, animate: true);
+        };
+        story.Begin();
+    }
+
+    void OnStatsPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        if (disposed || exiting || !statsWishMode) return;
+        if (statsDragging || statsDragSettling) { e.Handled = true; return; }
+        int delta = e.GetCurrentPoint(stats).Properties.MouseWheelDelta;
+        if (delta == 0) return;
+        ShowStatsPage(statsPageIndex + (delta < 0 ? 1 : -1), animate: true);
+        e.Handled = true;
+    }
+
+    bool IsCursorOverHandArea(Point point)
+    {
+        if (IsPointInside(pet, point)) return true;
+        return statsWishMode && IsPointInside(stats, point);
+    }
+
+    void KeepCoinCursor()
+    {
+        // The coin popup window can pin the stationary cursor to the arrow while
+        // coins are in the air; reassert the hand until the popup closes.
+        if (!trackingCoins || disposed || exiting || !IsWindowVisible(hwnd)) return;
+        if (!IsCursorOverWidget() || !TryGetHoverPoint(out Point point) || !IsCursorOverHandArea(point)) return;
+        SetCursor(handCursor);
+    }
+
+    bool IsPointInside(FrameworkElement element, Point point)
+    {
+        if (element.ActualWidth <= 0 || element.ActualHeight <= 0) return false;
+        try
+        {
+            Windows.Foundation.Rect bounds = element.TransformToVisual(hostSurface)
+                .TransformBounds(new Windows.Foundation.Rect(0, 0, element.ActualWidth, element.ActualHeight));
+            return bounds.Contains(point);
+        }
+        catch (ArgumentException) { return false; }
+    }
+
     void UpdateRestTypography()
     {
         bool unset = rest.Text == "未设置";
@@ -649,6 +1108,7 @@ public sealed class MainWindow : Window
         int revision = ++petAnimationRevision;
         reminderAnimationRevision++;
         napActive = false; napPending = false; napRevision++;
+        napEndAt = DateTime.MinValue;
         napAnimation?.Dispose(); napAnimation = null;
         reminderPetActive = false;
         coinPetActive = false; coinPetRequestedAt = -10000;
@@ -675,7 +1135,7 @@ public sealed class MainWindow : Window
     {
         try
         {
-            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", petId == "polar-bear" ? "polar-bear-idle.frames.gz" : petId == "panda" ? "panda-doze.frames.gz" : "cow-cat-wash.frames.gz")).ConfigureAwait(false);
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", petId == "polar-bear" ? "polar-bear-idle.frames.br" : petId == "panda" ? "panda-doze.frames.br" : "cow-cat-wash.frames.br")).ConfigureAwait(false);
             if (!DispatcherQueue.TryEnqueue(() =>
             {
                 if (exiting || disposed || revision != petAnimationRevision || settings.PetId != petId)
@@ -694,7 +1154,7 @@ public sealed class MainWindow : Window
     {
         try
         {
-            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-coins.frames.gz")).ConfigureAwait(false);
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-coins.frames.br")).ConfigureAwait(false);
             if (!DispatcherQueue.TryEnqueue(() =>
             {
                 if (exiting || disposed || revision != petAnimationRevision || settings.PetId != "polar-bear")
@@ -783,14 +1243,13 @@ public sealed class MainWindow : Window
     int layoutStartWidth, layoutTargetWidth, layoutTargetHeight, layoutStartX, layoutTargetX;
     double shownWidgetWidth = 368;
     double WidgetLogicalWidth => !settings.ShowSalaryLayout ? 336 : shownWidgetWidth;
-    double WidgetLogicalHeight => settings.WishEnabled ? 240 : 190;
+    double WidgetLogicalHeight => 190;
 
     void ApplySettings()
     {
         settings.Calendar = calendar;
         settings.PetId = NormalizePet(settings.PetId);
         if (!settings.MouseClickThrough) hoverDragArmed = false;
-        wishPanel.Visibility = settings.WishEnabled ? Visibility.Visible : Visibility.Collapsed;
         ApplyWidgetSize();
         ApplyMouseClickThrough();
         UpdateHoverDragMonitor();
@@ -804,6 +1263,7 @@ public sealed class MainWindow : Window
     void PreviewScale(double value)
     {
         if (disposed || exiting || !double.IsFinite(value)) return;
+        long applyStarted = GlassProfile.Timestamp();
         if (layoutTransitionActive) CompleteLayoutTransition();
         if (!scalePreviewHostActive) BeginScalePreviewHost();
         else if (scalePreviewSettled && desktopSource.TryGetRenderBounds(out int x, out int y, out int width, out int height))
@@ -812,7 +1272,13 @@ public sealed class MainWindow : Window
             desktopSource.BeginVisualDrag(x, y, width, height, renderImmediately: false);
         }
         previewScale = Math.Clamp(value, .5, 1.5);
-        ApplyWidgetSize(); Refresh();
+        long stageStarted = GlassProfile.Timestamp();
+        ApplyWidgetSize();
+        double sizeMs = GlassProfile.Ms(stageStarted);
+        stageStarted = GlassProfile.Timestamp();
+        Refresh();
+        if (GlassProfile.Enabled)
+            GlassProfile.Event($"scale-apply total={GlassProfile.Ms(applyStarted):F2} size={sizeMs:F2} refresh={GlassProfile.Ms(stageStarted):F2} value={previewScale:F3}");
         // The settings page can remain open for hours after using the ruler.
         // Stop high-frequency capture after input settles, while retaining the host
         // until preview closes so the next jump cannot expose new native backing.
@@ -836,7 +1302,8 @@ public sealed class MainWindow : Window
     {
         if (layoutHostActive) FinishLayoutHost();
         if (!previewScale.HasValue) EndScalePreviewHost();
-        layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition; salaryArea.Opacity = 1;
+        layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
+        if (!statsWishMode) salaryArea.Opacity = 1;
         shownWidgetWidth = 368; // Re-measure at the current scale instead of retaining a wider preview.
         double scale = PhysicalScale;
         surface.Width = WidgetLogicalWidth; surface.Height = WidgetLogicalHeight;
@@ -1041,6 +1508,18 @@ public sealed class MainWindow : Window
             value.VerticalAlignment = VerticalAlignment.Center;
             if (value.Parent is Border valueSlot) valueSlot.Height = Size(30);
         }
+        foreach (var value in wishPagePercents)
+        {
+            value.FontSize = Size(18); value.IsTextScaleFactorEnabled = false;
+            value.LineHeight = 0; value.LineStackingStrategy = LineStackingStrategy.MaxHeight;
+            value.TextLineBounds = TextLineBounds.Tight;
+            value.VerticalAlignment = VerticalAlignment.Center;
+            if (value.Parent is Border valueSlot) valueSlot.Height = Size(30);
+        }
+        foreach (var name in wishPageNames) name.FontSize = Size(16);
+        foreach (var bar in wishBarHosts) { bar.Height = Size(5); bar.Margin = new Thickness(0); }
+        foreach (var track in wishBarTracks) track.CornerRadius = new CornerRadius(Size(2.5));
+        foreach (var fill in wishBarFills) fill.CornerRadius = new CornerRadius(Size(2.5));
         UpdateRestTypography();
         caption.IsTextScaleFactorEnabled = false; countdown.IsTextScaleFactorEnabled = false;
         if (card.Child is Grid body)
@@ -1060,13 +1539,11 @@ public sealed class MainWindow : Window
         stats.Padding = new Thickness(Size(8), Size(6), Size(8), Size(6));
         stats.Margin = new Thickness(-Size(8), 0, 0, 0); stats.CornerRadius = new CornerRadius(16 * scale);
         SynchronizeStatsGeometry();
-        foreach (StackPanel column in statsRow.Children) column.Spacing = Size(5);
+        foreach (var page in wishPagePanels) { page.Spacing = Size(4); page.Margin = new Thickness(Size(12), 0, Size(12), 0); }
+        foreach (var page in statsCorePages) if (page is StackPanel panel) panel.Spacing = Size(5);
+        ApplyDotTypography();
         earningsEye.Width = Size(20); earningsEye.Height = Size(20);
         earningsVisibilityIcon.FontSize = Size(13);
-        wishPanel.Margin = new Thickness(0, Size(6), Size(8), 0);
-        wishPanel.RowSpacing = Size(5);
-        wishName.FontSize = wishAmount.FontSize = Size(13);
-        wishProgress.Height = Size(4);
     }
 
     string? fittedCaptionText;
@@ -1106,10 +1583,10 @@ public sealed class MainWindow : Window
             // Measure the complete row, not the space left by the current window.
             // Extra-long amounts can expand the card without clipping the last glyph.
             double widest = 0;
-            foreach (FrameworkElement column in statsRow.Children)
+            foreach (FrameworkElement page in statsCorePages)
             {
-                column.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
-                widest = Math.Max(widest, column.DesiredSize.Width);
+                page.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+                widest = Math.Max(widest, page.DesiredSize.Width);
             }
             shownWidgetWidth = Math.Max(shownWidgetWidth, Math.Ceiling((widest + 2 / (GetDpiForWindow(hwnd) / 96.0)) * 3 / PhysicalScale + 168));
         }
@@ -1256,9 +1733,12 @@ public sealed class MainWindow : Window
         if (!settings.HideAmount && now >= revealedUntil) HideSalary();
         bool work = Logic.WorkingDay(now, settings); var hours = Logic.WorkHours(now, settings); TimeSpan start = hours.Start, end = hours.End;
         TimeSpan? left = null;
+        int days = Logic.UntilRest(now, settings);
+        bool restStarted = Logic.RestStarted(now, settings, days);
         if (!work) { caption.Text = "今天休息，好好放松"; countdown.Text = "休息中"; }
         else if (now.TimeOfDay < start) { caption.Text = "距离上班还有"; left = start - now.TimeOfDay; }
         else if (now.TimeOfDay < end) { caption.Text = "距离下班还有"; left = end - now.TimeOfDay; }
+        else if (restStarted) { caption.Text = "已经放假啦"; countdown.Text = "好好休息"; }
         else { caption.Text = "今天辛苦了，自由时间到"; countdown.Text = "已下班"; }
         if (now < reminderUntil && reminderDue != 0)
             caption.Text = reminderDue == 3 ? "起身走走，喝口水吧"
@@ -1271,8 +1751,6 @@ public sealed class MainWindow : Window
             countdown.FontWeight = countdownIsStatus ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Medium;
         }
         if (left.HasValue) countdown.Text = string.Format(CultureInfo.InvariantCulture, "{0:00} : {1:00} : {2:00}", (int)left.Value.TotalHours, left.Value.Minutes, left.Value.Seconds);
-        int days = Logic.UntilRest(now, settings);
-        bool restStarted = Logic.RestStarted(now, settings, days);
         statTitles[0].Text = restStarted ? "下次上班" : "距休息";
         if (restStarted)
         {
@@ -1288,16 +1766,6 @@ public sealed class MainWindow : Window
         }
         UpdateRestTypography();
         pay.Text = Logic.UntilPay(now, settings.PayDay) + "天";
-        if (settings.WishEnabled)
-        {
-            decimal saved = Math.Max(0, settings.WishSaved), target = Math.Max(0, settings.WishTarget);
-            wishName.Text = string.IsNullOrWhiteSpace(settings.WishName) ? "小心愿" : settings.WishName.Trim();
-            decimal progress = target > 0 ? Math.Min(saved, target) / target * 100 : 0;
-            wishAmount.Text = target > 0
-                ? $"¥{saved:0.##} / ¥{target:0.##} · {progress:0}%"
-                : $"已攒 ¥{saved:0.##} · 未设目标";
-            wishProgress.Value = (double)progress;
-        }
         if (!layoutTransitionActive)
         {
             salaryArea.Visibility = settings.ShowSalaryLayout ? Visibility.Visible : Visibility.Collapsed;
@@ -1305,6 +1773,7 @@ public sealed class MainWindow : Window
             if (!statsRow.ColumnDefinitions[2].Width.Equals(salaryColumnWidth)) statsRow.ColumnDefinitions[2].Width = salaryColumnWidth;
         }
         else salaryArea.Visibility = Visibility.Visible;
+        UpdateStatsPager();
         earned.Text = settings.HideAmount ? "***元" : Logic.Earned(now, settings).ToString("F2", CultureInfo.InvariantCulture) + "元";
         earningsVisibilityIcon.Glyph = settings.HideAmount ? "\uED1A" : "\uE890";
         string eyeAction = settings.HideAmount ? "显示金额（需验证密码）" : "隐藏金额";
@@ -1319,61 +1788,74 @@ public sealed class MainWindow : Window
         if (!smoke && settings.UseChinaHolidays && holidayDay != now.Date) { holidayDay = now.Date; _ = calendar.RefreshAsync(now.Year, false); }
     }
 
-    bool InNapWindow(DateTime now)
+    System.Collections.Generic.List<WishEntry> ValidWishes()
     {
-        try
-        {
-            return Logic.WorkingDay(now, settings) &&
-                now.TimeOfDay >= Logic.Time(settings.LunchStart) &&
-                now.TimeOfDay < Logic.Time(settings.LunchEnd);
-        }
-        catch (FormatException) { return false; }
+        var wishes = new System.Collections.Generic.List<WishEntry>();
+        if (settings.Wishes != null)
+            foreach (var wish in settings.Wishes)
+                if (wish != null && !string.IsNullOrWhiteSpace(wish.Name) && wish.Target > 0 && wish.Saved >= 0)
+                    wishes.Add(wish);
+        return wishes;
     }
 
     void UpdateNap(DateTime now)
     {
-        if (settings.PetId != "polar-bear" || !InNapWindow(now))
+        if (settings.PetId != "polar-bear")
         {
             if (napActive) EndNap();
             napPending = false;
             return;
         }
-        if (napActive) return;
+        if (napActive)
+        {
+            if (now < napEndAt) return;
+            EndNap();
+            return;
+        }
+        (DateTime? PlayFrom, DateTime End, bool Lunch)? window;
+        try { window = Logic.NapWindow(now, settings); }
+        catch (FormatException) { window = null; }
+        if (!window.HasValue)
+        {
+            napPending = false;
+            return;
+        }
         if (reminderPetActive || coinPetActive)
         {
             // Let the current reminder or coin action finish; the nap starts on
-            // the next tick and then holds until lunch ends.
+            // the next tick and then holds until the window ends.
             napPending = true;
             return;
         }
         napPending = false;
-        BeginNap(now);
+        BeginNap(now, window.Value);
     }
 
-    void BeginNap(DateTime now)
+    void BeginNap(DateTime now, (DateTime? PlayFrom, DateTime End, bool Lunch) window)
     {
         if (exiting || disposed || napActive || settings.PetId != "polar-bear") return;
         napActive = true;
+        napEndAt = window.End;
         int revision = ++napRevision;
         petHoverTimer?.Stop();
         petAnimation?.Stop();
         CancelPolarCoinAction(false);
         reminderAnimation?.Dispose(); reminderAnimation = null;
         waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
-        var start = Logic.Time(settings.LunchStart);
-        var end = Logic.Time(settings.LunchEnd);
         // Entering near the start plays the transition; opening the app mid-lunch
-        // (or too little time left) goes straight to the sleeping frame.
-        bool play = (now.TimeOfDay - start).TotalSeconds <= 6 && (end - now.TimeOfDay).TotalSeconds >= 11;
+        // or after work goes straight to the sleeping frame.
+        bool play = window.PlayFrom.HasValue &&
+            now >= window.PlayFrom.Value && now - window.PlayFrom.Value <= TimeSpan.FromSeconds(6) &&
+            window.End - now >= TimeSpan.FromSeconds(11);
         _ = LoadNapAsync(revision, play);
-        GlassProfile.Event($"pet-nap-start {(play ? "play" : "hold")} remain={(int)(end - now.TimeOfDay).TotalSeconds}");
+        GlassProfile.Event($"pet-nap-start {(play ? "play" : "hold")} {(window.Lunch ? "lunch" : "off-work")} remain={(int)(window.End - now).TotalSeconds}");
     }
 
     async Task LoadNapAsync(int revision, bool play)
     {
         try
         {
-            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-nap.frames.gz")).ConfigureAwait(false);
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-nap.frames.br")).ConfigureAwait(false);
             if (!DispatcherQueue.TryEnqueue(() =>
             {
                 if (exiting || disposed || revision != napRevision || !napActive || settings.PetId != "polar-bear")
@@ -1395,6 +1877,7 @@ public sealed class MainWindow : Window
     {
         if (!napActive && napAnimation == null) return;
         napActive = false; napPending = false; napRevision++;
+        napEndAt = DateTime.MinValue;
         CancelPolarCoinAction(false);
         var animation = napAnimation; napAnimation = null;
         animation?.Dispose();
@@ -1444,7 +1927,7 @@ public sealed class MainWindow : Window
                 reminderPopup.AppWindow.Show(false);
                 return;
             }
-            bool dark = surface.ActualTheme == ElementTheme.Dark;
+            bool dark = SystemTheme.IsDark();
             var reminderText = ReminderText(due);
             popup = new Window { Title = reminderText.Title };
             bool acrylicSupported = Microsoft.UI.Composition.SystemBackdrops.DesktopAcrylicController.IsSupported();
@@ -1561,7 +2044,7 @@ public sealed class MainWindow : Window
             UpdatePopupContour();
             refreshReminderPopup = newDue =>
             {
-                bool isDark = surface.ActualTheme == ElementTheme.Dark;
+                bool isDark = SystemTheme.IsDark();
                 var text = ReminderText(newDue);
                 owned.Title = text.Title;
                 headerTitle.Text = text.Title;
@@ -1692,7 +2175,7 @@ public sealed class MainWindow : Window
 
     async Task<TimeSpan?> PlayPolarPhase(bool water, int revision)
     {
-        string file = water ? "polar-bear-cup-walk.frames.gz" : "polar-bear-stretch.frames.gz";
+        string file = water ? "polar-bear-cup-walk.frames.br" : "polar-bear-stretch.frames.br";
         try
         {
             var animation = await PetAnimationPlayer.LoadAsync(water ? waterPetOverlay : pet, Path.Combine(AppContext.BaseDirectory, "assets", file)).ConfigureAwait(false);
@@ -1978,10 +2461,39 @@ public sealed class MainWindow : Window
             {
                 Debug.WriteLine(ex.Message);
                 layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
-                salaryArea.Opacity = 1; FinishLayoutHost(); Refresh();
+                if (!statsWishMode) salaryArea.Opacity = 1;
+                FinishLayoutHost(); Refresh();
             }
         }
         Save();
+    }
+
+    void RunSmokeLayoutCycle()
+    {
+        int ticks = 0;
+        GlassProfile.Event("smoke-layout-start");
+        cycleTimer = DispatcherQueue.CreateTimer();
+        cycleTimer.Interval = TimeSpan.FromMilliseconds(1000);
+        cycleTimer.Tick += (_, __) =>
+        {
+            if (disposed || exiting || ++ticks > 20) { cycleTimer.Stop(); GlassProfile.Event("smoke-layout-end"); return; }
+            ToggleSalaryLayout();
+        };
+        cycleTimer.Start();
+    }
+
+    void RunSmokeScaleCycle()
+    {
+        int step = 0;
+        GlassProfile.Event("smoke-scale-start");
+        cycleTimer = DispatcherQueue.CreateTimer();
+        cycleTimer.Interval = TimeSpan.FromMilliseconds(smokeScaleFast ? 5 : 33);
+        cycleTimer.Tick += (_, __) =>
+        {
+            if (disposed || exiting || ++step > 240) { cycleTimer.Stop(); GlassProfile.Event("smoke-scale-end"); return; }
+            PreviewScale(1.125 + 0.375 * Math.Sin(step * Math.PI * 4 / 240.0));
+        };
+        cycleTimer.Start();
     }
 
     void AnimateLayoutTransition(object? sender, object args)
@@ -2003,7 +2515,7 @@ public sealed class MainWindow : Window
         double eased = time * time * (3 - 2 * time);
         layoutProgress = layoutStartProgress + ((settings.ShowSalaryLayout ? 1 : 0) - layoutStartProgress) * eased;
         statsRow.ColumnDefinitions[2].Width = layoutProgress > 0 ? new GridLength(layoutProgress, GridUnitType.Star) : new GridLength(0);
-        salaryArea.Opacity = layoutProgress * layoutProgress;
+        if (!statsWishMode) salaryArea.Opacity = layoutProgress * layoutProgress;
         int width = (int)Math.Round(layoutStartWidth + (layoutTargetWidth - layoutStartWidth) * eased);
         int x = (int)Math.Round(layoutStartX + (layoutTargetX - layoutStartX) * eased);
         layoutCurrentWidth = width; layoutCurrentX = x;
@@ -2114,7 +2626,7 @@ public sealed class MainWindow : Window
         if (GlassProfile.Enabled)
             GlassProfile.Event($"layout-complete frames={layoutFrameCount} elapsed={layoutTransitionClock.Elapsed.TotalMilliseconds:F1} progress={layoutProgress:F3}");
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
-        salaryArea.Opacity = 1;
+        if (!statsWishMode) salaryArea.Opacity = 1;
         FinishLayoutHost();
         Refresh();
     }
@@ -2243,9 +2755,7 @@ public sealed class MainWindow : Window
         settingsWindow.Closed += (_, __) =>
         {
             settingsWindow = null;
-            if (!previewScale.HasValue || disposed || exiting) return;
-            previewScale = null;
-            ApplyWidgetSize(); Refresh();
+            if (previewScale.HasValue && !disposed && !exiting) { previewScale = null; ApplyWidgetSize(); Refresh(); }
         };
         settingsWindow.Activate();
     }
@@ -2265,8 +2775,51 @@ public sealed class MainWindow : Window
     void TrackCoinLayer(object? sender, object args)
     {
         if (disposed || !IsWindowVisible(hwnd) || IsIconic(hwnd)) { CloseCoinLayer(); return; }
+        MakeCoinPopupClickThrough();
         PositionCoinLayer();
     }
+
+    IntPtr coinPopupWindow;
+
+    void MakeCoinPopupClickThrough()
+    {
+        // The overlay popup owns the cursor while coins are in the air and pins it
+        // to the arrow; make it transparent and answer its WM_SETCURSOR.
+        if (coinPopupWindow != IntPtr.Zero && IsWindow(coinPopupWindow) && IsWindowVisible(coinPopupWindow)) return;
+        {
+            IntPtr found = IntPtr.Zero;
+            EnumWindows((candidate, _) =>
+            {
+                uint pid;
+                GetWindowThreadProcessId(candidate, out pid);
+                if (pid != (uint)Environment.ProcessId || !IsWindowVisible(candidate)) return true;
+                var name = new StringBuilder(64);
+                GetClassName(candidate, name, name.Capacity);
+                if (name.ToString() != "Microsoft.UI.Content.PopupWindowSiteBridge") return true;
+                found = candidate;
+                return false;
+            }, IntPtr.Zero);
+            coinPopupWindow = found;
+        }
+        if (coinPopupWindow == IntPtr.Zero) return;
+        long style = GetWindowLongPtr(coinPopupWindow, -20 /* GWL_EXSTYLE */).ToInt64();
+        long clickThrough = style | 0x00000020 /* WS_EX_TRANSPARENT */ | 0x08000000 /* WS_EX_NOACTIVATE */ | 0x00000080 /* WS_EX_TOOLWINDOW */;
+        if (clickThrough != style) SetWindowLongPtr(coinPopupWindow, -20, new IntPtr(clickThrough));
+        popupSubclass ??= (h, msg, wParam, lParam, id, data) =>
+        {
+            if (msg == 0x0084 /* WM_NCHITTEST */) return new IntPtr(-1); // HTTRANSPARENT
+            if (msg == 0x0020 /* WM_SETCURSOR */ && (unchecked((long)lParam) & 0xFFFF) == 1 &&
+                TryGetHoverPoint(out Point point) && IsCursorOverHandArea(point))
+            {
+                SetCursor(handCursor);
+                return new IntPtr(1);
+            }
+            return DefSubclassProcCursor(h, msg, wParam, lParam);
+        };
+        SetWindowSubclass(coinPopupWindow, popupSubclass, (UIntPtr)1, UIntPtr.Zero);
+    }
+
+    SUBCLASSPROC? popupSubclass;
 
     void CloseCoinLayer()
     {
@@ -2277,6 +2830,42 @@ public sealed class MainWindow : Window
         coinStories.Clear();
         activeCoinUpgrade = null;
         coins.Children.Clear();
+        if (popupSettleTimer == null)
+        {
+            popupSettleTimer = DispatcherQueue.CreateTimer();
+            popupSettleTimer.Interval = TimeSpan.FromMilliseconds(150);
+            popupSettleTimer.IsRepeating = false;
+            popupSettleTimer.Tick += (_, __) => NudgeForCursor();
+        }
+        popupSettleTimer.Start();
+    }
+
+    DispatcherQueueTimer? popupSettleTimer, nudgeReturnTimer;
+    int nudgeX, nudgeY;
+
+    void NudgeForCursor()
+    {
+        if (disposed || exiting || !IsWindowVisible(hwnd)) return;
+        if (!IsCursorOverWidget() || !TryGetHoverPoint(out Point point) || !IsCursorOverHandArea(point)) return;
+        if (!GetCursorPos(out Win32Point cursor)) return;
+        nudgeX = cursor.X; nudgeY = cursor.Y;
+        MoveCursorAbsolute(nudgeX + 1, nudgeY);
+        if (nudgeReturnTimer == null)
+        {
+            nudgeReturnTimer = DispatcherQueue.CreateTimer();
+            nudgeReturnTimer.Interval = TimeSpan.FromMilliseconds(60);
+            nudgeReturnTimer.IsRepeating = false;
+            nudgeReturnTimer.Tick += (_, __) => MoveCursorAbsolute(nudgeX, nudgeY);
+        }
+        nudgeReturnTimer.Start();
+    }
+
+    static void MoveCursorAbsolute(int x, int y)
+    {
+        int width = Math.Max(1, GetSystemMetrics(0)), height = Math.Max(1, GetSystemMetrics(1));
+        mouse_event(0x8001 /* MOVE | ABSOLUTE */,
+            (int)Math.Round(x * 65535.0 / Math.Max(1, width - 1)),
+            (int)Math.Round(y * 65535.0 / Math.Max(1, height - 1)), 0, IntPtr.Zero);
     }
 
     void EmitCoin()
@@ -2813,16 +3402,34 @@ public sealed class MainWindow : Window
     {
         var point = e.GetCurrentPoint(surface);
         if (!point.Properties.IsLeftButtonPressed) return;
+        bool overStats = false;
         for (DependencyObject? source = e.OriginalSource as DependencyObject; source != null && source != card; source = VisualTreeHelper.GetParent(source))
+        {
             if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase ||
                 (!hoverDragArmed && (source is Image || ReferenceEquals(source, pet.Parent)))) return;
-
-        // Use the same physical coordinate source as the move/release paths.
-        if (!GetCursorPos(out Win32Point pressCursor)) return;
+            if (ReferenceEquals(source, stats)) overStats = true;
+        }
 
         HideHoverEffect();
         if (layoutTransitionActive) CompleteLayoutTransition();
         if (scalePreviewHostActive) { EndScalePreviewHost(); ApplyWidgetSize(); }
+
+        if (overStats && statsWishMode)
+        {
+            if (statsDragSettling) { e.Handled = true; return; }
+            if (card.CapturePointer(e.Pointer))
+            {
+                statsDragging = true;
+                statsDragPointerId = e.Pointer.PointerId; statsDragStartY = point.Position.Y;
+                BeginStatsDrag();
+                e.Handled = true;
+            }
+            return;
+        }
+
+        // Use the same physical coordinate source as the move/release paths.
+        if (!GetCursorPos(out Win32Point pressCursor)) return;
+
         dragUsesMouse = e.Pointer.PointerDeviceType == PointerDeviceType.Mouse;
         dragReleasePending = false;
         isDragging = true;
@@ -2840,6 +3447,12 @@ public sealed class MainWindow : Window
     {
         var point = e.GetCurrentPoint(surface).Position;
         glass.SetInteraction(2 * point.X / Math.Max(1, surface.Width) - 1, 2 * point.Y / Math.Max(1, surface.Height) - 1, true);
+        if (statsDragging)
+        {
+            if (e.Pointer.PointerId == statsDragPointerId) UpdateStatsDrag(point.Y);
+            e.Handled = true;
+            return;
+        }
         if (isDragging) e.Handled = true;
     }
 
@@ -2987,12 +3600,26 @@ public sealed class MainWindow : Window
 
     void OnCardPointerReleased(object sender, PointerRoutedEventArgs e)
     {
+        if (statsDragging)
+        {
+            double clickY = e.GetCurrentPoint(stats).Position.Y;
+            int clickDirection = clickY < stats.ActualHeight / 2 ? 1 : -1;
+            EndStatsDragRelease(e.Pointer, allowClick: true, clickDirection);
+            e.Handled = true;
+            return;
+        }
         EndDrag(e.Pointer, sampleFinalPosition: true);
         e.Handled = true;
     }
 
     void OnCardPointerCaptureLost(object sender, PointerRoutedEventArgs e)
     {
+        if (statsDragging)
+        {
+            statsDragOffset = 0; statsDragMoved = false;
+            EndStatsDragRelease(e.Pointer, allowClick: false);
+            return;
+        }
         EndDrag(e.Pointer);
     }
 
@@ -3046,7 +3673,7 @@ public sealed class MainWindow : Window
         var point = e.GetCurrentPoint(surface);
         if (point.Properties.PointerUpdateKind != PointerUpdateKind.RightButtonReleased) return;
         if (e.Pointer.PointerDeviceType != PointerDeviceType.Mouse) return;
-        ShowContextMenu(point.Position);
+        ShowContextMenu(point.Position, mouse: true);
         e.Handled = true;
     }
 
@@ -3056,18 +3683,48 @@ public sealed class MainWindow : Window
         // the reliable mouse entry, and it also covers touch long-press.
         if (e.PointerDeviceType == PointerDeviceType.Mouse &&
             Environment.TickCount64 - widgetMenuShownAt < 600) { e.Handled = true; return; }
-        ShowContextMenu(e.GetPosition(surface));
+        ShowContextMenu(e.GetPosition(surface), e.PointerDeviceType == PointerDeviceType.Mouse);
         e.Handled = true;
     }
 
-    void ShowContextMenu(Point point)
+    void ShowContextMenu(Point point, bool mouse)
     {
         if (disposed || widgetMenuOpen) return;
         if (isDragging) EndDrag(null, sampleFinalPosition: true);
-        var menu = EnsureWidgetMenu();
+        int screenX, screenY;
+        if (mouse)
+        {
+            if (!GetCursorPos(out Win32Point cursor)) return;
+            screenX = cursor.X; screenY = cursor.Y;
+        }
+        else if (!TrySurfacePointToScreen(point, out screenX, out screenY)) return;
+        WidgetMenuWindow menu;
+        try { menu = EnsureWidgetMenu(); }
+        catch (Exception ex) { Debug.WriteLine("右键菜单无法创建：" + ex.Message); return; }
         widgetMenuShownAt = Environment.TickCount64;
         GlassProfile.Event("context-menu-show");
-        menu.ShowAt(surface, point);
+        widgetMenuOpen = true;
+        try
+        {
+            menu.ShowAt(screenX, screenY, SystemTheme.IsDark(), Math.Clamp(EffectiveScale, .85, 1.25));
+        }
+        catch (Exception ex)
+        {
+            widgetMenuOpen = false;
+            Debug.WriteLine("右键菜单无法显示：" + ex.Message);
+        }
+    }
+
+    bool TrySurfacePointToScreen(Point point, out int x, out int y)
+    {
+        x = y = 0;
+        var origin = new Win32Point();
+        if (!ClientToScreen(hwnd, ref origin)) return false;
+        double dpi = Math.Max(96, GetDpiForWindow(hwnd)) / 96.0;
+        var local = surface.TransformToVisual(hostSurface).TransformPoint(point);
+        x = origin.X + (int)Math.Round(local.X * dpi);
+        y = origin.Y + (int)Math.Round(local.Y * dpi);
+        return true;
     }
 
     void ApplyMouseClickThrough()
@@ -3851,7 +4508,7 @@ public sealed class MainWindow : Window
 
     void CreateTray(string path)
     {
-        tray = new NativeTrayIcon(hwnd, path, ShowWidget, OpenSettings, Exit, () => false,
+        tray = new NativeTrayIcon(hwnd, path, ShowWidget, OpenSettings, Exit,
             ToggleMouseClickThrough, () => settings.MouseClickThrough);
     }
 
@@ -3885,6 +4542,7 @@ public sealed class MainWindow : Window
             HideAmount = true,
             ShowSalaryLayout = s.ShowSalaryLayout,
             WishEnabled = s.WishEnabled,
+            Wishes = s.Wishes != null ? s.Wishes.ConvertAll(w => new WishEntry { Name = w.Name, Target = w.Target, Saved = w.Saved }) : new System.Collections.Generic.List<WishEntry>(),
             WishName = s.WishName,
             WishTarget = s.WishTarget,
             WishSaved = s.WishSaved,
@@ -3946,6 +4604,13 @@ public sealed class MainWindow : Window
     void Exit()
     {
         if (exiting) return; exiting = true;
+        // XAML/capture teardown must never leave a ghost process behind.
+        var watchdog = new Thread(() =>
+        {
+            Thread.Sleep(3000);
+            Environment.Exit(0);
+        }) { IsBackground = true, Name = "ExitWatchdog" };
+        watchdog.Start();
         try
         {
             EndDrag(null);
@@ -4006,6 +4671,7 @@ public sealed class MainWindow : Window
         if (sessionNotificationRegistered) { WTSUnRegisterSessionNotification(hwnd); sessionNotificationRegistered = false; }
         sessionMonitor?.Dispose();
         tray?.Dispose();
+        widgetMenu?.Shutdown(); widgetMenu = null;
         installerExitWait?.Unregister(null);
         installerExit?.Dispose();
         activationWait?.Unregister(null);
@@ -4024,6 +4690,17 @@ public sealed class MainWindow : Window
 
     [StructLayout(LayoutKind.Sequential)] struct NativeClientRect { internal int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out NativeClientRect rect);
+    [DllImport("user32.dll")] static extern IntPtr LoadCursor(IntPtr instance, IntPtr name);
+    [DllImport("user32.dll")] static extern IntPtr SetCursor(IntPtr cursor);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
+    delegate bool EnumWindowsProc(IntPtr window, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr window, int index, IntPtr value);
+    delegate IntPtr SUBCLASSPROC(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, UIntPtr id, UIntPtr data);
+    [DllImport("comctl32.dll")] static extern bool SetWindowSubclass(IntPtr hwnd, SUBCLASSPROC callback, UIntPtr id, UIntPtr data);
+    [DllImport("comctl32.dll", EntryPoint = "DefSubclassProc")] static extern IntPtr DefSubclassProcCursor(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Win32Point point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr parent);
@@ -4083,4 +4760,19 @@ public sealed class MainWindow : Window
     [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Win32Point point, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfoEx info);
+}
+
+static class InputCursors
+{
+    internal static readonly InputCursor Hand = InputSystemCursor.Create(InputSystemCursorShape.Hand);
+}
+
+sealed class HandCursorGrid : Grid
+{
+    internal HandCursorGrid() => ProtectedCursor = InputCursors.Hand;
+}
+
+sealed class InteractiveCursorGrid : Grid
+{
+    internal bool Interactive { set => ProtectedCursor = value ? InputCursors.Hand : null; }
 }

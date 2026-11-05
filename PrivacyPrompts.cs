@@ -65,7 +65,7 @@ namespace OffWorkWidget.WinUI
             string help = mode == Mode.Unlock ? "验证后显示当前请求查看的金额。" :
                 mode == Mode.Reset ? "重置会清除原密码并将薪资归零，无法恢复。" :
                 mode == Mode.Change ? "输入原密码后修改，已有薪资会保留。" :
-                "设置后，隐藏金额无需密码，重新显示时需要验证。";
+                "首次使用：请设置 4–20 位金额密码。隐藏金额无需密码，重新显示时需要验证。";
             var description = new TextBlock { Text = help, FontSize = 12, TextWrapping = TextWrapping.Wrap };
             if (mode == Mode.Reset) description.Foreground = new SolidColorBrush(Colors.OrangeRed);
             panel.Children.Add(description);
@@ -73,7 +73,7 @@ namespace OffWorkWidget.WinUI
                 AddPassword(panel, mode == Mode.Unlock ? "金额密码" : "原密码", current);
             if (mode != Mode.Unlock)
             {
-                AddPassword(panel, "新密码 · 6–128 位", next);
+                AddPassword(panel, "新密码 · 4–20 位", next);
                 AddPassword(panel, "再次输入新密码", confirm);
             }
             if (mode == Mode.Reset) panel.Children.Add(consent);
@@ -403,7 +403,7 @@ namespace OffWorkWidget.WinUI
         {
             var input = new PasswordBox
             {
-                MaxLength = 128, FontSize = 13, MinHeight = 38,
+                MaxLength = 20, FontSize = 13, MinHeight = 38,
                 BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8),
                 Background = FieldBrush(dark),
                 VerticalContentAlignment = VerticalAlignment.Center, Padding = new Thickness(10, 7, 10, 7)

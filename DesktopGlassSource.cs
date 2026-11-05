@@ -138,7 +138,7 @@ internal sealed class DesktopGlassSource : IDisposable
                 SetWindowDisplayAffinity(handle, 0x11);
             if (GlassProfile.Enabled) GlassProfile.Event("screen-capture-test affinity=" + ScreenCaptureExperiment.AffinityReady);
             if (!ScreenCaptureExperiment.AffinityReady)
-                MessageBoxW(handle, "当前系统无法启用无黄边采样，玻璃背景暂时不可用。请联系开发者检查。", "下班倒计时", 0x30);
+                MessageBoxW(handle, "当前系统无法启用无黄边采样，玻璃背景暂时不可用。请联系开发者检查。", "有盼", 0x30);
         }
         else SetWindowDisplayAffinity(handle, 0);
         timer = window.DispatcherQueue.CreateTimer();

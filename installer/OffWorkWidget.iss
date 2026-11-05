@@ -1,32 +1,32 @@
-#ifndef PayloadDir
+﻿#ifndef PayloadDir
   #error PayloadDir is required
 #endif
 #ifndef OutputDir
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.29"
+  #define AppVersion "1.0.44"
 #endif
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
   #define OutputName "OffWorkWidget-Installer-QA"
   #define InstallLeaf "OffWorkWidget-QA"
-  #define ShortcutName "下班倒计时安装测试"
+  #define ShortcutName "有盼安装测试"
 #else
   #define ProductId "{{B312EA3B-93C3-481D-AF00-5F60D9B84B35}"
-  #define OutputName "下班倒计时-Setup-" + AppVersion + "-x64"
+  #define OutputName "有盼-Setup-" + AppVersion + "-x64"
   #define InstallLeaf "OffWorkWidget"
-  #define ShortcutName "下班倒计时"
+  #define ShortcutName "有盼"
 #endif
 [Setup]
 AppId={#ProductId}
-AppName=下班倒计时
+AppName=有盼
 AppVersion={#AppVersion}
-AppVerName=下班倒计时 {#AppVersion}
-AppPublisher=下班倒计时
-VersionInfoProductName=下班倒计时
+AppVerName=有盼 {#AppVersion}
+AppPublisher=有盼
+VersionInfoProductName=有盼
 VersionInfoProductVersion={#AppVersion}
-VersionInfoDescription=下班倒计时 安装程序
+VersionInfoDescription=有盼 {#AppVersion} 安装程序
 DefaultDirName={localappdata}\Programs\{#InstallLeaf}
 DefaultGroupName={#ShortcutName}
 DisableProgramGroupPage=yes
@@ -54,18 +54,21 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 [Messages]
 ButtonCancel=取消
 FinishedHeadingLabel=安装完成
-FinishedLabel=下班倒计时已准备就绪。%n愿每一天，都有值得期待的下班时刻。
+FinishedLabel=有盼已准备就绪。%n愿每一天，都有值得期待的下班时刻。
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,prerequisites\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PayloadDir}\prerequisites\VC_redist.x64.exe"; Flags: dontcopy
 #include "ObsoleteRuntimeFiles.iss"
+[InstallDelete]
+Type: files; Name: "{autodesktop}\下班倒计时.lnk"
+Type: filesandordirs; Name: "{autoprograms}\下班倒计时"
 [Icons]
 Name: "{group}\{#ShortcutName}"; Filename: "{app}\OffWorkWidget.WinUI.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#ShortcutName}"; Filename: "{app}\OffWorkWidget.WinUI.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 [Run]
-Filename: "{app}\OffWorkWidget.WinUI.exe"; Description: "启动下班倒计时"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\OffWorkWidget.WinUI.exe"; Description: "启动有盼"; Flags: nowait postinstall skipifsilent runasoriginaluser
 [Code]
 const
   EventModifyState = $0002;
@@ -77,6 +80,7 @@ function CloseHandle(Handle: THandle): Boolean;
   external 'CloseHandle@kernel32.dll stdcall';
 var
   RuntimeReboot: Boolean;
+  RemoveUserData: Boolean;
   ContentTop, ContentHeight: Integer;
   InstallPage: TWizardPage;
   InstallPath: TNewEdit;
@@ -332,7 +336,7 @@ var
 begin
   Result := '';
   if not CloseRunningWidget then begin
-    Result := '请先从旧版下班倒计时的托盘菜单选择“退出”，然后重试安装。';
+    Result := '请先从旧版有盼的托盘菜单选择“退出”，然后重试安装。';
     exit;
   end;
   if not HasVCRuntime then begin
@@ -374,7 +378,12 @@ function InitializeUninstall: Boolean;
 begin
   Result := CloseRunningWidget;
   if not Result then
-    MsgBox('请先从下班倒计时的托盘菜单选择“退出”，然后重新卸载。个人设置会保留。', mbInformation, MB_OK);
+    MsgBox('请先从有盼的托盘菜单选择“退出”，然后重新卸载。个人设置会保留。', mbInformation, MB_OK)
+  else if UninstallSilent then
+    RemoveUserData := False
+  else
+    RemoveUserData := MsgBox('是否同时删除本机设置、心愿和金额密码？' + #13#10 +
+      '选择“否”将保留，重新安装后可继续使用。', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -392,5 +401,15 @@ begin
     (CompareText(Command, ExpectedCommand) = 0) then begin
     if not RegDeleteValue(HKCU, RunKey, 'OffWorkWidget') then
       Log('Unable to remove this installation startup entry.');
+  end;
+  if RemoveUserData then begin
+    if FileExists(ExpandConstant('{localappdata}\OffWorkWidget\settings.xml')) and
+      (not DeleteFile(ExpandConstant('{localappdata}\OffWorkWidget\settings.xml'))) then
+      Log('Unable to remove settings.xml.');
+    if FileExists(ExpandConstant('{localappdata}\OffWorkWidget\privacy.db')) and
+      (not DeleteFile(ExpandConstant('{localappdata}\OffWorkWidget\privacy.db'))) then
+      Log('Unable to remove privacy.db.');
+    DeleteFile(ExpandConstant('{localappdata}\OffWorkWidget\privacy.db-wal'));
+    DeleteFile(ExpandConstant('{localappdata}\OffWorkWidget\privacy.db-shm'));
   end;
 end;

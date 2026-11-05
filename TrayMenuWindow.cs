@@ -37,7 +37,7 @@ internal sealed class TrayMenuWindow : Window
     {
         this.selected = selected;
         this.dismissed = dismissed;
-        Title = "下班倒计时菜单";
+        Title = "有盼菜单";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         native = AppWindow.GetFromWindowId(Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd));
         native.IsShownInSwitchers = false;
@@ -57,15 +57,13 @@ internal sealed class TrayMenuWindow : Window
         SetWindowLongW(hwnd, -20, (extended & ~0x00040000) | 0x00000080);
         int rendering = 2;
         DwmSetWindowAttribute(hwnd, 2, ref rendering, 4);
-        int corner = rounded ? 3 : 1;
+        int corner = rounded ? 2 : 1;
         DwmSetWindowAttribute(hwnd, 33, ref corner, 4);
-        var margins = new Margins { Left = 1, Right = 1, Top = 1, Bottom = 1 };
-        DwmExtendFrameIntoClientArea(hwnd, ref margins);
 
         var panel = new StackPanel { Spacing = 0, Margin = new Thickness(4) };
         surface = new Border
         {
-            CornerRadius = new CornerRadius(rounded ? 8 : 0),
+            CornerRadius = new CornerRadius(rounded ? 14 : 0),
             BorderThickness = new Thickness(1),
             Child = panel
         };
@@ -76,6 +74,7 @@ internal sealed class TrayMenuWindow : Window
         panel.Children.Add(divider);
         AddItem(panel, 4, "退出", "\uE7E8");
         Content = surface;
+        SystemBackdrop = new WinUIEx.TransparentTintBackdrop(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(OnKeyDown), true);
         Activated += (_, args) =>
         {
@@ -152,7 +151,7 @@ internal sealed class TrayMenuWindow : Window
         var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
         GetMonitorInfoW(MonitorFromPoint(new Point { X = physicalX, Y = physicalY }, 2), ref info);
         int gap = (int)Math.Ceiling(4 * scale);
-        int x = Math.Clamp(physicalX - width, info.Work.Left, Math.Max(info.Work.Left, info.Work.Right - width));
+        int x = Math.Clamp(physicalX + gap, info.Work.Left, Math.Max(info.Work.Left, info.Work.Right - width));
         int y = physicalY - height - gap;
         if (y < info.Work.Top) y = physicalY + gap;
         y = Math.Clamp(y, info.Work.Top, Math.Max(info.Work.Top, info.Work.Bottom - height));
@@ -162,8 +161,8 @@ internal sealed class TrayMenuWindow : Window
         native.Show();
         Activate();
         SetForegroundWindow(hwnd);
-        items[0].Focus(FocusState.Programmatic);
-        DispatcherQueue.TryEnqueue(() => { if (IsOpen) items[0].Focus(FocusState.Programmatic); });
+        items[0].Focus(FocusState.Pointer);
+        DispatcherQueue.TryEnqueue(() => { if (IsOpen) items[0].Focus(FocusState.Pointer); });
     }
 
     internal void Hide()
@@ -235,14 +234,11 @@ internal sealed class TrayMenuWindow : Window
         }
         int immersive = dark ? 1 : 0;
         DwmSetWindowAttribute(hwnd, 20, ref immersive, 4);
-        int color = line.R | (line.G << 8) | (line.B << 16);
-        DwmSetWindowAttribute(hwnd, 34, ref color, 4);
     }
 
     [StructLayout(LayoutKind.Sequential)] struct Point { internal int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct Rect { internal int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { internal int Size; internal Rect Monitor, Work; internal uint Flags; }
-    [StructLayout(LayoutKind.Sequential)] struct Margins { internal int Left, Right, Top, Bottom; }
     [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr window, int index);
     [DllImport("user32.dll")] static extern int SetWindowLongW(IntPtr window, int index, int value);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
@@ -251,5 +247,4 @@ internal sealed class TrayMenuWindow : Window
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
-    [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref Margins margins);
 }

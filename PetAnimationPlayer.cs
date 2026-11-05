@@ -43,8 +43,10 @@ internal sealed class PetAnimationPlayer : IDisposable
         var data = await Task.Run(() =>
         {
             using var file = File.OpenRead(path);
-            using var gzip = new GZipStream(file, CompressionMode.Decompress);
-            using var reader = new BinaryReader(gzip);
+            using Stream decompressor = path.EndsWith(".br", StringComparison.OrdinalIgnoreCase)
+                ? new BrotliStream(file, CompressionMode.Decompress)
+                : new GZipStream(file, CompressionMode.Decompress);
+            using var reader = new BinaryReader(decompressor);
             if (new string(reader.ReadChars(8)) != "OWPET001") throw new InvalidDataException("Invalid pet animation header.");
             int w = reader.ReadInt32(), h = reader.ReadInt32(), n = reader.ReadInt32(), rate = reader.ReadInt32();
             if (w < 1 || w > 512 || h < 1 || h > 512 || n < 1 || n > 1000 || rate < 1 || rate > 60)
@@ -52,8 +54,8 @@ internal sealed class PetAnimationPlayer : IDisposable
             int length = checked(w * h * 4 * n);
             if (length > 100 * 1024 * 1024) throw new InvalidDataException("Pet animation is too large.");
             var bytes = new byte[length];
-            gzip.ReadExactly(bytes);
-            if (gzip.ReadByte() != -1) throw new InvalidDataException("Unexpected pet animation data.");
+            decompressor.ReadExactly(bytes);
+            if (decompressor.ReadByte() != -1) throw new InvalidDataException("Unexpected pet animation data.");
             return (bytes, w, h, n, rate);
         });
         var ready = new TaskCompletionSource<PetAnimationPlayer>(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -114,7 +114,7 @@ namespace OffWorkWidget
         }
         public static void ValidatePassword(string password)
         {
-            if (string.IsNullOrWhiteSpace(password) || password.Length < 6 || password.Length > 128) throw new ArgumentException("密码长度须为 6–128 位，不能全为空格。");
+            if (string.IsNullOrWhiteSpace(password) || password.Length < 4 || password.Length > 20) throw new ArgumentException("密码长度须为 4–20 位，不能全为空格。");
         }
         public void SetInitialPassword(string password)
         {

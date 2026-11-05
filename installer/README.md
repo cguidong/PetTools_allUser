@@ -8,7 +8,7 @@
 .\installer\build-installer.ps1 -CompilerPath 'C:\工具\Inno Setup 6\ISCC.exe'
 ```
 
-默认先发布到 publish，再输出到相邻的“下班倒计时-安装包”目录。已有完整发布包可加 `-SkipPublish`；可指定 `-PayloadDir` 和 `-OutputDir`，避免覆盖正在运行的发布目录。编译器可通过 ISCC 环境变量指定。不会自动下载编译工具。
+默认先发布到 publish，再输出到相邻的“有盼-安装包”目录。已有完整发布包可加 `-SkipPublish`；可指定 `-PayloadDir` 和 `-OutputDir`，避免覆盖正在运行的发布目录。编译器可通过 ISCC 环境变量指定。不会自动下载编译工具。
 
 完整打包自包含发布文件（不含调试 PDB），校验微软签名的 VC++ x64 安装程序，生成 EXE 和 SHA256。编译器来自 https://jrsoftware.org/isdl.php；中文翻译来自 Inno Setup 6.7.3 官方仓库的 ChineseSimplified.isl，保留文件中的作者声明。
 

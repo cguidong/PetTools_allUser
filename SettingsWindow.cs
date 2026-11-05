@@ -90,7 +90,17 @@ namespace OffWorkWidget.WinUI
         TextBlock startTimeDisplay, endTimeDisplay;
         TextBox salary, workDays, payDay;
         ToggleSwitch wishEnabled = null!;
-        TextBox wishName = null!, wishTarget = null!, wishSaved = null!;
+        StackPanel wishRowsHost = null!;
+        Button wishAdd = null!;
+        TextBlock wishCount = null!;
+        ComboBox wishAllocation = null!;
+        readonly List<WishRowEditor> wishRows = new();
+        sealed class WishRowEditor
+        {
+            internal FrameworkElement Card = null!;
+            internal TextBox Name = null!, Target = null!, Saved = null!;
+            internal Button Delete = null!;
+        }
         int waterMinutes, walkMinutes;
         ComboBox reminderDisplay = null!;
         string reminderPosition = "center";
@@ -138,6 +148,9 @@ namespace OffWorkWidget.WinUI
         Border toolbar = null!;
         Button autoAppearanceButton = null!, nightAppearanceButton = null!, backToTop = null!, footerCancel = null!;
         readonly ScaleTransform footerArrowScale = new ScaleTransform { ScaleX = 0, ScaleY = 0 };
+        readonly Stopwatch footerChromeClock = new Stopwatch();
+        bool animatingFooterChrome;
+        double footerChromeProgress, footerChromeStart, footerChromeTarget;
         readonly SolidColorBrush pageBackgroundBrush = new SolidColorBrush();
         readonly AcrylicBrush headerBackgroundBrush = new AcrylicBrush { Opacity = 0 };
         readonly SolidColorBrush footerBackgroundBrush = new SolidColorBrush();
@@ -161,8 +174,13 @@ namespace OffWorkWidget.WinUI
         Button petSelector = null!;
         readonly double[] accordionProgress = new double[3], accordionStart = new double[3], accordionTarget = new double[3];
         readonly Stopwatch accordionClock = new Stopwatch();
+        readonly Stopwatch wishDetailsClock = new Stopwatch();
         readonly Windows.UI.ViewManagement.UISettings animationSettings = new Windows.UI.ViewManagement.UISettings();
-        bool animatingAccordion;
+        Border wishDetailsHost = null!;
+        StackPanel wishDetails = null!;
+        TextBlock wishSummary = null!;
+        bool animatingAccordion, animatingWishDetails;
+        double wishDetailsProgress, wishDetailsStart, wishDetailsTarget;
         int expandedAccordion;
         bool workSectionExpanded = true;
         bool salaryAuthorized, automatic, night, privacyPromptOpen;
@@ -1262,20 +1280,60 @@ namespace OffWorkWidget.WinUI
         {
             compactTitle.Opacity = 1;
             UpdateHeaderTransition();
-            if (backToTop != null)
+            if (backToTop == null) return;
+            // Any scroll reveals the arrow at full size; the bounce comes from the
+            // animation, not from tracking the scroll offset.
+            double target = settingsScroll.VerticalOffset > 4 ? 1 : 0;
+            if (!animationSettings.AnimationsEnabled)
             {
-                double reveal = animationSettings.AnimationsEnabled
-                    ? Math.Clamp((settingsScroll.VerticalOffset - 120) / 80, 0, 1)
-                    : settingsScroll.VerticalOffset > 160 ? 1 : 0;
-                footerCancel.Margin = new Thickness(0, 0, 46 * reveal, 0);
-                footerArrowScale.ScaleX = footerArrowScale.ScaleY = reveal;
-                backToTop.Opacity = reveal;
-                backToTop.IsEnabled = reveal > 0;
-                backToTop.IsHitTestVisible = reveal > 0;
-                backToTop.IsTabStop = reveal > 0;
-                Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(backToTop,
-                    reveal > 0 ? Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Content : Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Raw);
+                footerChromeProgress = footerChromeStart = footerChromeTarget = target;
+                ApplyFooterChrome(target);
+                return;
             }
+            if (target == footerChromeTarget) return;
+            footerChromeStart = footerChromeProgress;
+            footerChromeTarget = target;
+            footerChromeClock.Restart();
+            if (!animatingFooterChrome) { animatingFooterChrome = true; CompositionTarget.Rendering += AnimateFooterChrome; }
+            AnimateFooterChrome(null, null!);
+        }
+
+        static double EaseOutBack(double t)
+        {
+            const double c1 = 1.70158, c3 = c1 + 1;
+            double u = t - 1;
+            return 1 + c3 * u * u * u + c1 * u * u;
+        }
+
+        void AnimateFooterChrome(object? sender, object args)
+        {
+            double position = Math.Clamp(footerChromeClock.Elapsed.TotalMilliseconds / 300, 0, 1);
+            double eased = EaseOutBack(position);
+            footerChromeProgress = footerChromeStart + (footerChromeTarget - footerChromeStart) * eased;
+            ApplyFooterChrome(footerChromeProgress);
+            if (position >= 1)
+            {
+                footerChromeProgress = footerChromeTarget;
+                ApplyFooterChrome(footerChromeProgress);
+                CompositionTarget.Rendering -= AnimateFooterChrome;
+                footerChromeClock.Stop();
+                animatingFooterChrome = false;
+            }
+        }
+
+        void ApplyFooterChrome(double value)
+        {
+            if (backToTop == null || footerCancel == null) return;
+            double visible = Math.Clamp(value, 0, 1);
+            footerCancel.Margin = new Thickness(0, 0, Math.Max(0, 46 * value), 0);
+            footerArrowScale.ScaleX = footerArrowScale.ScaleY = Math.Max(0, value);
+            backToTop.Opacity = visible;
+            bool on = visible > 0;
+            backToTop.IsEnabled = on;
+            backToTop.IsHitTestVisible = on;
+            backToTop.IsTabStop = on;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(backToTop,
+                on ? Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Content : Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Raw);
         }
 
         void UpdateHeaderTransition()
@@ -2140,13 +2198,14 @@ namespace OffWorkWidget.WinUI
                 CreateAccordionHeader("工作与休息", out restChevron, () => ToggleAccordion(2), 1),
                 CreateAccordionHeader("健康提醒", out careChevron, () => ToggleAccordion(3), 2) };
             var contents = new[] { incomeContent, restContent, careContent };
+            var wishCard = BuildWishCard();
             foreach (int i in new[] { 1, 0, 2 })
             {
                 var body = new StackPanel(); body.Children.Add(headers[i]); body.Children.Add(contents[i]);
                 accordionCards[i] = CreateCardBorder(new Thickness(0)); accordionCards[i].Child = body;
                 stack.Children.Add(accordionCards[i]);
+                if (i == 0) stack.Children.Add(wishCard);
             }
-            stack.Children.Add(BuildWishCard());
             accordionProgress[1] = accordionStart[1] = accordionTarget[1] = 1;
             restContent.Visibility = Visibility.Visible;
             restChevron.RenderTransform = new RotateTransform { Angle = 90 };
@@ -2160,35 +2219,146 @@ namespace OffWorkWidget.WinUI
             var header = new Grid();
             header.ColumnDefinitions.Add(new ColumnDefinition());
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            header.Children.Add(new TextBlock { Text = "小心愿", FontSize = 14, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            var headerLabels = new StackPanel { Spacing = 2 };
+            headerLabels.Children.Add(new TextBlock { Text = "我的心愿", FontSize = 14, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            wishSummary = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextTrimming = TextTrimming.CharacterEllipsis };
+            headerLabels.Children.Add(wishSummary);
+            Grid.SetColumn(headerLabels, 0); header.Children.Add(headerLabels);
             wishEnabled = CreateGreenSwitch(current.WishEnabled);
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishEnabled, "显示小心愿");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishEnabled, "显示我的心愿");
             Grid.SetColumn(wishEnabled, 1); header.Children.Add(wishEnabled);
             panel.Children.Add(header);
-            var details = new StackPanel { Spacing = 8, Visibility = current.WishEnabled ? Visibility.Visible : Visibility.Collapsed };
-            wishEnabled.Toggled += (_, __) => details.Visibility = wishEnabled.IsOn ? Visibility.Visible : Visibility.Collapsed;
-            details.Children.Add(new TextBlock { Text = "心愿", FontSize = 13, Foreground = subInkBrush });
-            wishName = CreateInputBox(current.WishName ?? string.Empty);
-            wishName.PlaceholderText = "例如：旅行";
-            wishName.MaxLength = 40;
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishName, "心愿名称");
-            details.Children.Add(wishName);
-            var amounts = new Grid { ColumnSpacing = 12 };
-            amounts.ColumnDefinitions.Add(new ColumnDefinition()); amounts.ColumnDefinitions.Add(new ColumnDefinition());
-            wishTarget = CreateInputBox(current.WishTarget.ToString(CultureInfo.InvariantCulture));
-            wishSaved = CreateInputBox(current.WishSaved.ToString(CultureInfo.InvariantCulture));
-            var targetColumn = new StackPanel { Spacing = 8 };
-            targetColumn.Children.Add(new TextBlock { Text = "目标金额（元）", FontSize = 13, Foreground = subInkBrush });
-            targetColumn.Children.Add(wishTarget);
-            var savedColumn = new StackPanel { Spacing = 8 };
-            savedColumn.Children.Add(new TextBlock { Text = "已攒金额（元）", FontSize = 13, Foreground = subInkBrush });
-            savedColumn.Children.Add(wishSaved);
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishTarget, "目标金额，元");
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishSaved, "已攒金额，元");
-            amounts.Children.Add(targetColumn); Grid.SetColumn(savedColumn, 1); amounts.Children.Add(savedColumn);
-            details.Children.Add(amounts); panel.Children.Add(details);
+            var details = new StackPanel { Spacing = 8 };
+            wishDetails = details;
+            wishDetailsProgress = current.WishEnabled ? 1 : 0;
+            wishDetailsHost = new Border { Child = details, Visibility = current.WishEnabled ? Visibility.Visible : Visibility.Collapsed };
+            wishEnabled.Toggled += (_, __) => ToggleWishDetails(wishEnabled.IsOn);
+            details.Children.Add(new TextBlock { Text = "进度 = 已攒 + 上次发薪后工资", FontSize = 12.5, Foreground = subInkBrush });
+            var allocationRow = new Grid { ColumnSpacing = 8 };
+            allocationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            allocationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            allocationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            allocationRow.Children.Add(new TextBlock { Text = "多心愿进度", FontSize = 12, Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center });
+            wishAllocation = new ComboBox
+            {
+                Height = 32, MinWidth = 128, FontSize = 12.5,
+                Background = inputBackgroundBrush, Foreground = inkBrush,
+                BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8),
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            wishAllocation.Items.Add(new ComboBoxItem { Content = "依次完成", Tag = "sequential" });
+            wishAllocation.Items.Add(new ComboBoxItem { Content = "平均分配", Tag = "split" });
+            wishAllocation.SelectedIndex = current.WishAllocation == "split" ? 1 : 0;
+            ToolTipService.SetToolTip(wishAllocation, "依次完成：总进度池依次填满前面的心愿；平均分配：总进度池平均分到每个心愿");
+            Grid.SetColumn(wishAllocation, 1); allocationRow.Children.Add(wishAllocation);
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
+            wishCount = new TextBlock { FontSize = 12, Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center };
+            var accentTint = new SolidColorBrush(Windows.UI.Color.FromArgb(28, 0, 122, 255));
+            var accentTintHover = new SolidColorBrush(Windows.UI.Color.FromArgb(44, 0, 122, 255));
+            var accentTintPressed = new SolidColorBrush(Windows.UI.Color.FromArgb(60, 0, 122, 255));
+            var accentTintDisabled = new SolidColorBrush(Windows.UI.Color.FromArgb(14, 0, 122, 255));
+            wishAdd = new Button
+            {
+                Content = new FontIcon { Glyph = "\uE710", FontSize = 14 },
+                Width = 32, Height = 32, MinWidth = 0, Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(10),
+                Background = accentTint,
+                Foreground = accentBlue,
+                BorderThickness = new Thickness(0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            wishAdd.Resources["ButtonBackgroundPointerOver"] = accentTintHover;
+            wishAdd.Resources["ButtonBackgroundPressed"] = accentTintPressed;
+            wishAdd.Resources["ButtonBackgroundDisabled"] = accentTintDisabled;
+            wishAdd.Resources["ButtonForegroundPointerOver"] = accentBlue;
+            wishAdd.Resources["ButtonForegroundPressed"] = accentBlue;
+            wishAdd.Resources["ButtonForegroundDisabled"] = subInkBrush;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(wishAdd, "添加心愿");
+            ToolTipService.SetToolTip(wishAdd, "添加一个新的小心愿");
+            wishAdd.Click += (_, __) => { if (wishRows.Count < OffWorkWidget.Logic.MaxWishes) AddWishRow(new OffWorkWidget.WishEntry()); };
+            actions.Children.Add(wishCount); actions.Children.Add(wishAdd);
+            Grid.SetColumn(actions, 2); allocationRow.Children.Add(actions);
+            details.Children.Add(allocationRow);
+            var labels = new Grid { ColumnSpacing = 6 };
+            labels.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2.2, GridUnitType.Star) });
+            labels.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) });
+            labels.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) });
+            labels.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+            string[] labelText = { "心愿名称", "目标（元）", "已攒（元）" };
+            for (int i = 0; i < 3; i++)
+            {
+                var label = new TextBlock { Text = labelText[i], FontSize = 11.5, Foreground = subInkBrush, Margin = new Thickness(8, 0, 0, 0) };
+                Grid.SetColumn(label, i); labels.Children.Add(label);
+            }
+            details.Children.Add(labels);
+            wishRowsHost = new StackPanel { Spacing = 10 };
+            details.Children.Add(wishRowsHost);
+            panel.Children.Add(wishDetailsHost);
             card.Child = panel;
+
+            OffWorkWidget.Logic.NormalizeWishes(current);
+            foreach (var wish in current.Wishes) AddWishRow(wish);
+            UpdateWishAddState();
             return card;
+        }
+
+        void AddWishRow(OffWorkWidget.WishEntry wish)
+        {
+            if (wishRows.Count >= OffWorkWidget.Logic.MaxWishes) return;
+            var row = new OffWorkWidget.WishEntry { Name = wish.Name ?? "", Target = wish.Target, Saved = wish.Saved };
+            var grid = new Grid { ColumnSpacing = 6 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2.2, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+            var editor = new WishRowEditor { Card = grid, Name = CreateInputBox(row.Name), Target = CreateInputBox(row.Target.ToString(CultureInfo.InvariantCulture)), Saved = CreateInputBox(row.Saved.ToString(CultureInfo.InvariantCulture)) };
+            foreach (var box in new[] { editor.Name, editor.Target, editor.Saved })
+            {
+                box.MinWidth = 0;
+                box.Padding = new Thickness(8, 6, 8, 6);
+            }
+            editor.Name.MaxLength = 8;
+            int number = wishRows.Count + 1;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Name, "心愿名称 " + number);
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Target, "目标金额 " + number + "，元");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Saved, "已攒金额 " + number + "，元");
+            grid.Children.Add(editor.Name);
+            Grid.SetColumn(editor.Target, 1); grid.Children.Add(editor.Target);
+            Grid.SetColumn(editor.Saved, 2); grid.Children.Add(editor.Saved);
+            editor.Delete = new Button
+            {
+                Content = new FontIcon { Glyph = "\uE74D", FontSize = 12 },
+                Width = 28, Height = 28, MinWidth = 0, Padding = new Thickness(0),
+                CornerRadius = new CornerRadius(7),
+                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                Foreground = subInkBrush,
+                BorderThickness = new Thickness(0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            editor.Delete.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+            editor.Delete.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Delete, "删除心愿 " + number);
+            ToolTipService.SetToolTip(editor.Delete, "删除这个心愿");
+            editor.Delete.Click += (_, __) =>
+            {
+                wishRows.Remove(editor);
+                wishRowsHost.Children.Remove(editor.Card);
+                UpdateWishAddState();
+            };
+            Grid.SetColumn(editor.Delete, 3); grid.Children.Add(editor.Delete);
+            wishRows.Add(editor);
+            wishRowsHost.Children.Add(grid);
+            UpdateWishAddState();
+        }
+
+        void UpdateWishAddState()
+        {
+            if (wishAdd == null) return;
+            wishAdd.IsEnabled = wishRows.Count < OffWorkWidget.Logic.MaxWishes;
+            if (wishCount != null) wishCount.Text = wishRows.Count + "/" + OffWorkWidget.Logic.MaxWishes;
+            if (wishSummary != null)
+                wishSummary.Text = wishRows.Count == 0 ? "暂无心愿" : "共 " + wishRows.Count + " 个心愿";
+            ToolTipService.SetToolTip(wishAdd, wishAdd.IsEnabled ? "添加一个新的小心愿" : "最多添加 8 个小心愿");
         }
 
         Border CreateChevronSurface(Button owner, Grid icon)
@@ -2320,6 +2490,46 @@ namespace OffWorkWidget.WinUI
             }
             UpdateAccordionChrome();
             if (position >= 1) { CompositionTarget.Rendering -= AnimateAccordion; accordionClock.Stop(); animatingAccordion = false; }
+        }
+
+        void ToggleWishDetails(bool show)
+        {
+            if (wishDetailsHost == null) return;
+            if (show && wishRows.Count == 0) AddWishRow(new OffWorkWidget.WishEntry());
+            if (wishDetailsHost.XamlRoot == null)
+            {
+                wishDetailsProgress = wishDetailsTarget = wishDetailsStart = show ? 1 : 0;
+                wishDetailsHost.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+                return;
+            }
+            wishDetailsStart = wishDetailsProgress;
+            wishDetailsTarget = show ? 1 : 0;
+            wishDetailsHost.Visibility = Visibility.Visible;
+            wishDetailsClock.Restart();
+            if (!animatingWishDetails) { animatingWishDetails = true; CompositionTarget.Rendering += AnimateWishDetails; }
+            AnimateWishDetails(null, null!);
+        }
+
+        void AnimateWishDetails(object? sender, object args)
+        {
+            bool enabled = animationSettings.AnimationsEnabled;
+            double position = enabled ? Math.Clamp(wishDetailsClock.Elapsed.TotalMilliseconds / 260, 0, 1) : 1;
+            double eased = position * position * (3 - 2 * position);
+            double progress = wishDetailsStart + (wishDetailsTarget - wishDetailsStart) * eased;
+            wishDetailsProgress = progress;
+            double width = Math.Max(1, form.ActualWidth - 32);
+            wishDetails.Measure(new Windows.Foundation.Size(width, double.PositiveInfinity));
+            double height = Math.Max(0, wishDetails.DesiredSize.Height) * progress;
+            wishDetailsHost.Height = height;
+            wishDetailsHost.Opacity = progress;
+            wishDetailsHost.Clip = new RectangleGeometry { Rect = new Windows.Foundation.Rect(0, 0, width, height) };
+            if (position >= 1)
+            {
+                wishDetailsHost.Height = double.NaN; wishDetailsHost.Clip = null;
+                wishDetailsHost.Opacity = 1;
+                wishDetailsHost.Visibility = wishDetailsTarget > 0 ? Visibility.Visible : Visibility.Collapsed;
+                CompositionTarget.Rendering -= AnimateWishDetails; wishDetailsClock.Stop(); animatingWishDetails = false;
+            }
         }
 
         void BuildDesktopLayoutCard()
@@ -4399,17 +4609,36 @@ namespace OffWorkWidget.WinUI
                 return;
             }
 
-            string wishText = wishName.Text.Trim();
-            bool validWishTarget = decimal.TryParse(wishTarget.Text, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal targetValue) && targetValue > 0 && targetValue <= 100000000;
-            bool validWishSaved = decimal.TryParse(wishSaved.Text, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal savedValue) && savedValue >= 0 && savedValue <= 100000000;
-            if (wishEnabled.IsOn && (string.IsNullOrWhiteSpace(wishText) || !validWishTarget || !validWishSaved))
+            var wishItems = new List<OffWorkWidget.WishEntry>();
+            for (int i = 0; i < wishRows.Count; i++)
             {
-                error.Text = "请填写心愿名称、目标金额（大于 0）和已攒金额（不小于 0），金额最多为 100000000 元。";
-                error.Visibility = Visibility.Visible;
-                return;
+                var row = wishRows[i];
+                string rowName = row.Name.Text.Trim();
+                string targetText = row.Target.Text.Trim();
+                string savedText = row.Saved.Text.Trim();
+                if (rowName.Length == 0 && targetText.Length == 0 && savedText.Length == 0) continue;
+                if (rowName.Length == 0)
+                {
+                    error.Text = $"请填写第 {i + 1} 个心愿的名称。"; error.Visibility = Visibility.Visible;
+                    return;
+                }
+                if (rowName.Length > 8)
+                {
+                    error.Text = $"第 {i + 1} 个心愿名称最多 8 个字。"; error.Visibility = Visibility.Visible;
+                    return;
+                }
+                if (!decimal.TryParse(targetText, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal rowTarget) || rowTarget <= 0 || rowTarget > 100000000)
+                {
+                    error.Text = $"第 {i + 1} 个心愿的目标金额须大于 0 且不超过 100000000 元。"; error.Visibility = Visibility.Visible;
+                    return;
+                }
+                if (!decimal.TryParse(savedText, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal rowSaved) || rowSaved < 0 || rowSaved > 100000000)
+                {
+                    error.Text = $"第 {i + 1} 个心愿的已攒金额须在 0 到 100000000 元之间。"; error.Visibility = Visibility.Visible;
+                    return;
+                }
+                wishItems.Add(new OffWorkWidget.WishEntry { Name = rowName, Target = rowTarget, Saved = rowSaved });
             }
-            if (!validWishTarget) targetValue = current.WishTarget;
-            if (!validWishSaved) savedValue = current.WishSaved;
 
             double size = scale.Value;
             if (!double.IsFinite(size) || size < 0.5 || size > 1.5)
@@ -4470,9 +4699,11 @@ namespace OffWorkWidget.WinUI
                 DoubleRestWeekStart = doubleRestWeekStart.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                 DateAdjustments = adjustments.Select(a => new OffWorkWidget.DateAdjustment { Date = a.Date, IsWorkday = a.IsWorkday }).ToList(),
                 WishEnabled = wishEnabled.IsOn,
-                WishName = wishText,
-                WishTarget = targetValue,
-                WishSaved = savedValue,
+                Wishes = wishItems,
+                WishAllocation = (wishAllocation.SelectedItem as ComboBoxItem)?.Tag as string ?? "sequential",
+                WishName = wishItems.Count > 0 ? wishItems[0].Name : "",
+                WishTarget = wishItems.Count > 0 ? wishItems[0].Target : 0,
+                WishSaved = wishItems.Count > 0 ? wishItems[0].Saved : 0,
                 WaterReminder = water.IsOn,
                 WalkReminder = walk.IsOn,
                 ReminderPopup = reminderDisplay.SelectedIndex == 1,

@@ -1,7 +1,7 @@
 ﻿param([string]$CompilerPath,[string]$PayloadDir,[string]$OutputDir,[switch]$SkipPublish,[switch]$InstallerQATest)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-if (!$OutputDir) { $OutputDir = Join-Path (Split-Path $root -Parent) '下班倒计时-安装包' }
+if (!$OutputDir) { $OutputDir = Join-Path (Split-Path $root -Parent) '有盼-安装包' }
 if (!$PayloadDir) { $PayloadDir = Join-Path $root 'publish' }
 if (!$CompilerPath) {
     $candidates = @(
@@ -18,9 +18,14 @@ if (!$SkipPublish) {
     if ($LASTEXITCODE -ne 0) { throw '发布失败。' }
 }
 $PayloadDir = (Resolve-Path -LiteralPath $PayloadDir).Path
-foreach ($required in @('OffWorkWidget.WinUI.exe','OffWorkWidget.WinUI.dll','App.xbf','OffWorkWidget.WinUI.pri','OffWorkWidget.WinUI.runtimeconfig.json','coreclr.dll','Microsoft.UI.Xaml.dll','CustomEffectRuntimeNative.dll','assets\app-icon.ico','prerequisites\VC_redist.x64.exe')) {
+foreach ($required in @('OffWorkWidget.WinUI.exe','OffWorkWidget.WinUI.dll','App.xbf','OffWorkWidget.WinUI.pri','OffWorkWidget.WinUI.runtimeconfig.json','coreclr.dll','Microsoft.UI.Xaml.dll','CustomEffectRuntimeNative.dll','assets\app-icon.ico','assets\polar-bear-idle.frames.br','assets\polar-bear-nap.frames.br','prerequisites\VC_redist.x64.exe')) {
     if (!(Test-Path -LiteralPath (Join-Path $PayloadDir $required))) { throw "发布包缺少 $required" }
 }
+# WinUI ships MUI files for every Windows language. Keep Chinese, English and the app assets only.
+$keepDirs = @('assets','prerequisites','Microsoft.UI.Xaml','en-us','zh-CN','zh-TW')
+Get-ChildItem -LiteralPath $PayloadDir -Directory | Where-Object {
+    $_.Name -notin $keepDirs -and (Get-ChildItem -LiteralPath $_.FullName -Filter *.mui -File -Recurse -ErrorAction SilentlyContinue)
+} | Remove-Item -Recurse -Force
 $redist = Join-Path $PayloadDir 'prerequisites\VC_redist.x64.exe'
 $signature = Get-AuthenticodeSignature -LiteralPath $redist
 if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw 'VC++ 运行库微软签名验证失败。' }
@@ -35,7 +40,7 @@ if ($LASTEXITCODE -ne 0) { throw '安装包编译失败。' }
 if (!$InstallerQATest) {
     Copy-Item -LiteralPath $redist -Destination (Join-Path $OutputDir 'VC_redist.x64.exe') -Force
 }
-$name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } else { "下班倒计时-Setup-$version-x64.exe" }
+$name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } else { "有盼-Setup-$version-x64.exe" }
 $artifact = Join-Path $OutputDir $name
 $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
 [IO.File]::WriteAllText("$artifact.sha256", "$($hash.Hash)  $name`r`n", [Text.UTF8Encoding]::new($true))

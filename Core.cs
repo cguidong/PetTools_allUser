@@ -42,6 +42,12 @@ namespace OffWorkWidget
                 : "柔光呼吸";
         }
     }
+    public class WishEntry
+    {
+        public string Name = "";
+        public decimal Target = 0;
+        public decimal Saved = 0;
+    }
     public class Settings
     {
         public string Start = "09:00";
@@ -70,6 +76,9 @@ namespace OffWorkWidget
         public string DoubleRestWeekStart = "";
         public System.Collections.Generic.List<DateAdjustment> DateAdjustments = new System.Collections.Generic.List<DateAdjustment>();
         public bool WishEnabled = false;
+        public System.Collections.Generic.List<WishEntry> Wishes = new System.Collections.Generic.List<WishEntry>();
+        public string WishAllocation = "sequential";
+        // Legacy single-wish fields, kept only to migrate existing settings files.
         public string WishName = "";
         public decimal WishTarget = 0;
         public decimal WishSaved = 0;
@@ -93,6 +102,28 @@ namespace OffWorkWidget
     }
     public static class Logic
     {
+        public const int MaxWishes = 8;
+        public static void NormalizeWishes(Settings s)
+        {
+            if (s.Wishes == null) s.Wishes = new System.Collections.Generic.List<WishEntry>();
+            if (s.WishAllocation != "sequential" && s.WishAllocation != "split") s.WishAllocation = "sequential";
+            s.Wishes.RemoveAll(w => w == null);
+            if (s.Wishes.Count == 0 &&
+                !string.IsNullOrWhiteSpace(s.WishName) && s.WishTarget > 0 && s.WishSaved >= 0)
+                s.Wishes.Add(new WishEntry { Name = s.WishName.Trim(), Target = s.WishTarget, Saved = s.WishSaved });
+            foreach (var wish in s.Wishes)
+            {
+                wish.Name = (wish.Name ?? "").Trim();
+                if (wish.Name.Length > 8) wish.Name = wish.Name.Substring(0, 8);
+            }
+            var first = s.Wishes.Count > 0 ? s.Wishes[0] : null;
+            if (first != null)
+            {
+                s.WishName = first.Name;
+                s.WishTarget = first.Target;
+                s.WishSaved = first.Saved;
+            }
+        }
         public static TimeSpan Time(string value)
         {
             TimeSpan t;
@@ -154,6 +185,31 @@ namespace OffWorkWidget
         public static bool RestStarted(DateTime now, Settings s, int days)
         {
             return days == 0 || (days == 1 && now.TimeOfDay >= WorkHours(now, s).End);
+        }
+        public static (DateTime? PlayFrom, DateTime End, bool Lunch)? NapWindow(DateTime now, Settings s)
+        {
+            bool workday = WorkingDay(now, s);
+            if (workday)
+            {
+                var hours = WorkHours(now, s);
+                var lunchStart = now.Date.Add(Time(s.LunchStart));
+                var lunchEnd = now.Date.Add(Time(s.LunchEnd));
+                if (now >= lunchStart && now < lunchEnd) return (lunchStart, lunchEnd, true);
+                if (now.TimeOfDay >= hours.Start && now.TimeOfDay < hours.End) return null;
+            }
+            var next = NextWorkStart(now, s);
+            if (!next.HasValue || next.Value <= now) return null;
+            DateTime? playFrom = null;
+            // Only replay the transition when the app opens right at a work end.
+            for (int i = 0; i <= 1; i++)
+            {
+                var date = now.Date.AddDays(-i);
+                if (!WorkingDay(date, s)) continue;
+                var end = date.Date.Add(WorkHours(date, s).End);
+                var age = now - end;
+                if (age >= TimeSpan.Zero && age <= TimeSpan.FromSeconds(6)) { playFrom = end; break; }
+            }
+            return (playFrom, next.Value, false);
         }
         public static DateTime? NextWorkStart(DateTime now, Settings s)
         {
@@ -235,6 +291,18 @@ namespace OffWorkWidget
             double ratio = duration > 0 ? Math.Max(0, Math.Min(1, elapsed / duration)) : 0;
             return s.Salary / s.WorkDays * (decimal)ratio;
         }
+        public static decimal EarnedSinceLastPayday(DateTime now, Settings s)
+        {
+            DateTime currentPay = PayDate(now.Year, now.Month, s.PayDay);
+            DateTime previous = now.AddMonths(-1);
+            DateTime start = now.Date >= currentPay ? currentPay : PayDate(previous.Year, previous.Month, s.PayDay);
+            decimal total = 0;
+            for (DateTime day = start; day < now.Date; day = day.AddDays(1))
+                if (WorkingDay(day, s)) total += s.Salary / s.WorkDays;
+            return total + Earned(now, s);
+        }
+        static DateTime PayDate(int year, int month, int day) =>
+            new DateTime(year, month, Math.Min(day, DateTime.DaysInMonth(year, month)));
         public static int UntilPay(DateTime now, int day)
         {
             DateTime pay = new DateTime(now.Year, now.Month, Math.Min(day, DateTime.DaysInMonth(now.Year, now.Month)));
@@ -243,6 +311,7 @@ namespace OffWorkWidget
         }
         public static void Validate(Settings s)
         {
+            NormalizeWishes(s);
             if (Time(s.End) <= Time(s.Start)) throw new FormatException("下班时间须晚于上班时间，当前版本支持当天班次。");
             // Validate lunch even when an older settings file stored LunchEnabled=false.
             try
@@ -291,9 +360,15 @@ namespace OffWorkWidget
             catch (OverflowException) { throw new FormatException("计薪天数过小，超出薪资计算范围，请增大计薪天数。"); }
             if (s.WishEnabled)
             {
-                if (string.IsNullOrWhiteSpace(s.WishName)) throw new FormatException("请填写心愿名称。");
-                if (s.WishTarget <= 0 || s.WishTarget > 100000000m) throw new FormatException("心愿目标金额须大于 0 且不超过 1 亿元。");
-                if (s.WishSaved < 0 || s.WishSaved > 100000000m) throw new FormatException("已攒金额须在 0 到 1 亿元之间。");
+                if (s.Wishes.Count > MaxWishes) throw new FormatException($"小心愿最多添加 {MaxWishes} 个。");
+                if (s.WishAllocation != "sequential" && s.WishAllocation != "split") throw new FormatException("多心愿进度分配方式无效。");
+                foreach (var wish in s.Wishes)
+                {
+                    if (string.IsNullOrWhiteSpace(wish.Name)) throw new FormatException("请填写心愿名称。");
+                    if (wish.Name.Trim().Length > 8) throw new FormatException("心愿名称最多 8 个字符。");
+                    if (wish.Target <= 0 || wish.Target > 100000000m) throw new FormatException("心愿目标金额须大于 0 且不超过 1 亿元。");
+                    if (wish.Saved < 0 || wish.Saved > 100000000m) throw new FormatException("已攒金额须在 0 到 1 亿元之间。");
+                }
             }
             if (s.WaterMinutes < 1 || s.WaterMinutes > 720 || s.WalkMinutes < 1 || s.WalkMinutes > 720) throw new FormatException("提醒间隔须为 1–720 分钟。");
             if (s.ReminderPosition != "custom" && s.ReminderPosition != "center" && s.ReminderPosition != "top-left" && s.ReminderPosition != "top-center" && s.ReminderPosition != "top-right" &&
