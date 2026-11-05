@@ -143,18 +143,20 @@ internal sealed unsafe class NativeCaptureCrop : IDisposable
     }
 
     // Copies directly from the locked CPU bitmap; avoids a second WinRT buffer and array marshaling.
-    internal static void CopyPixels(SoftwareBitmap bitmap, byte[] destination)
+    internal static void CopyPixels(SoftwareBitmap bitmap, byte[] destination, int width, int height)
     {
         ArgumentNullException.ThrowIfNull(bitmap);
         ArgumentNullException.ThrowIfNull(destination);
         if (bitmap.BitmapPixelFormat != BitmapPixelFormat.Bgra8)
             throw new ArgumentException("Expected a BGRA8 capture bitmap.", nameof(bitmap));
-        int rows = bitmap.PixelHeight, rowBytes = checked(bitmap.PixelWidth * 4);
+        if (width <= 0 || height <= 0 || width > bitmap.PixelWidth || height > bitmap.PixelHeight)
+            throw new ArgumentOutOfRangeException(nameof(width), "Copy region must fit the capture bitmap.");
+        int rows = height, rowBytes = checked(width * 4);
         if (destination.Length < checked(rows * rowBytes))
             throw new ArgumentException("Destination does not fit the capture bitmap.", nameof(destination));
         using var buffer = bitmap.LockBuffer(BitmapBufferAccessMode.Read);
         var plane = buffer.GetPlaneDescription(0);
-        if (plane.Width < bitmap.PixelWidth || plane.Height < rows || Math.Abs((long)plane.Stride) < rowBytes)
+        if (plane.Width < width || plane.Height < rows || Math.Abs((long)plane.Stride) < rowBytes)
             throw new InvalidOperationException("Capture bitmap has an invalid row layout.");
         using var reference = buffer.CreateReference();
         var access = reference.As<IMemoryBufferByteAccess>();

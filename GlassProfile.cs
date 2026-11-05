@@ -19,7 +19,7 @@ internal static class GlassProfile
     static volatile bool stopping;
     static long dropped;
 
-    enum Kind { Render, Capture, Readback, Crop, Source, Appearance, Event }
+    enum Kind { Render, Capture, Readback, Crop, Source, Appearance, Event, Pacing }
 
     readonly struct Row
     {
@@ -82,6 +82,11 @@ internal static class GlassProfile
         => Enqueue(new Row(Kind.Render, Environment.TickCount64, totalMs, uploadMs, appearanceMs,
             intervalMs, captureToRenderMs, flags: (visualDrag ? 1 : 0) | (changed ? 2 : 0),
             i1: (int)Math.Min(int.MaxValue, pixels), i2: atlasVersion));
+
+    // Callback cadence only; this is not a screen-presentation FPS measurement.
+    internal static void Pacing(double intervalMs, bool moving, bool inactive, bool captureBusy, bool probeBusy)
+        => Enqueue(new Row(Kind.Pacing, Environment.TickCount64, intervalMs,
+            flags: (moving ? 1 : 0) | (inactive ? 2 : 0) | (captureBusy ? 4 : 0) | (probeBusy ? 8 : 0)));
 
     internal static void Capture(double composeMs, double metricsMs, double layoutMs, bool layoutProbed,
         bool pendingRegion, bool unchanged, bool skipped, int capturedWindows)

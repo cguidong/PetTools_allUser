@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Buffers;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Windows.Graphics.Capture;
@@ -57,6 +58,9 @@ internal static class CompositorWindowCapture
     static readonly object gate = new object();
     static readonly Dictionary<IntPtr, Source> sources = new Dictionary<IntPtr, Source>();
     static readonly Dictionary<IntPtr, long> retryAfter = new Dictionary<IntPtr, long>();
+    // Diagnostic IDs are process-local and do not expose native window handles.
+    static readonly Dictionary<IntPtr, long> diagnosticWindows = new Dictionary<IntPtr, long>();
+    static long nextDiagnosticWindow, nextDiagnosticSource;
     const int FrameIntervalMilliseconds = 100, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
@@ -75,7 +79,7 @@ internal static class CompositorWindowCapture
     static bool TryGetFrame(IntPtr hwnd, Region? region, out Frame? frame)
     {
         frame = null;
-        if (hwnd == IntPtr.Zero) return false;
+        if (hwnd == IntPtr.Zero || !WindowBackdropCapture.IsWindowAvailable(hwnd)) return false;
         Source source;
         lock (gate)
         {
@@ -85,7 +89,7 @@ internal static class CompositorWindowCapture
                 retryAfter.Remove(hwnd);
             }
             if (sources.TryGetValue(hwnd, out var expired) && expired.IsExpired)
-            { sources.Remove(hwnd); _ = Task.Run(expired.Dispose); }
+            { sources.Remove(hwnd); _ = Task.Run(() => expired.Dispose("expired-on-access")); }
             if (!sources.TryGetValue(hwnd, out source!))
             {
                 if (sources.Count >= 4)
@@ -96,7 +100,7 @@ internal static class CompositorWindowCapture
                     // Do not evict sources still being visited in the same sampling pass.
                     if (oldest == null || Environment.TickCount64 - oldest.LastUse < 100) return false;
                     sources.Remove(oldest.Handle);
-                    _ = Task.Run(oldest.Dispose);
+                    _ = Task.Run(() => oldest.Dispose("capacity-eviction"));
                 }
                 source = new Source(hwnd);
                 sources.Add(hwnd, source);
@@ -119,7 +123,7 @@ internal static class CompositorWindowCapture
     {
         Source[] removed;
         lock (gate) { removed = new List<Source>(sources.Values).ToArray(); sources.Clear(); retryAfter.Clear(); }
-        foreach (var source in removed) _ = Task.Run(source.Dispose);
+        foreach (var source in removed) _ = Task.Run(() => source.Dispose("release-all"));
     }
 
     internal static void Reset() => ReleaseAll();
@@ -137,10 +141,10 @@ internal static class CompositorWindowCapture
         lock (gate)
         {
             foreach (var pair in sources)
-                if (pair.Value.IsExpired || !IsWindow(pair.Key)) removed.Add(pair.Value);
+                if (pair.Value.IsExpired || !WindowBackdropCapture.IsWindowAvailable(pair.Key)) removed.Add(pair.Value);
             foreach (var source in removed) sources.Remove(source.Handle);
         }
-        foreach (var source in removed) source.Dispose();
+        foreach (var source in removed) source.Dispose(source.IsExpired ? "reaper-expired" : "window-unavailable");
     }
 
     static bool Reserve(long delta)
@@ -156,18 +160,19 @@ internal static class CompositorWindowCapture
     sealed class Source : IDisposable
     {
         readonly object sync = new object();
+        readonly long diagnosticSource, diagnosticWindow;
         readonly DateTime started = DateTime.UtcNow;
         readonly long createdAt = Environment.TickCount64;
         long lastUse = Environment.TickCount64, lastRead, lastSizeCheck;
         int poolWidth, poolHeight, widthInset, heightInset;
-        bool disposed, inFlight, closed;
+        bool disposed, inFlight, closed, firstFrameLogged, surfaceMismatchLogged;
         Frame? latest;
         Region? requestedRegion;
         NativeCaptureCrop? crop;
         bool cropDisabled, fastCapture;
         long contentActiveUntil;
         bool regionRefresh;
-        int refreshScheduled;
+        int refreshScheduled, rateChangeScheduled;
         Direct3D11CaptureFrame? pending;
         Direct3D11CaptureFrame? retained;
         IDirect3DSurface? retainedSurface;
@@ -177,13 +182,42 @@ internal static class CompositorWindowCapture
         GraphicsCaptureSession? session;
         internal IntPtr Handle { get; }
         internal long LastUse => Interlocked.Read(ref lastUse);
-        internal Source(IntPtr hwnd) { Handle = hwnd; }
+        internal Source(IntPtr hwnd)
+        {
+            Handle = hwnd;
+            if (GlassProfile.Enabled)
+            {
+                diagnosticSource = Interlocked.Increment(ref nextDiagnosticSource);
+                // The caller owns gate. Limit diagnostic-only bookkeeping.
+                if (!diagnosticWindows.TryGetValue(hwnd, out diagnosticWindow))
+                {
+                    if (diagnosticWindows.Count >= 4096) diagnosticWindows.Clear();
+                    diagnosticWindow = ++nextDiagnosticWindow;
+                    diagnosticWindows[hwnd] = diagnosticWindow;
+                }
+                Trace("create");
+            }
+        }
+        void Trace(string action)
+        {
+            if (GlassProfile.Enabled)
+                GlassProfile.Event("capture-session " + action + " sid=" + diagnosticSource + " wid=" + diagnosticWindow + " class=" + ClassName(Handle));
+        }
         internal void Touch(Region? region)
         {
             Volatile.Write(ref requestedRegion, region);
             long now = Environment.TickCount64;
-            if (Volatile.Read(ref fastCapture) && now >= Volatile.Read(ref contentActiveUntil))
-                _ = Task.Run(() => { lock (sync) { if (Environment.TickCount64 >= contentActiveUntil) SetCaptureRate(false); } });
+            if (Volatile.Read(ref fastCapture) && now >= Volatile.Read(ref contentActiveUntil) &&
+                Interlocked.CompareExchange(ref rateChangeScheduled, 1, 0) == 0)
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        lock (sync)
+                            if (Environment.TickCount64 >= contentActiveUntil) SetCaptureRate(false);
+                    }
+                    finally { Volatile.Write(ref rateChangeScheduled, 0); }
+                });
             Interlocked.Exchange(ref lastUse, now);
             long previous = Interlocked.Read(ref lastSizeCheck);
             if (now - previous >= 100 && Interlocked.CompareExchange(ref lastSizeCheck, now, previous) == previous)
@@ -202,8 +236,9 @@ internal static class CompositorWindowCapture
                     if (width <= 0 || height <= 0 || (long)width * height > PixelBudget || (width == poolWidth && height == poolHeight)) return;
                     // Some layered windows keep an old-size capture item after resizing. Recreate the
                     // source instead of scaling that stale frame into the new native bounds.
+                    Trace("size-change old=" + poolWidth + "x" + poolHeight + " new=" + width + "x" + height);
                     Volatile.Write(ref closed, true);
-                    Dispose();
+                    Dispose("size-change");
                 }
             }
             catch (Exception ex) { Fail(ex); }
@@ -227,7 +262,8 @@ internal static class CompositorWindowCapture
             }
             Volatile.Write(ref closed, true);
             Volatile.Write(ref lastError, error.Message);
-            Dispose();
+            if (GlassProfile.Enabled) GlassProfile.Event("source-fail " + ClassName(Handle) + " " + error.GetType().Name);
+            Dispose("failure-" + error.GetType().Name);
         }
         internal bool IsStarting => !Volatile.Read(ref disposed) && !Volatile.Read(ref closed) &&
             Environment.TickCount64 - createdAt < 500;
@@ -284,10 +320,15 @@ internal static class CompositorWindowCapture
                 newSession = newPool.CreateCaptureSession(newItem);
                 newSession.IsCursorCaptureEnabled = false;
                 LimitCaptureRate(newSession);
-                // If this ABI is unavailable, fail closed rather than changing consent or using black-keying.
-                var border = newSession.As<IGraphicsCaptureSession3>();
-                try { border.IsBorderRequired = false; }
-                finally { if (Marshal.IsComObject(border)) Marshal.ReleaseComObject(border); }
+                // Windows 10 19041/19045 supports WGC but not this newer border property.
+                // Retain its system-default capture border; never request permission here.
+                if (Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+                    "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired"))
+                {
+                    var border = newSession.As<IGraphicsCaptureSession3>();
+                    try { border.IsBorderRequired = false; }
+                    finally { if (Marshal.IsComObject(border)) Marshal.ReleaseComObject(border); }
+                }
                 lock (sync)
                 {
                     if (disposed) return;
@@ -301,20 +342,27 @@ internal static class CompositorWindowCapture
                     item.Closed += ItemClosed;
                     pool.FrameArrived += FrameArrived;
                     session.StartCapture();
+                    Trace("started");
                 }
+                if (GlassProfile.Enabled) GlassProfile.Event("source-start " + ClassName(Handle));
             }
             catch (Exception ex) { Fail(ex); }
             finally { newSession?.Dispose(); newPool?.Dispose(); newDevice?.Dispose(); if (newItem != null) ((IWinRTObject)newItem).NativeObject.Dispose(); }
         }
 
         void ItemClosed(GraphicsCaptureItem sender, object args)
-        { Volatile.Write(ref closed, true); Dispose(); }
+        { Volatile.Write(ref closed, true); Dispose("item-closed"); }
 
         void FrameArrived(Direct3D11CaptureFramePool sender, object args)
         {
             lock (sync)
             {
                 if (disposed) return;
+                if (!firstFrameLogged)
+                {
+                    firstFrameLogged = true;
+                    if (GlassProfile.Enabled) GlassProfile.Event("source-first " + ClassName(Handle) + " " + (Environment.TickCount64 - createdAt));
+                }
                 try
                 {
                     var next = sender.TryGetNextFrame();
@@ -367,18 +415,25 @@ internal static class CompositorWindowCapture
                         // a recycled texture used by later frames. Only dispose the owning frame.
                         var surface = retainedSurface ??= captured.Surface;
                         var original = surface.Description;
-                        if (original.Width != size.Width || original.Height != size.Height)
-                        { Volatile.Write(ref closed, true); Dispose(); return; }
-                        int left = 0, top = 0, pixelWidth = size.Width, pixelHeight = size.Height;
+                        // A frame-pool surface can differ from ContentSize, especially during
+                        // resizing. Preserve the session and use only the valid intersection.
+                        int validWidth = Math.Min(original.Width, size.Width), validHeight = Math.Min(original.Height, size.Height);
+                        if (validWidth <= 0 || validHeight <= 0) continue;
+                        if (!surfaceMismatchLogged && (original.Width != size.Width || original.Height != size.Height))
+                        {
+                            surfaceMismatchLogged = true;
+                            Trace("surface-size content=" + size.Width + "x" + size.Height + " surface=" + original.Width + "x" + original.Height);
+                        }
+                        int left = 0, top = 0, pixelWidth = validWidth, pixelHeight = validHeight;
                         bool cropped = false;
                         var region = Volatile.Read(ref requestedRegion);
                         if (!cropDisabled && region != null &&
                             WindowBackdropCapture.TryGetCaptureOrigin(Handle, size.Width, size.Height, out int originX, out int originY))
                         {
-                            pixelWidth = Math.Min(size.Width, region.Width + 192);
-                            pixelHeight = Math.Min(size.Height, region.Height + 192);
-                            left = Math.Clamp(region.X - originX - 96, 0, size.Width - pixelWidth);
-                            top = Math.Clamp(region.Y - originY - 96, 0, size.Height - pixelHeight);
+                            pixelWidth = Math.Min(validWidth, region.Width + 192);
+                            pixelHeight = Math.Min(validHeight, region.Height + 192);
+                            left = Math.Clamp(region.X - originX - 96, 0, validWidth - pixelWidth);
+                            top = Math.Clamp(region.Y - originY - 96, 0, validHeight - pixelHeight);
                             try
                             {
                                 crop ??= new NativeCaptureCrop(device!);
@@ -388,7 +443,7 @@ internal static class CompositorWindowCapture
                             catch (Exception error)
                             {
                                 DisableCrop(error);
-                                left = top = 0; pixelWidth = size.Width; pixelHeight = size.Height;
+                                left = top = 0; pixelWidth = validWidth; pixelHeight = validHeight;
                             }
                         }
                         int width = pixelWidth, height = pixelHeight;
@@ -404,7 +459,7 @@ internal static class CompositorWindowCapture
                                 catch (Exception error)
                                 {
                                     DisableCrop(error); cropped = false;
-                                    left = top = 0; width = size.Width; height = size.Height;
+                                    left = top = 0; width = validWidth; height = validHeight;
                                     count = (long)width * height;
                                     var fullPixels = ArrayPool<byte>.Shared.Rent(checked((int)(count * 4)));
                                     ArrayPool<byte>.Shared.Return(pixels); pixels = fullPixels;
@@ -413,9 +468,8 @@ internal static class CompositorWindowCapture
                             if (!cropped)
                             {
                                 using var bitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(surface, BitmapAlphaMode.Premultiplied);
-                                if (bitmap.PixelWidth != width || bitmap.PixelHeight != height)
-                                { Volatile.Write(ref closed, true); Dispose(); return; }
-                                NativeCaptureCrop.CopyPixels(bitmap, pixels);
+                                if (bitmap.PixelWidth < width || bitmap.PixelHeight < height) continue;
+                                NativeCaptureCrop.CopyPixels(bitmap, pixels, width, height);
                             }
                             // An evicted source releases its pixel reservation on a worker.
                             // Retain a static source's only frame while that release completes.
@@ -475,12 +529,14 @@ internal static class CompositorWindowCapture
             cropDisabled = true; crop?.Dispose(); crop = null;
             SetCaptureRate(false);
         }
-        public void Dispose()
+        public void Dispose() => Dispose("unspecified");
+        internal void Dispose(string reason)
         {
             lock (sync)
             {
                 if (disposed) return;
                 disposed = true;
+                Trace("stop reason=" + reason);
                 pending?.Dispose(); pending = null;
                 if (latest != null) { Interlocked.Add(ref cachedPixels, -latest.PixelCount); latest.Dispose(); latest = null; }
                 if (!inFlight) ReleaseResources();
@@ -491,6 +547,7 @@ internal static class CompositorWindowCapture
         {
             if (item != null) { try { item.Closed -= ItemClosed; } catch { } }
             if (pool != null) { try { pool.FrameArrived -= FrameArrived; } catch { } }
+            if (session != null) Trace("session-close");
             try { session?.Dispose(); } catch { }
             retainedSurface = null;
             retained?.Dispose(); retained = null;
@@ -584,6 +641,13 @@ internal static class CompositorWindowCapture
     [StructLayout(LayoutKind.Sequential)] struct Rect { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int count);
+    static string ClassName(IntPtr hwnd)
+    {
+        var text = new StringBuilder(128);
+        GetClassName(hwnd, text, text.Capacity);
+        return text.ToString();
+    }
     [DllImport("d3d11.dll")] static extern int D3D11CreateDevice(IntPtr adapter, uint driver, IntPtr software, uint flags, IntPtr levels, uint levelCount, uint sdk, out IntPtr device, out uint chosen, out IntPtr context);
     [DllImport("d3d11.dll")] static extern int CreateDirect3D11DeviceFromDXGIDevice(IntPtr dxgi, out IntPtr device);
     [DllImport("combase.dll")] static extern int WindowsCreateString([MarshalAs(UnmanagedType.LPWStr)] string text, uint length, out IntPtr value);

@@ -5,9 +5,8 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.8"
+  #define AppVersion "1.0.29"
 #endif
-#define AppCodename "清透"
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
   #define OutputName "OffWorkWidget-Installer-QA"
@@ -23,11 +22,11 @@
 AppId={#ProductId}
 AppName=下班倒计时
 AppVersion={#AppVersion}
-AppVerName=下班倒计时 {#AppVersion} {#AppCodename}
+AppVerName=下班倒计时 {#AppVersion}
 AppPublisher=下班倒计时
-VersionInfoProductName=下班倒计时 {#AppCodename}
+VersionInfoProductName=下班倒计时
 VersionInfoProductVersion={#AppVersion}
-VersionInfoDescription=下班倒计时 {#AppVersion} {#AppCodename} 安装程序
+VersionInfoDescription=下班倒计时 安装程序
 DefaultDirName={localappdata}\Programs\{#InstallLeaf}
 DefaultGroupName={#ShortcutName}
 DisableProgramGroupPage=yes
@@ -141,7 +140,7 @@ end;
 
 procedure InitializeWizard;
 var
-  Heading, Detail, PathLabel: TNewStaticText;
+  Heading, Detail, VersionLabel, PathLabel: TNewStaticText;
   BrowseButton: TNewButton;
 begin
   WizardForm.Font.Name := 'Microsoft YaHei UI';
@@ -173,6 +172,13 @@ begin
   Detail.Font.Name := 'Microsoft YaHei UI';
   Detail.Font.Size := 10;
   Detail.Font.Color := $00807870;
+
+  VersionLabel := TNewStaticText.Create(WizardForm);
+  VersionLabel.Parent := InstallPage.Surface;
+  VersionLabel.SetBounds(0, ScaleY(124), InstallPage.SurfaceWidth, ScaleY(20));
+  VersionLabel.Caption := '版本 {#AppVersion}';
+  VersionLabel.Font.Name := 'Microsoft YaHei UI';
+  VersionLabel.Font.Size := 10;
 
   PathLabel := TNewStaticText.Create(WizardForm);
   PathLabel.Parent := InstallPage.Surface;

@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 [assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 namespace OffWorkWidget
@@ -41,7 +43,11 @@ namespace OffWorkWidget
         }
         public bool Verify(string password)
         {
-            var row = ReadRequired(); if (row[1].Length == 0) return false;
+            return VerifyRow(password, ReadRequired());
+        }
+        static bool VerifyRow(string password, string[] row)
+        {
+            if (row[1].Length == 0) return false;
             int rounds = int.Parse(row[2], CultureInfo.InvariantCulture);
             if (rounds < 100000 || rounds > 2000000) throw new InvalidDataException("密码数据无效。");
             byte[] actual = Derive(password, Convert.FromBase64String(row[0]), rounds), expected = Convert.FromBase64String(row[1]);
@@ -52,6 +58,59 @@ namespace OffWorkWidget
                 return difference == 0;
             }
             finally { Array.Clear(actual,0,actual.Length); Array.Clear(expected,0,expected.Length); }
+        }
+        // Only PBKDF2 runs on the pool; database access resumes on the calling UI context.
+        public async Task<bool> VerifyAsync(string password, CancellationToken cancellationToken = default)
+        {
+            var row = ReadRequired();
+            cancellationToken.ThrowIfCancellationRequested();
+            bool verified = await Task.Run(() => VerifyRow(password, row), cancellationToken);
+            EnsurePasswordState(row, cancellationToken);
+            return verified;
+        }
+        public async Task SetInitialPasswordAsync(string password, CancellationToken cancellationToken = default)
+        {
+            var row = ReadRequired();
+            if (row[1].Length != 0) throw new InvalidOperationException("已设置密码，请验证原密码后修改。");
+            await WritePasswordAsync(password, false, row, cancellationToken);
+        }
+        public async Task ChangePasswordAsync(string oldPassword, string newPassword, CancellationToken cancellationToken = default)
+        {
+            var row = ReadRequired();
+            cancellationToken.ThrowIfCancellationRequested();
+            bool verified = await Task.Run(() => VerifyRow(oldPassword, row), cancellationToken);
+            EnsurePasswordState(row, cancellationToken);
+            if (!verified) throw new ArgumentException("原密码不正确。");
+            await WritePasswordAsync(newPassword, false, row, cancellationToken);
+        }
+        public Task ResetPasswordAndSalaryAsync(string password, CancellationToken cancellationToken = default)
+        {
+            return WritePasswordAsync(password, true, ReadRequired(), cancellationToken);
+        }
+        async Task WritePasswordAsync(string password, bool resetSalary, string[] original, CancellationToken cancellationToken)
+        {
+            ValidatePassword(password);
+            cancellationToken.ThrowIfCancellationRequested();
+            byte[] salt = new byte[32]; using (var random = RandomNumberGenerator.Create()) random.GetBytes(salt);
+            byte[]? hash = null;
+            try
+            {
+                hash = await Task.Run(() => Derive(password, salt, Rounds), cancellationToken);
+                EnsurePasswordState(original, cancellationToken);
+                CommitPassword(salt, hash, resetSalary);
+            }
+            finally
+            {
+                if (hash != null) Array.Clear(hash, 0, hash.Length);
+                Array.Clear(salt, 0, salt.Length);
+            }
+        }
+        void EnsurePasswordState(string[] original, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var current = ReadRequired();
+            for (int i = 0; i < 3; i++)
+                if (current[i] != original[i]) throw new InvalidOperationException("密码状态已变化，请重新操作。");
         }
         public static void ValidatePassword(string password)
         {
@@ -73,18 +132,19 @@ namespace OffWorkWidget
             ValidatePassword(password);
             byte[] salt = new byte[32]; using(var random = RandomNumberGenerator.Create()) random.GetBytes(salt);
             byte[] hash = Derive(password,salt,Rounds);
+            try { CommitPassword(salt, hash, resetSalary); }
+            finally { Array.Clear(hash,0,hash.Length); }
+        }
+        void CommitPassword(byte[] salt, byte[] hash, bool resetSalary)
+        {
+            string sealedSalary = resetSalary ? Seal(0) : ReadRequired()[3];
+            Execute("BEGIN IMMEDIATE");
             try
             {
-                string sealedSalary = resetSalary ? Seal(0) : ReadRequired()[3];
-                Execute("BEGIN IMMEDIATE");
-                try
-                {
-                    Execute("UPDATE privacy SET salt=?,hash=?,rounds=?,salary=? WHERE id=1", Convert.ToBase64String(salt), Convert.ToBase64String(hash), Rounds.ToString(CultureInfo.InvariantCulture), sealedSalary);
-                    Execute("COMMIT");
-                }
-                catch { Execute("ROLLBACK"); throw; }
+                Execute("UPDATE privacy SET salt=?,hash=?,rounds=?,salary=? WHERE id=1", Convert.ToBase64String(salt), Convert.ToBase64String(hash), Rounds.ToString(CultureInfo.InvariantCulture), sealedSalary);
+                Execute("COMMIT");
             }
-            finally { Array.Clear(hash,0,hash.Length); }
+            catch { Execute("ROLLBACK"); throw; }
         }
         static byte[] Derive(string password, byte[] salt, int rounds)
         {
@@ -111,6 +171,7 @@ namespace OffWorkWidget
         }
         IntPtr Prepare(string sql)
         {
+            if (db == IntPtr.Zero) throw new ObjectDisposedException(nameof(PrivacyStore));
             IntPtr stmt; Check(Native.sqlite3_prepare_v2(db,Utf8(sql),-1,out stmt,IntPtr.Zero)); return stmt;
         }
         void Execute(string sql, params string[] values)

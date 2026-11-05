@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Xml.Serialization;
 using Microsoft.UI;
 using Microsoft.UI.Dispatching;
+using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -25,8 +26,23 @@ public sealed class MainWindow : Window
 {
     Settings settings = new Settings();
     double? previewScale;
-    bool scalePreviewHostActive, preparingScalePreviewHost;
-    int scalePreviewWidth, scalePreviewHeight;
+    bool scalePreviewHostActive, preparingScalePreviewHost, scalePreviewSettled, scalePreviewRevealPending;
+    DispatcherQueueTimer? scalePreviewSettleTimer;
+    DispatcherQueueTimer? hoverDragTimer;
+    DispatcherQueueTimer? dragReleaseTimer;
+    long hoverDragSinceTick;
+    bool hoverDragArmed;
+    bool hoverMonitorActive;
+    // Countdown waits until the pointer rests in place, so sweeping across
+    // the click-through widget never consumes the hover delay.
+    const int HoverHoldDelayMs = 300;
+    const int HoverHoldDriftPx = 5;
+    const int HoverMoveSamplePx = 2;
+    long hoverHoldSinceTick;
+    int hoverHoldX, hoverHoldY, hoverSampleX, hoverSampleY;
+    double scaleViewportDpi, scaleViewportScale;
+    (int Left, int Top, int Right, int Bottom, int Diameter)? surfaceClipBounds;
+    int scalePreviewWidth, scalePreviewHeight, scalePreviewRevealFrames;
     int scalePreviewInsetX, scalePreviewInsetY, scalePreviewInsetWidth, scalePreviewInsetHeight;
     const double ScaleReference = .75;
     double EffectiveScale => previewScale ?? settings.Scale;
@@ -36,15 +52,61 @@ public sealed class MainWindow : Window
     readonly PrivacyStore privacy;
     readonly ChinaHolidayCalendar calendar;
     readonly Grid surface = new Grid();
-    readonly Grid hostSurface = new Grid();
+    readonly Grid hostSurface = new Grid { Opacity = 0 };
+    DispatcherQueueTimer? startupRevealTimer;
+    bool startupRevealStarted, startupMaskActive = true;
     Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? surfaceGeometry;
     readonly Border card = new Border { CornerRadius = new CornerRadius(36), Margin = new Thickness(0) };
     readonly Border backdropCard = new Border();
     readonly Canvas foregroundLayer = new Canvas();
     readonly ScaleTransform contentScale = new ScaleTransform();
-    readonly Border notice;
     readonly Canvas coins = new Canvas { IsHitTestVisible = false };
     readonly Canvas coinOverlay = new Canvas { IsHitTestVisible = false };
+    readonly Canvas hoverEffectLayer = new Canvas { IsHitTestVisible = false, Visibility = Visibility.Collapsed };
+    readonly Canvas hoverEffectRoot = new Canvas { Width = 120, Height = 120, RenderTransformOrigin = new Point(.5, .5), IsHitTestVisible = false };
+    readonly CompositeTransform hoverEffectTransform = new CompositeTransform();
+    readonly SolidColorBrush hoverEffectAccent = new(Colors.Transparent);
+    readonly SolidColorBrush hoverEffectCompanion = new(Colors.Transparent);
+    readonly RadialGradientBrush hoverEffectHalo = new();
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverHaloVisual;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverReadyRing;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverReadyRingOuter;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverRipple1;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverRipple2;
+    Microsoft.UI.Xaml.Shapes.Path? hoverOrbitTrail;
+    PathFigure? hoverOrbitTrailFigure;
+    PolyLineSegment? hoverOrbitTrailSegment;
+    Microsoft.UI.Xaml.Shapes.Path? hoverOrbitTrailSoft;
+    PathFigure? hoverOrbitTrailSoftFigure;
+    PolyLineSegment? hoverOrbitTrailSoftSegment;
+    Microsoft.UI.Xaml.Shapes.Path? hoverOrbitProgress;
+    PathFigure? hoverOrbitProgressFigure;
+    ArcSegment? hoverOrbitProgressSegment;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverOrbitHead;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverOrbitGlow;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverOrbitTrack;
+    readonly RadialGradientBrush hoverOrbitGlowBrush = new();
+    readonly SolidColorBrush hoverOrbitInk = new();
+    readonly SolidColorBrush hoverOrbitRingBrush = new();
+    readonly SolidColorBrush hoverOrbitHeadBrush = new();
+    Canvas? hoverAuroraLayer;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverAuroraA;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverAuroraB;
+    Microsoft.UI.Xaml.Shapes.Ellipse? hoverAuroraC;
+    Microsoft.UI.Xaml.Shapes.Path? hoverAuroraCrescent;
+    readonly RotateTransform hoverAuroraRotate = new();
+    readonly ScaleTransform hoverAuroraScale = new();
+    readonly ScaleTransform hoverHaloScale = new();
+    readonly ScaleTransform hoverReadyScale = new();
+    readonly ScaleTransform hoverReadyOuterScale = new();
+    ScaleTransform? hoverRipple1Scale;
+    ScaleTransform? hoverRipple2Scale;
+    Storyboard? hoverBloomStoryboard;
+    bool hoverEffectVisible, hoverEffectReady, hoverEffectLoopActive;
+    long hoverEffectStartTick, hoverEffectReadyAt;
+    string hoverEffectStyle = HoverEffects.Halo;
+    bool? hoverEffectDark;
+    bool hoverEffectPale;
     readonly Microsoft.UI.Xaml.Controls.Primitives.Popup coinPopup = new()
     {
         ShouldConstrainToRootBounds = false, IsLightDismissEnabled = false, IsHitTestVisible = false
@@ -54,6 +116,25 @@ public sealed class MainWindow : Window
     readonly TranslateTransform petClickLift = new TranslateTransform();
     Storyboard? petClickAnimation;
     int emittedCoins;
+    long coinScoreLastAt;
+    readonly TextBlock coinScore = new TextBlock { FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, VerticalAlignment = VerticalAlignment.Center };
+    readonly TextBlock coinScoreTarget = new TextBlock { IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65, VerticalAlignment = VerticalAlignment.Center };
+    readonly TextBlock coinScoreHeading = new TextBlock { Text = "本次金币", IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65 };
+    readonly TextBlock coinScoreDivider = new TextBlock { Text = "/", IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .4, VerticalAlignment = VerticalAlignment.Center };
+    readonly StackPanel coinScoreNumbers = new StackPanel { Orientation = Orientation.Horizontal };
+    readonly StackPanel coinScoreWords = new StackPanel();
+    readonly StackPanel coinScoreContent = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+    readonly Viewbox coinScoreRingHost = new Viewbox { VerticalAlignment = VerticalAlignment.Center };
+    readonly SolidColorBrush coinScoreRingAccent = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 200, 181, 134));
+    readonly ArcSegment coinScoreRingSegment = new ArcSegment { Size = new Windows.Foundation.Size(10, 10), SweepDirection = SweepDirection.Clockwise };
+    readonly Microsoft.UI.Xaml.Shapes.Path coinScoreRingArc = new Microsoft.UI.Xaml.Shapes.Path { StrokeThickness = 1.5, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round };
+    readonly Border coinScoreBadge = new Border
+    {
+        HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
+        IsHitTestVisible = false, Visibility = Visibility.Collapsed
+    };
+    readonly System.Collections.Generic.HashSet<Storyboard> coinStories = new();
+    Border? activeCoinUpgrade;
     readonly TextBlock caption = new TextBlock { FontSize = 14, CharacterSpacing = 15, FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.Normal };
     readonly TextBlock countdown = new TextBlock { FontSize = 36, FontWeight = Microsoft.UI.Text.FontWeights.Medium, FontFamily = new FontFamily("Segoe UI"), Margin = new Thickness(0, 4, 0, 10) };
     readonly TextBlock rest = new TextBlock(), pay = new TextBlock(), earned = new TextBlock();
@@ -67,9 +148,30 @@ public sealed class MainWindow : Window
     readonly SolidColorBrush eyePressedBackground = new(Windows.UI.Color.FromArgb(48, 0, 0, 0));
     readonly StackPanel salaryArea = new StackPanel { Spacing = 5 };
     readonly Grid statsRow = new Grid();
+    readonly Grid wishPanel = new Grid { Visibility = Visibility.Collapsed, IsHitTestVisible = false };
+    readonly TextBlock wishName = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1, FontFamily = new FontFamily("Microsoft YaHei"), IsTextScaleFactorEnabled = false };
+    readonly TextBlock wishAmount = new TextBlock { TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1, TextAlignment = TextAlignment.Right, FontFamily = new FontFamily("Segoe UI"), IsTextScaleFactorEnabled = false };
+    readonly ProgressBar wishProgress = new ProgressBar { Minimum = 0, Maximum = 100, MinHeight = 0, IsHitTestVisible = false };
     readonly Border stats = new Border { CornerRadius = new CornerRadius(16), Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(-8, 0, 0, 0), HorizontalAlignment = HorizontalAlignment.Stretch };
     readonly Image pet = new Image { Width = 132, Height = 150, Stretch = Stretch.Uniform, VerticalAlignment = VerticalAlignment.Bottom };
-    readonly TextBlock reminder = new TextBlock { FontSize = 13, TextWrapping = TextWrapping.Wrap, MaxWidth = 240 };
+    readonly Image waterPetOverlay = new Image { Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Visibility = Visibility.Collapsed };
+    PetAnimationPlayer? petAnimation;
+    PetAnimationPlayer? reminderAnimation;
+    PetAnimationPlayer? coinPetAnimation;
+    bool coinPetActive;
+    long coinPetRequestedAt = -10000;
+    bool reminderPetActive;
+    int reminderAnimationRevision, reminderDue, pendingReminders;
+    PetAnimationPlayer? napAnimation;
+    bool napActive, napPending;
+    int napRevision;
+    DispatcherQueueTimer? petHoverTimer;
+    delegate IntPtr KeyboardHookProc(int code, IntPtr message, IntPtr data);
+    KeyboardHookProc? petEnterHookProc;
+    IntPtr petEnterHook;
+    bool petEnterHeld, petEnterHandled;
+    Storyboard? petBreathing;
+    int petAnimationRevision;
     readonly DispatcherQueueTimer timer;
     DispatcherQueueTimer? smokeTimer;
     bool previewFrozen, countdownIsStatus;
@@ -99,6 +201,8 @@ public sealed class MainWindow : Window
     bool sessionNotificationRegistered;
     double nextSessionRegistrationAttempt;
     SettingsWindow? settingsWindow;
+    Window? reminderPopup;
+    Action<int>? refreshReminderPopup;
     Mutex? instance;
     EventWaitHandle? activation;
     RegisteredWaitHandle? activationWait;
@@ -114,19 +218,21 @@ public sealed class MainWindow : Window
     bool glassAppearanceInitialized;
     double glassTone, glassFromTone, glassTargetTone, glassTint, glassFromTint, glassTargetTint;
     bool analysisRegionsDirty = true;
-    int walkingFrame, petRevision;
+    int walkingFrame;
     Microsoft.UI.Xaml.Media.ImageSource[]? walkingFrames;
     readonly DispatcherQueueTimer walkTimer;
 
     public MainWindow()
     {
         smoke = Environment.GetCommandLineArgs().Contains("--smoke-test");
-        try { timeBeginPeriod(1); } catch { }
         dataFolder = Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") ?? (smoke ? Path.Combine(Path.GetTempPath(), "OffWorkWidget-WinUI-smoke") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"));
         Directory.CreateDirectory(dataFolder);
         GlassProfile.Configure(dataFolder);
-        Title = "下班倒计时 · 液体玻璃";
+        Title = "下班倒计时";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        // Resize/presenter setup can expose native backing before XAML is ready.
+        SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd, 0, 0, 2 /* LWA_ALPHA */);
         native = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd));
         string instanceKey = Environment.UserName + (Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") == null ? "" : "-WinUI-Isolated");
         if (!smoke)
@@ -155,6 +261,18 @@ public sealed class MainWindow : Window
                 var loaded = (Settings?)new XmlSerializer(typeof(Settings)).Deserialize(stream);
                 if (loaded == null) throw new InvalidDataException("设置文件内容为空。");
                 if (loaded.Scale > 1.5 && loaded.Scale <= 2) loaded.Scale = 1.5; // Preserve existing settings from the former range.
+                if (loaded.HoverDragSeconds < 1 || loaded.HoverDragSeconds > 3) loaded.HoverDragSeconds = 3;
+                loaded.HoverEffect = HoverEffects.Normalize(loaded.HoverEffect);
+                // Previously a disabled lunch could retain an invalid range. Repair only
+                // that unused range, rather than rejecting the entire settings file.
+                if (!loaded.LunchEnabled)
+                {
+                    try
+                    {
+                        if (Logic.Time(loaded.LunchEnd) <= Logic.Time(loaded.LunchStart)) throw new FormatException();
+                    }
+                    catch (FormatException) { loaded.LunchStart = "12:00"; loaded.LunchEnd = "13:00"; }
+                }
                 Logic.Validate(loaded);
                 string configText = File.ReadAllText(config);
                 if (!configText.Contains("<ScaleReferenceVersion>") || loaded.ScaleReferenceVersion < 1)
@@ -200,10 +318,25 @@ public sealed class MainWindow : Window
         coinOverlay.Children.Add(coins);
         coinPopup.Child = coinOverlay;
         coins.RenderTransform = contentScale;
-        notice = new Border { Child = reminder, CornerRadius = new CornerRadius(14), Padding = new Thickness(12, 6, 12, 6), Background = new SolidColorBrush(Windows.UI.Color.FromArgb(235, 38, 38, 42)), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(16, 10, 0, 0), Visibility = Visibility.Collapsed };
-        notice.RenderTransform = contentScale;
-        reminder.Foreground = new SolidColorBrush(Colors.White);
-        surface.Children.Add(notice);
+        surface.Children.Add(waterPetOverlay);
+        surface.LayoutUpdated += (_, __) => UpdateWaterOverlayBounds();
+        coinScore.Foreground = coinScoreHeading.Foreground = coinScoreTarget.Foreground = coinScoreDivider.Foreground = foreground;
+        coinScore.FontFamily = coinScoreTarget.FontFamily = coinScoreDivider.FontFamily = new FontFamily("Segoe UI");
+        var scoreRing = new Canvas { Width = 26, Height = 26 };
+        var scoreTrack = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 21.5, Height = 21.5, Stroke = foreground, StrokeThickness = 1.5, Opacity = .1 };
+        Canvas.SetLeft(scoreTrack, 2.25); Canvas.SetTop(scoreTrack, 2.25); scoreRing.Children.Add(scoreTrack);
+        var scoreFigure = new PathFigure { StartPoint = new Point(13, 3), IsFilled = false };
+        scoreFigure.Segments.Add(coinScoreRingSegment);
+        var scoreGeometry = new PathGeometry(); scoreGeometry.Figures.Add(scoreFigure);
+        coinScoreRingArc.Data = scoreGeometry; coinScoreRingArc.Stroke = coinScoreRingAccent; scoreRing.Children.Add(coinScoreRingArc);
+        coinScoreRingHost.Child = scoreRing;
+        coinScoreNumbers.Children.Add(coinScore); coinScoreNumbers.Children.Add(coinScoreDivider); coinScoreNumbers.Children.Add(coinScoreTarget);
+        coinScoreWords.Children.Add(coinScoreHeading); coinScoreWords.Children.Add(coinScoreNumbers);
+        coinScoreContent.Children.Add(coinScoreRingHost); coinScoreContent.Children.Add(coinScoreWords);
+        coinScoreBadge.Child = coinScoreContent;
+        coinScoreBadge.SizeChanged += (_, __) => FitCaptionToColumn();
+        surface.Children.Add(coinScoreBadge);
+        BuildHoverEffect();
 
         if (native.Presenter is OverlappedPresenter presenter)
         {
@@ -217,7 +350,8 @@ public sealed class MainWindow : Window
         DwmSetWindowAttribute(hwnd, 2, ref ncRenderingDisabled, 4); // DWMWA_NCRENDERING_POLICY = DISABLED (prevents DWM caption/frame border line)
         var margins = new GlassMargins { Left = -1, Right = -1, Top = -1, Bottom = -1 };
         DwmExtendFrameIntoClientArea(hwnd, ref margins);
-        try { native.IsShownInSwitchers = false; } catch { }
+        bool visibleTestWindow = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA")) && Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_WINDOW") == "1";
+        try { native.IsShownInSwitchers = visibleTestWindow; } catch { }
         try
         {
             int style = GetWindowLong(hwnd, GWL_STYLE);
@@ -226,7 +360,7 @@ public sealed class MainWindow : Window
             SetWindowLong(hwnd, GWL_STYLE, style);
 
             int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, (exStyle | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
+            SetWindowLong(hwnd, GWL_EXSTYLE, visibleTestWindow ? (exStyle | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW : (exStyle | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
         }
         catch { }
         string icon = Path.Combine(AppContext.BaseDirectory, "assets", "app-icon.ico");
@@ -236,8 +370,10 @@ public sealed class MainWindow : Window
         desktopSource = new DesktopGlassSource(this, surface, backdropCard);
         desktopSource.FrameUpdated = UpdateAppearance;
         desktopSource.MetricsUpdated = UpdateAppearance;
-        desktopSource.BeforeRender = () => { UpdateDragFrame(); UpdateScalePreviewBounds(); UpdateStatsTransition(); UpdateTextTransition(); UpdateGlassTransition(); };
+        desktopSource.BeforeRender = () => { UpdateDragFrame(); UpdateScalePreviewBounds(rendering: true); UpdateStatsTransition(); UpdateTextTransition(); UpdateGlassTransition(); };
         surface.Loaded += (_, __) => UpdateRenderViewport();
+        surface.Loaded += (_, __) => WarmWidgetMenu();
+        hostSurface.Loaded += (_, __) => BeginStartupReveal();
         surface.LayoutUpdated += (_, __) => analysisRegionsDirty = true;
         caption.SizeChanged += (_, __) => analysisRegionsDirty = true;
         countdown.SizeChanged += (_, __) => analysisRegionsDirty = true;
@@ -245,7 +381,8 @@ public sealed class MainWindow : Window
         native.Changed += (_, args) => { if (args.DidSizeChange) UpdateRenderViewport(); };
         ApplySettings();
 
-        surface.RightTapped += (_, e) => ShowContextMenu(e.GetPosition(surface));
+        surface.PointerReleased += OnSurfacePointerReleased;
+        surface.RightTapped += OnSurfaceRightTapped;
         card.PointerPressed += OnCardPointerPressed;
         card.PointerMoved += OnCardPointerMoved;
         card.PointerExited += (_, __) => glass.SetInteraction(0, 0, false);
@@ -254,12 +391,19 @@ public sealed class MainWindow : Window
         card.PointerCanceled += OnCardPointerCaptureLost;
         Activated += (_, args) => { if (args.WindowActivationState == WindowActivationState.Deactivated) { EndDrag(null); glass.SetInteraction(0, 0, false); } };
         surface.DoubleTapped += (_, __) => OpenSettings();
-        native.Closing += (_, e) => { if (!exiting) { EndDrag(null); e.Cancel = true; native.Hide(); } };
+        native.Closing += (_, e) => { if (!exiting) { EndDrag(null); e.Cancel = true; HideWidget(); } };
         Closed += (_, __) => DisposeResources();
-        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(hwnd);
+        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(this);
         sessionMonitor.WindowMessageReceived += OnSessionChanged;
         sessionMonitor.WindowMessageReceived += OnLayoutHitTest;
+        sessionMonitor.WindowMessageReceived += OnEraseBackground;
+        sessionMonitor.WindowMessageReceived += OnKeyMessage;
         TryRegisterSessionNotifications();
+
+        petEnterHookProc = OnPetKeyboardHook;
+        petEnterHook = SetWindowsHookEx(13 /* WH_KEYBOARD_LL */, petEnterHookProc, GetModuleHandle(null), 0);
+        if (petEnterHook == IntPtr.Zero) GlassProfile.Event("pet-keyboard-hook-error " + Marshal.GetLastWin32Error());
+        else GlassProfile.Event("pet-keyboard-hook-ready");
 
         timer = DispatcherQueue.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(100);
@@ -281,14 +425,22 @@ public sealed class MainWindow : Window
             }
             Refresh();
             UpdateAppearance();
-            notice.Visibility = DateTime.Now < reminderUntil ? Visibility.Visible : Visibility.Collapsed;
+            if (emittedCoins > 0) coinScoreBadge.Visibility = elapsed.ElapsedMilliseconds - coinScoreLastAt < 10000 ? Visibility.Visible : Visibility.Collapsed;
         };
         walkTimer = DispatcherQueue.CreateTimer();
         walkTimer.Interval = TimeSpan.FromMilliseconds(140);
         walkTimer.Tick += (_, __) =>
         {
-            if (DateTime.Now >= reminderUntil) { walkTimer.Stop(); LoadPet(); return; }
-            if (walkingFrames != null) pet.Source = walkingFrames[(walkingFrame++) % walkingFrames.Length];
+            if (DateTime.Now >= reminderUntil)
+            {
+                walkTimer.Stop();
+                CloseReminderPopup();
+                if (settings.PetId == "polar-bear") EndPolarReminder();
+                else { reminderDue = 0; LoadPet(); }
+                StartNextReminder();
+                return;
+            }
+            if (!reminderPetActive && walkingFrames != null) pet.Source = walkingFrames[(walkingFrame++) % walkingFrames.Length];
         };
         timer.Start();
         if (!smoke) CreateTray(icon);
@@ -307,6 +459,11 @@ public sealed class MainWindow : Window
             };
             end.Start();
         }
+        // XAML opacity cannot hide the parent HWND's cold native backing.
+        // Mask the whole window before its first Activate/Show, until the real
+        // content viewport and transparent backing are initialized.
+        SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(hwnd, 0, 0, 2 /* LWA_ALPHA */);
     }
 
     static void Add(MenuFlyout menu, string title, Action action)
@@ -316,13 +473,43 @@ public sealed class MainWindow : Window
         menu.Items.Add(item);
     }
 
-    MenuFlyout CreateWidgetMenu()
+    MenuFlyout? widgetMenu;
+    ElementTheme widgetMenuTheme;
+    bool widgetMenuHighContrast, widgetMenuOpen;
+    long widgetMenuShownAt;
+    Windows.UI.ViewManagement.AccessibilitySettings? menuAccessibility;
+
+    MenuFlyout EnsureWidgetMenu()
     {
-        // Popup theme resources may retain the app theme, so set the menu palette explicitly.
         ElementTheme theme = settings.AutomaticAppearance ? surface.ActualTheme
             : settings.NightMode ? ElementTheme.Dark : ElementTheme.Light;
+        menuAccessibility ??= new Windows.UI.ViewManagement.AccessibilitySettings();
+        bool highContrast = menuAccessibility.HighContrast;
+        if (widgetMenu != null && widgetMenuTheme == theme && widgetMenuHighContrast == highContrast)
+            return widgetMenu;
+        var menu = CreateWidgetMenu(theme, highContrast);
+        Add(menu, "设置", OpenSettings);
+        Add(menu, "隐藏到托盘", HideWidget);
+        Add(menu, "退出", Exit);
+        menu.Opened += (_, __) => { if (ReferenceEquals(widgetMenu, menu)) widgetMenuOpen = true; };
+        menu.Closed += (_, __) => { if (ReferenceEquals(widgetMenu, menu)) widgetMenuOpen = false; };
+        widgetMenu = menu;
+        widgetMenuTheme = theme;
+        widgetMenuHighContrast = highContrast;
+        return menu;
+    }
+
+    void WarmWidgetMenu()
+    {
+        if (disposed || exiting) return;
+        try { EnsureWidgetMenu(); }
+        catch (Exception ex) { Debug.WriteLine("右键菜单预热失败：" + ex.Message); }
+    }
+
+    MenuFlyout CreateWidgetMenu(ElementTheme theme, bool highContrast)
+    {
+        // Popup theme resources may retain the app theme, so set the menu palette explicitly.
         bool dark = theme == ElementTheme.Dark;
-        bool highContrast = new Windows.UI.ViewManagement.AccessibilitySettings().HighContrast;
         var systemColors = new Windows.UI.ViewManagement.UISettings();
         var background = highContrast ? systemColors.UIElementColor(Windows.UI.ViewManagement.UIElementType.Window)
             : dark ? Windows.UI.Color.FromArgb(255, 39, 39, 42) : Windows.UI.Color.FromArgb(255, 250, 250, 252);
@@ -359,6 +546,8 @@ public sealed class MainWindow : Window
         var body = new Grid { Margin = new Thickness(24, 18, 12, 18), ColumnSpacing = 20 };
         body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(132) });
+        body.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        body.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var text = new StackPanel { Spacing = 0, VerticalAlignment = VerticalAlignment.Center };
         caption.Foreground = foreground; countdown.Foreground = foreground;
         text.Children.Add(caption); text.Children.Add(countdown);
@@ -404,8 +593,18 @@ public sealed class MainWindow : Window
         };
         petHost.Children.Add(pet);
         Grid.SetColumn(petHost, 1); body.Children.Add(petHost);
+        wishPanel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2, GridUnitType.Star) });
+        wishPanel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3, GridUnitType.Star) });
+        wishPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        wishPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        wishName.Foreground = foreground; wishAmount.Foreground = foreground;
+        wishPanel.Children.Add(wishName);
+        Grid.SetColumn(wishAmount, 1); wishPanel.Children.Add(wishAmount);
+        Grid.SetRow(wishProgress, 1); Grid.SetColumnSpan(wishProgress, 2); wishPanel.Children.Add(wishProgress);
+        Grid.SetRow(wishPanel, 1); Grid.SetColumnSpan(wishPanel, 2); body.Children.Add(wishPanel);
         card.Child = body;
-        petHost.Tapped += (_, e) => { EmitCoin(); e.Handled = true; };
+        petHost.PointerPressed += (_, __) => suppressPetTap = false;
+        petHost.Tapped += (_, e) => { if (!suppressPetTap) EmitCoin(); suppressPetTap = false; e.Handled = true; };
         petHost.DoubleTapped += (_, e) => { e.Handled = true; };
         pet.RenderTransformOrigin = new Point(.5, 1);
         var petTransform = new CompositeTransform();
@@ -413,13 +612,13 @@ public sealed class MainWindow : Window
         petTransforms.Children.Add(petTransform);
         petTransforms.Children.Add(petClickLift);
         pet.RenderTransform = petTransforms;
-        pet.PointerEntered += (_, __) => { petTransform.ScaleX = 1.035; petTransform.ScaleY = 1.035; };
+        pet.PointerEntered += (_, __) => { if (settings.PetId != "polar-bear" && settings.PetId != "panda" && settings.PetId != "cow-cat") { petTransform.ScaleX = 1.035; petTransform.ScaleY = 1.035; } UpdatePetAnimationHover(); };
+        pet.PointerMoved += (_, __) => UpdatePetAnimationHover();
         pet.PointerExited += (_, __) => { petTransform.ScaleX = 1; petTransform.ScaleY = 1; };
-        petHost.RightTapped += (_, e) => { ShowContextMenu(e.GetPosition(surface)); e.Handled = true; };
         var breathe = new DoubleAnimation { From = 0, To = -2, Duration = new Duration(TimeSpan.FromSeconds(2.8)), AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } };
         Storyboard.SetTarget(breathe, petTransform); Storyboard.SetTargetProperty(breathe, "TranslateY");
-        var breathing = new Storyboard(); breathing.Children.Add(breathe);
-        pet.Loaded += (_, __) => breathing.Begin();
+        petBreathing = new Storyboard(); petBreathing.Children.Add(breathe);
+        pet.Loaded += (_, __) => { if (settings.PetId != "polar-bear" && settings.PetId != "panda" && settings.PetId != "cow-cat") petBreathing.Begin(); };
     }
 
     StackPanel Stat(string title, TextBlock value)
@@ -441,16 +640,135 @@ public sealed class MainWindow : Window
         rest.FontSize = Math.Round(pay.FontSize * logicalSize / 22 * dpi) / dpi;
         rest.FontWeight = unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium;
     }
-    static string NormalizePet(string id) => id == "cat" ? "cow-cat" : id == "samoyed" ? "corgi" : id == "red-panda" || id == "cow-cat" || id == "corgi" || id == "panda" || id == "polar-bear" ? id : "cow-cat";
+    static string NormalizePet(string id) =>
+        id == "cat" || id == "samoyed" || id == "corgi" || id == "red-panda" ? "cow-cat" :
+        id == "cow-cat" || id == "panda" || id == "polar-bear" ? id : "polar-bear";
 
-    void PreviewPet(string id)
+    void LoadPet()
     {
-        id = NormalizePet(id);
-        petRevision++; walkTimer?.Stop(); settings.PetId = id; LoadPet();
-        if (DateTime.Now < reminderUntil) _ = StartWalk();
+        int revision = ++petAnimationRevision;
+        reminderAnimationRevision++;
+        napActive = false; napPending = false; napRevision++;
+        napAnimation?.Dispose(); napAnimation = null;
+        reminderPetActive = false;
+        coinPetActive = false; coinPetRequestedAt = -10000;
+        coinPetAnimation?.Dispose(); coinPetAnimation = null;
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
+        petAnimation?.Dispose(); petAnimation = null;
+        petHoverTimer?.Stop();
+        walkingFrames = null;
+        bool polar = settings.PetId == "polar-bear";
+        pet.Source = new BitmapImage(new Uri("ms-appx:///assets/" + (polar ? "polar-bear-idle" : settings.PetId) + ".png"));
+        if (polar || settings.PetId == "panda" || settings.PetId == "cow-cat")
+        {
+            petBreathing?.Stop();
+            if (pet.RenderTransform is TransformGroup group && group.Children[0] is CompositeTransform transform)
+            { transform.ScaleX = transform.ScaleY = 1; transform.TranslateY = 0; }
+            _ = LoadPetAnimationAsync(revision, settings.PetId);
+            if (polar) _ = LoadCoinPetAnimationAsync(revision);
+        }
+        else if (pet.IsLoaded) petBreathing?.Begin();
     }
 
-    void LoadPet() { pet.Source = new BitmapImage(new Uri("ms-appx:///assets/" + settings.PetId + ".png")); }
+    async Task LoadPetAnimationAsync(int revision, string petId)
+    {
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", petId == "polar-bear" ? "polar-bear-idle.frames.gz" : petId == "panda" ? "panda-doze.frames.gz" : "cow-cat-wash.frames.gz")).ConfigureAwait(false);
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != petAnimationRevision || settings.PetId != petId)
+                { animation.Dispose(); return; }
+                petAnimation = animation;
+                if (!reminderPetActive && !napActive) { animation.ShowPoster(); UpdatePetHoverMonitor(); }
+                else if (!napActive && (petId == "panda" || petId == "cow-cat") && DateTime.Now < reminderUntil) animation.PlayOnce();
+                if (petId == "polar-bear" && elapsed.ElapsedMilliseconds - coinPetRequestedAt < PetAnimationPlayer.TriggerQuietMilliseconds) PlayPolarCoinAction();
+            })) animation.Dispose();
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        { Debug.WriteLine("宠物动画无法载入：" + ex.Message); GlassProfile.Event("pet-animation-error " + ex.GetType().Name); }
+    }
+
+    async Task LoadCoinPetAnimationAsync(int revision)
+    {
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-coins.frames.gz")).ConfigureAwait(false);
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != petAnimationRevision || settings.PetId != "polar-bear")
+                { animation.Dispose(); return; }
+                coinPetAnimation = animation;
+                GlassProfile.Event("pet-coin-animation-ready");
+                if (elapsed.ElapsedMilliseconds - coinPetRequestedAt < PetAnimationPlayer.TriggerQuietMilliseconds) PlayPolarCoinAction();
+            })) animation.Dispose();
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        { Debug.WriteLine("北极熊金币动画无法载入：" + ex.Message); GlassProfile.Event("pet-coin-animation-error " + ex.GetType().Name); }
+    }
+
+    void PlayPolarCoinAction()
+    {
+        var source = napActive ? napAnimation : petAnimation;
+        if (settings.PetId != "polar-bear" || reminderPetActive || source == null || coinPetAnimation == null ||
+            !uiSettings.AnimationsEnabled || disposed || exiting || !IsWindowVisible(hwnd)) return;
+        if (coinPetActive) { coinPetAnimation.PulseTriggeredLoop(); return; }
+        var from = source.CaptureFrame();
+        var idle = napActive && napAnimation != null ? napAnimation.LastFrame() : petAnimation!.PosterFrame();
+        source.Stop();
+        coinPetActive = true;
+        var action = coinPetAnimation;
+        int revision = petAnimationRevision;
+        action.StartTriggeredLoop(from, idle, () =>
+        {
+            if (disposed || exiting || revision != petAnimationRevision || coinPetAnimation != action) return;
+            coinPetActive = false;
+            if (napActive && napAnimation != null) napAnimation.ShowLastFrame();
+            else { petAnimation?.ResetIdle(); UpdatePetHoverMonitor(); }
+        });
+    }
+
+    void CancelPolarCoinAction(bool showIdle)
+    {
+        coinPetRequestedAt = -10000;
+        coinPetAnimation?.Stop();
+        if (!coinPetActive) return;
+        coinPetActive = false;
+        if (showIdle) petAnimation?.ResetIdle();
+    }
+
+    void UpdatePetHoverMonitor()
+    {
+        bool active = petAnimation != null && !reminderPetActive && !napActive && !napPending && !exiting && !disposed && !startupMaskActive && startupRevealStarted && IsWindowVisible(hwnd);
+        if (!active) { petHoverTimer?.Stop(); CancelPolarCoinAction(true); petAnimation?.Stop(); return; }
+        if (petHoverTimer == null)
+        {
+            petHoverTimer = DispatcherQueue.CreateTimer();
+            petHoverTimer.Interval = TimeSpan.FromMilliseconds(50);
+            petHoverTimer.Tick += (_, __) => UpdatePetAnimationHover();
+        }
+        petHoverTimer.Start();
+    }
+
+    void UpdatePetAnimationHover()
+    {
+        if (petAnimation == null || reminderPetActive || napActive || napPending || exiting || disposed) return;
+        if (!IsWindowVisible(hwnd) || startupMaskActive) { UpdatePetHoverMonitor(); return; }
+        if (coinPetActive) return;
+        bool inside = false, overPetPixels = false;
+        if (uiSettings.AnimationsEnabled && !isDragging && TryGetHoverPoint(out Point point))
+        {
+            var inverse = pet.TransformToVisual(hostSurface).Inverse;
+            if (inverse != null)
+            {
+                Point local = inverse.TransformPoint(point);
+                overPetPixels = petAnimation.HitTest(local.X, local.Y);
+                inside = overPetPixels && IsCursorOverWidget();
+            }
+        }
+        petAnimation.SetHover(inside, overPetPixels);
+    }
 
     readonly Stopwatch layoutTransitionClock = new Stopwatch();
     bool layoutTransitionActive, layoutHostActive;
@@ -465,13 +783,21 @@ public sealed class MainWindow : Window
     int layoutStartWidth, layoutTargetWidth, layoutTargetHeight, layoutStartX, layoutTargetX;
     double shownWidgetWidth = 368;
     double WidgetLogicalWidth => !settings.ShowSalaryLayout ? 336 : shownWidgetWidth;
+    double WidgetLogicalHeight => settings.WishEnabled ? 240 : 190;
 
     void ApplySettings()
     {
         settings.Calendar = calendar;
         settings.PetId = NormalizePet(settings.PetId);
+        if (!settings.MouseClickThrough) hoverDragArmed = false;
+        wishPanel.Visibility = settings.WishEnabled ? Visibility.Visible : Visibility.Collapsed;
         ApplyWidgetSize();
         ApplyMouseClickThrough();
+        UpdateHoverDragMonitor();
+        CloseReminderPopup();
+        pendingReminders = reminderDue = 0;
+        reminderUntil = DateTime.MinValue;
+        walkTimer?.Stop();
         LoadPet(); reminders.Reset(); Refresh();
     }
 
@@ -480,8 +806,30 @@ public sealed class MainWindow : Window
         if (disposed || exiting || !double.IsFinite(value)) return;
         if (layoutTransitionActive) CompleteLayoutTransition();
         if (!scalePreviewHostActive) BeginScalePreviewHost();
+        else if (scalePreviewSettled && desktopSource.TryGetRenderBounds(out int x, out int y, out int width, out int height))
+        {
+            scalePreviewSettled = false;
+            desktopSource.BeginVisualDrag(x, y, width, height, renderImmediately: false);
+        }
         previewScale = Math.Clamp(value, .5, 1.5);
         ApplyWidgetSize(); Refresh();
+        // The settings page can remain open for hours after using the ruler.
+        // Stop high-frequency capture after input settles, while retaining the host
+        // until preview closes so the next jump cannot expose new native backing.
+        if (scalePreviewSettleTimer == null)
+        {
+            scalePreviewSettleTimer = DispatcherQueue.CreateTimer();
+            scalePreviewSettleTimer.Interval = TimeSpan.FromMilliseconds(250);
+            scalePreviewSettleTimer.Tick += (_, __) =>
+            {
+                scalePreviewSettleTimer.Stop();
+                if (disposed || exiting || !scalePreviewHostActive) return;
+                desktopSource.EndVisualDrag(keepBounds: true);
+                scalePreviewSettled = true;
+                GlassProfile.Event("scale-preview-settled");
+            };
+        }
+        scalePreviewSettleTimer.Stop(); scalePreviewSettleTimer.Start();
     }
 
     void ApplyWidgetSize()
@@ -491,20 +839,19 @@ public sealed class MainWindow : Window
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition; salaryArea.Opacity = 1;
         shownWidgetWidth = 368; // Re-measure at the current scale instead of retaining a wider preview.
         double scale = PhysicalScale;
-        surface.Width = WidgetLogicalWidth; surface.Height = 190;
-        card.Width = WidgetLogicalWidth * scale; card.Height = 190 * scale;
+        surface.Width = WidgetLogicalWidth; surface.Height = WidgetLogicalHeight;
+        card.Width = WidgetLogicalWidth * scale; card.Height = WidgetLogicalHeight * scale;
         card.RenderTransformOrigin = new Point(0, 0);
         card.RenderTransform = null;
         ApplyTypography();
         card.HorizontalAlignment = HorizontalAlignment.Left; card.VerticalAlignment = VerticalAlignment.Top;
         contentScale.ScaleX = contentScale.ScaleY = scale;
         backdropCard.CornerRadius = new CornerRadius(36 * scale);
-        notice.Margin = new Thickness(16 * scale, 10 * scale, 0, 0);
         glass.Brush.BlurAmount = 0;
         surface.HorizontalAlignment = HorizontalAlignment.Left; surface.VerticalAlignment = VerticalAlignment.Top;
         pixelScale = GetDpiForWindow(hwnd) / 96.0 * scale;
         int winW = (int)Math.Ceiling(WidgetLogicalWidth * pixelScale);
-        int winH = (int)Math.Ceiling(190 * pixelScale);
+        int winH = (int)Math.Ceiling(WidgetLogicalHeight * pixelScale);
         // Resolve the target XAML geometry before resizing the native surface.
         // A native resize can present before the next XAML layout/render pass.
         double dpi = GetDpiForWindow(hwnd) / 96.0;
@@ -531,8 +878,8 @@ public sealed class MainWindow : Window
             : DisplayArea.GetFromWindowId(native.Id, DisplayAreaFallback.Primary).WorkArea;
         if (posX == -1 && posY == -1)
         {
-            posX = area.X + area.Width - winW - 35;
-            posY = area.Y + 60;
+            posX = area.X + Math.Max(0, (area.Width - winW) / 2);
+            posY = area.Y + Math.Max(0, (area.Height - winH) / 2);
         }
         else
         {
@@ -543,20 +890,69 @@ public sealed class MainWindow : Window
         native.Move(new PointInt32(posX, posY));
     }
 
+    void BeginStartupReveal()
+    {
+        if (startupRevealStarted || disposed) return;
+        startupRevealStarted = true;
+        var wait = Stopwatch.StartNew();
+        startupRevealTimer = DispatcherQueue.CreateTimer();
+        startupRevealTimer.Interval = TimeSpan.FromMilliseconds(16);
+        startupRevealTimer.Tick += (_, __) =>
+        {
+            if (disposed) { startupRevealTimer.Stop(); return; }
+            // Give the first captured background a chance to arrive, without
+            // leaving the widget invisible when capture isn't available.
+            if (!desktopSource.IsReady && wait.ElapsedMilliseconds < 300) return;
+            startupRevealTimer.Stop();
+            if (settings.X == -1 && settings.Y == -1)
+            {
+                var area = DisplayArea.Primary.WorkArea;
+                native.Move(new PointInt32(area.X + Math.Max(0, (area.Width - native.Size.Width) / 2),
+                    area.Y + Math.Max(0, (area.Height - native.Size.Height) / 2)));
+            }
+            RememberWindowPosition();
+            Save();
+            ClearTransparentHostBackground();
+            startupMaskActive = false;
+            SetLayeredWindowAttributes(hwnd, 0, 255, 2 /* LWA_ALPHA */);
+            if (!uiSettings.AnimationsEnabled) { hostSurface.Opacity = 1; ApplyMouseClickThrough(); UpdateHoverDragMonitor(); return; }
+            var fade = new DoubleAnimation
+            {
+                From = 0, To = 1, Duration = new Duration(TimeSpan.FromMilliseconds(420)),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            Storyboard.SetTarget(fade, hostSurface); Storyboard.SetTargetProperty(fade, "Opacity");
+            var reveal = new Storyboard(); reveal.Children.Add(fade);
+            reveal.Completed += (_, __) => { hostSurface.Opacity = 1; reveal.Stop(); ApplyMouseClickThrough(); UpdateHoverDragMonitor(); };
+            reveal.Begin();
+        };
+        startupRevealTimer.Start();
+    }
+
+    void RememberWindowPosition()
+    {
+        // Temporary backing windows used by layout/scale previews aren't the
+        // user's visible card position. Those paths already track their target.
+        if (layoutHostActive || scalePreviewHostActive) return;
+        settings.X = native.Position.X;
+        settings.Y = native.Position.Y;
+    }
+
     void BeginScalePreviewHost()
     {
         if (!desktopSource.TryGetHostRenderBounds(out int x, out int y, out int width, out int height)) return;
         scalePreviewInsetX = x - native.Position.X; scalePreviewInsetY = y - native.Position.Y;
         scalePreviewInsetWidth = native.Size.Width - width; scalePreviewInsetHeight = native.Size.Height - height;
         scalePreviewWidth = native.Size.Width; scalePreviewHeight = native.Size.Height;
-        scalePreviewHostActive = true; preparingScalePreviewHost = true;
-        desktopSource.BeginVisualDrag(x, y, width, height);
+        scalePreviewHostActive = true; preparingScalePreviewHost = true; scalePreviewRevealPending = true; scalePreviewRevealFrames = 2;
+        // Keep the filled crop until the enlarged viewport has a covering scene.
+        desktopSource.BeginVisualDrag(x, y, width, height, renderImmediately: false);
         try
         {
-            // Allocate once; the ruler only changes XAML and the precise region.
+            // Reserve rounding headroom; keep this host until the preview closes.
             double dpi = GetDpiForWindow(hwnd) / 96.0;
-            native.Resize(new SizeInt32((int)Math.Ceiling(Math.Max(368, shownWidgetWidth) * 1.5 * ScaleReference * dpi),
-                (int)Math.Ceiling(190 * 1.5 * ScaleReference * dpi)));
+            native.Resize(new SizeInt32((int)Math.Ceiling((Math.Max(368, shownWidgetWidth) + 96) * 1.5 * ScaleReference * dpi),
+                (int)Math.Ceiling(WidgetLogicalHeight * 1.5 * ScaleReference * dpi)));
             ClearTransparentHostBackground();
         }
         finally { preparingScalePreviewHost = false; }
@@ -564,14 +960,21 @@ public sealed class MainWindow : Window
 
     void EndScalePreviewHost()
     {
+        scalePreviewSettleTimer?.Stop();
         if (!scalePreviewHostActive) return;
-        scalePreviewHostActive = false;
+        scalePreviewHostActive = false; scalePreviewSettled = false; scalePreviewRevealPending = false;
         desktopSource.EndVisualDrag();
     }
 
-    void UpdateScalePreviewBounds()
+    void UpdateScalePreviewBounds(bool rendering = false)
     {
         if (!scalePreviewHostActive || preparingScalePreviewHost) return;
+        // Let XAML submit its new outline before exposing the initialized spare host.
+        if (rendering && scalePreviewRevealPending && --scalePreviewRevealFrames <= 0)
+        {
+            scalePreviewRevealPending = false;
+            UpdateSurfaceClip();
+        }
         if (desktopSource.TryGetHostRenderBounds(out int x, out int y, out _, out _))
             desktopSource.UpdateVisualBounds(x, y, Math.Max(1, scalePreviewWidth - scalePreviewInsetWidth),
                 Math.Max(1, scalePreviewHeight - scalePreviewInsetHeight));
@@ -592,11 +995,21 @@ public sealed class MainWindow : Window
             }
             finally { preparingScalePreviewHost = false; }
         }
-        scalePreviewWidth = width; scalePreviewHeight = height;
         double dpi = GetDpiForWindow(hwnd) / 96.0;
+        int renderWidth = Math.Max(1, width - scalePreviewInsetWidth);
+        int renderHeight = Math.Max(1, height - scalePreviewInsetHeight);
+        if (scalePreviewWidth == width && scalePreviewHeight == height &&
+            scaleViewportDpi == dpi && scaleViewportScale == PhysicalScale &&
+            surface.Width == renderWidth / dpi && surface.Height == renderHeight / dpi &&
+            card.Width == surface.Width && card.Height == surface.Height)
+        {
+            UpdateScalePreviewBounds();
+            return;
+        }
+        scalePreviewWidth = width; scalePreviewHeight = height;
+        scaleViewportDpi = dpi; scaleViewportScale = PhysicalScale;
         pixelScale = dpi * PhysicalScale;
-        SetRenderGeometry(Math.Max(1, width - scalePreviewInsetWidth), Math.Max(1, height - scalePreviewInsetHeight),
-            dpi, PhysicalScale);
+        SetRenderGeometry(renderWidth, renderHeight, dpi, PhysicalScale);
         UpdateScalePreviewBounds();
         desktopSource.SynchronizeVisualFrame();
         UpdateSurfaceClip();
@@ -607,6 +1020,15 @@ public sealed class MainWindow : Window
         double scale = PhysicalScale, dpi = GetDpiForWindow(hwnd) / 96.0;
         double Size(double logical) => Math.Round(logical * scale * dpi) / dpi;
         card.UseLayoutRounding = true;
+        coinScoreBadge.UseLayoutRounding = true;
+        coinScore.FontSize = Size(18);
+        coinScoreHeading.FontSize = Size(12);
+        coinScoreTarget.FontSize = Size(14); coinScoreDivider.FontSize = Size(13);
+        coinScoreNumbers.Spacing = Size(4);
+        coinScoreWords.Spacing = Size(1); coinScoreContent.Spacing = Size(8);
+        coinScoreRingHost.Width = coinScoreRingHost.Height = Size(26);
+        coinScoreBadge.Padding = new Thickness(0); coinScoreBadge.BorderThickness = new Thickness(0);
+        coinScoreBadge.Margin = new Thickness(0, Size(6), Size(16), 0);
         caption.FontSize = Size(17); caption.CharacterSpacing = 0;
         caption.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
         countdown.FontSize = Size(36); countdown.Margin = new Thickness(0, Size(4), 0, Size(8));
@@ -641,6 +1063,10 @@ public sealed class MainWindow : Window
         foreach (StackPanel column in statsRow.Children) column.Spacing = Size(5);
         earningsEye.Width = Size(20); earningsEye.Height = Size(20);
         earningsVisibilityIcon.FontSize = Size(13);
+        wishPanel.Margin = new Thickness(0, Size(6), Size(8), 0);
+        wishPanel.RowSpacing = Size(5);
+        wishName.FontSize = wishAmount.FontSize = Size(13);
+        wishProgress.Height = Size(4);
     }
 
     string? fittedCaptionText;
@@ -652,6 +1078,8 @@ public sealed class MainWindow : Window
         double dpi = GetDpiForWindow(hwnd) / 96.0;
         double preferred = Math.Round(17 * PhysicalScale * dpi) / dpi;
         double available = card.Width - body.Margin.Left - body.Margin.Right - body.ColumnDefinitions[1].Width.Value - body.ColumnSpacing - 2 / dpi;
+        if (coinScoreBadge.Visibility == Visibility.Visible && coinScoreBadge.ActualWidth > 0)
+            available = Math.Min(available, card.Width - body.Margin.Left - coinScoreBadge.Margin.Right - coinScoreBadge.ActualWidth - 8 * PhysicalScale);
         if (available <= 0) return;
         if (fittedCaptionText == caption.Text && fittedCaptionPreferred == preferred && fittedCaptionAvailable == available && caption.FontSize == fittedCaptionFont) return;
         fittedCaptionText = caption.Text; fittedCaptionPreferred = preferred; fittedCaptionAvailable = available;
@@ -686,7 +1114,7 @@ public sealed class MainWindow : Window
             shownWidgetWidth = Math.Max(shownWidgetWidth, Math.Ceiling((widest + 2 / (GetDpiForWindow(hwnd) / 96.0)) * 3 / PhysicalScale + 168));
         }
         double scale = GetDpiForWindow(hwnd) / 96.0 * PhysicalScale;
-        var size = new SizeInt32((int)Math.Ceiling(WidgetLogicalWidth * scale), (int)Math.Ceiling(190 * scale));
+        var size = new SizeInt32((int)Math.Ceiling(WidgetLogicalWidth * scale), (int)Math.Ceiling(WidgetLogicalHeight * scale));
         if (layoutTransitionActive)
         {
             layoutTargetWidth = size.Width; layoutTargetHeight = size.Height;
@@ -767,6 +1195,7 @@ public sealed class MainWindow : Window
 
     void UpdateSurfaceClip()
     {
+        if (scalePreviewHostActive && scalePreviewRevealPending) return;
         try
         {
             // Native hit testing follows the same child viewport as the composed clip.
@@ -786,20 +1215,33 @@ public sealed class MainWindow : Window
                     height = Math.Min(childHeight, (int)Math.Ceiling(surface.Height * GetDpiForWindow(hwnd) / 96.0));
                 }
             }
+            // Keep the preview host region stable; composition owns the changing outline.
+            // Shrinking its native corner before XAML presents can expose a white wedge.
+            if (scalePreviewHostActive)
+            {
+                width = Math.Max(1, native.Size.Width - scalePreviewInsetWidth);
+                height = Math.Max(1, native.Size.Height - scalePreviewInsetHeight);
+                diameter = 0;
+            }
             int right = left + Math.Max(1, width), bottom = top + Math.Max(1, height);
+            var clipBounds = (left, top, right, bottom, diameter);
+            if (surfaceClipBounds == clipBounds) return;
             // HRGN edges are binary. A real outward guard preserves the compositor's
             // partial-coverage pixels, including the right/bottom raster boundary.
             const int guard = 4;
             SetProp(hwnd, "OffWorkWidget.GlassDiameterPx", new IntPtr(diameter));
             SetProp(hwnd, "OffWorkWidget.GlassGuardPx", new IntPtr(guard));
-            IntPtr region = CreateRoundRectRgn(left - guard, top - guard, right + guard, bottom + guard,
-                diameter + guard * 2, diameter + guard * 2);
+            IntPtr region = CreateContentRegion(left, top, right, bottom, diameter, guard);
             if (region != IntPtr.Zero)
             {
                 if (SetWindowRgn(hwnd, region, true) == 0)
                     DeleteObject(region); // Windows owns the region only after success.
                 else
-                    ClearTransparentHostBackground(); // Also initialize newly revealed resize/animation pixels.
+                {
+                    // Retry identical geometry if its native backing couldn't be
+                    // cleared during a transient resize; don't cache that failure.
+                    surfaceClipBounds = ClearTransparentHostBackground() ? clipBounds : null;
+                }
             }
         }
         catch (Exception ex)
@@ -818,6 +1260,9 @@ public sealed class MainWindow : Window
         else if (now.TimeOfDay < start) { caption.Text = "距离上班还有"; left = start - now.TimeOfDay; }
         else if (now.TimeOfDay < end) { caption.Text = "距离下班还有"; left = end - now.TimeOfDay; }
         else { caption.Text = "今天辛苦了，自由时间到"; countdown.Text = "已下班"; }
+        if (now < reminderUntil && reminderDue != 0)
+            caption.Text = reminderDue == 3 ? "起身走走，喝口水吧"
+                : reminderDue == 1 ? "歇一歇，喝口水吧" : "活动一下，放松身心";
         bool showStatus = !left.HasValue;
         if (countdownIsStatus != showStatus)
         {
@@ -843,6 +1288,16 @@ public sealed class MainWindow : Window
         }
         UpdateRestTypography();
         pay.Text = Logic.UntilPay(now, settings.PayDay) + "天";
+        if (settings.WishEnabled)
+        {
+            decimal saved = Math.Max(0, settings.WishSaved), target = Math.Max(0, settings.WishTarget);
+            wishName.Text = string.IsNullOrWhiteSpace(settings.WishName) ? "小心愿" : settings.WishName.Trim();
+            decimal progress = target > 0 ? Math.Min(saved, target) / target * 100 : 0;
+            wishAmount.Text = target > 0
+                ? $"¥{saved:0.##} / ¥{target:0.##} · {progress:0}%"
+                : $"已攒 ¥{saved:0.##} · 未设目标";
+            wishProgress.Value = (double)progress;
+        }
         if (!layoutTransitionActive)
         {
             salaryArea.Visibility = settings.ShowSalaryLayout ? Visibility.Visible : Visibility.Collapsed;
@@ -859,15 +1314,339 @@ public sealed class MainWindow : Window
         FitCaptionToColumn();
         settingsWindow?.RefreshSalaryLayoutButton();
         int due = reminders.Tick(now, elapsed.Elapsed, settings);
-        if (due != 0) { reminder.Text = due == 3 ? "喝口水，也站起来走走吧" : due == 1 ? "喝口水，照顾好自己" : "站起来走走，放松一下"; reminderUntil = now.AddSeconds(20); _ = StartWalk(); }
+        if (due != 0) QueueReminders(due);
+        UpdateNap(now);
         if (!smoke && settings.UseChinaHolidays && holidayDay != now.Date) { holidayDay = now.Date; _ = calendar.RefreshAsync(now.Year, false); }
+    }
+
+    bool InNapWindow(DateTime now)
+    {
+        try
+        {
+            return Logic.WorkingDay(now, settings) &&
+                now.TimeOfDay >= Logic.Time(settings.LunchStart) &&
+                now.TimeOfDay < Logic.Time(settings.LunchEnd);
+        }
+        catch (FormatException) { return false; }
+    }
+
+    void UpdateNap(DateTime now)
+    {
+        if (settings.PetId != "polar-bear" || !InNapWindow(now))
+        {
+            if (napActive) EndNap();
+            napPending = false;
+            return;
+        }
+        if (napActive) return;
+        if (reminderPetActive || coinPetActive)
+        {
+            // Let the current reminder or coin action finish; the nap starts on
+            // the next tick and then holds until lunch ends.
+            napPending = true;
+            return;
+        }
+        napPending = false;
+        BeginNap(now);
+    }
+
+    void BeginNap(DateTime now)
+    {
+        if (exiting || disposed || napActive || settings.PetId != "polar-bear") return;
+        napActive = true;
+        int revision = ++napRevision;
+        petHoverTimer?.Stop();
+        petAnimation?.Stop();
+        CancelPolarCoinAction(false);
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
+        var start = Logic.Time(settings.LunchStart);
+        var end = Logic.Time(settings.LunchEnd);
+        // Entering near the start plays the transition; opening the app mid-lunch
+        // (or too little time left) goes straight to the sleeping frame.
+        bool play = (now.TimeOfDay - start).TotalSeconds <= 6 && (end - now.TimeOfDay).TotalSeconds >= 11;
+        _ = LoadNapAsync(revision, play);
+        GlassProfile.Event($"pet-nap-start {(play ? "play" : "hold")} remain={(int)(end - now.TimeOfDay).TotalSeconds}");
+    }
+
+    async Task LoadNapAsync(int revision, bool play)
+    {
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-nap.frames.gz")).ConfigureAwait(false);
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != napRevision || !napActive || settings.PetId != "polar-bear")
+                { animation.Dispose(); return; }
+                napAnimation = animation;
+                if (play) animation.PlayOnce(); else animation.ShowLastFrame();
+                GlassProfile.Event("pet-nap-ready " + (play ? "play" : "last"));
+            })) animation.Dispose();
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        {
+            Debug.WriteLine("北极熊午睡动画无法载入：" + ex.Message);
+            GlassProfile.Event("pet-nap-error " + ex.GetType().Name);
+            DispatcherQueue.TryEnqueue(EndNap);
+        }
+    }
+
+    void EndNap()
+    {
+        if (!napActive && napAnimation == null) return;
+        napActive = false; napPending = false; napRevision++;
+        CancelPolarCoinAction(false);
+        var animation = napAnimation; napAnimation = null;
+        animation?.Dispose();
+        if (petAnimation != null)
+        {
+            petAnimation.ResetIdle();
+            UpdatePetHoverMonitor();
+        }
+        else LoadPet();
+        GlassProfile.Event("pet-nap-end");
+        StartNextReminder();
+    }
+
+    void QueueReminders(int due)
+    {
+        pendingReminders |= due & 3;
+        StartNextReminder();
+    }
+
+    void StartNextReminder()
+    {
+        if (reminderDue != 0 || pendingReminders == 0 || napActive || napPending || exiting || disposed) return;
+        bool water = (pendingReminders & 1) != 0, walk = (pendingReminders & 2) != 0;
+        reminderDue = (water ? 1 : 0) | (walk ? 2 : 0);
+        pendingReminders = 0;
+        // A combined reminder plays the walk pose first, then the cup pose.
+        reminderUntil = DateTime.Now.AddSeconds(reminderDue == 3 ? 22 : 20);
+        if (settings.ReminderPopup) ShowReminderPopup(reminderDue);
+        GlassProfile.Event("pet-reminder-queued-start " + reminderDue);
+        _ = StartWalk();
+    }
+
+    static (string Title, string Message, string Body) ReminderText(int due) => due == 3
+        ? ("休息提醒", "起身走走，喝口水吧", "先舒展一下身体，再补充水分。")
+        : due == 1
+            ? ("喝水提醒", "喝口水，休息一下", "补充水分，让自己舒服一点。")
+            : ("活动提醒", "站起来活动一下", "伸伸懒腰，放松一下身体。");
+
+    void ShowReminderPopup(int due)
+    {
+        Window? popup = null;
+        try
+        {
+            if (reminderPopup != null && refreshReminderPopup != null)
+            {
+                refreshReminderPopup(due);
+                reminderPopup.AppWindow.Show(false);
+                return;
+            }
+            bool dark = surface.ActualTheme == ElementTheme.Dark;
+            var reminderText = ReminderText(due);
+            popup = new Window { Title = reminderText.Title };
+            bool acrylicSupported = Microsoft.UI.Composition.SystemBackdrops.DesktopAcrylicController.IsSupported();
+            var background = new SolidColorBrush(acrylicSupported
+                ? (dark ? Windows.UI.Color.FromArgb(84, 4, 8, 14) : Windows.UI.Color.FromArgb(34, 92, 104, 120))
+                : (dark ? Windows.UI.Color.FromArgb(255, 38, 38, 41) : Windows.UI.Color.FromArgb(255, 248, 248, 250)));
+            var textBrush = new SolidColorBrush(dark ? Windows.UI.Color.FromArgb(255, 245, 245, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30));
+            var secondaryBrush = new SolidColorBrush(dark ? Windows.UI.Color.FromArgb(255, 172, 172, 180) : Windows.UI.Color.FromArgb(255, 105, 105, 114));
+            var panel = new Grid { Padding = new Thickness(22, 16, 22, 18) };
+            panel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(32) });
+            panel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            var header = new Grid { Height = 32 };
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var headerTitle = new TextBlock { Text = reminderText.Title, Foreground = secondaryBrush, FontSize = 14, VerticalAlignment = VerticalAlignment.Center }; header.Children.Add(headerTitle);
+            var dismiss = new Button { Content = new FontIcon { Glyph = "\uE8BB", FontSize = 12 }, Width = 32, Height = 32, MinWidth = 0, Padding = new Thickness(0), CornerRadius = new CornerRadius(10), Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Foreground = secondaryBrush, BorderThickness = new Thickness(0) };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(dismiss, "关闭提醒");
+            Grid.SetColumn(dismiss, 1); header.Children.Add(dismiss); panel.Children.Add(header);
+            var message = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+            var messageTitle = new TextBlock { Text = reminderText.Message, Foreground = textBrush, FontSize = 20, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap }; message.Children.Add(messageTitle);
+            var messageBody = new TextBlock { Text = reminderText.Body, Foreground = secondaryBrush, FontSize = 14, TextWrapping = TextWrapping.Wrap }; message.Children.Add(messageBody);
+            var messageBackground = new SolidColorBrush(dark ? Windows.UI.Color.FromArgb(255, 65, 65, 68) : Windows.UI.Color.FromArgb(255, 250, 250, 251));
+            var messageCard = new Border { Background = messageBackground, CornerRadius = new CornerRadius(12), Padding = new Thickness(12, 8, 12, 8), VerticalAlignment = VerticalAlignment.Center, Child = message };
+            var messageGroup = new StackPanel { MaxWidth = 420, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Center };
+            messageGroup.Children.Add(messageCard);
+            Grid.SetRow(messageGroup, 1); panel.Children.Add(messageGroup);
+            var close = new Button { Content = "知道了", HorizontalAlignment = HorizontalAlignment.Right, MinWidth = 88, Height = 36, CornerRadius = new CornerRadius(11), Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0, 122, 255)), Foreground = new SolidColorBrush(Microsoft.UI.Colors.White), BorderThickness = new Thickness(0) };
+            var owned = popup;
+            close.Click += (_, __) => CloseReminderPopup();
+            dismiss.Click += (_, __) => CloseReminderPopup();
+            messageGroup.Children.Add(close);
+            // Use the same antialiased composition contour as the settings window.
+            var popupSurface = new Grid { RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light };
+            var frostedBackground = new SystemBackdropElement { CornerRadius = new CornerRadius(24), IsHitTestVisible = false, SystemBackdrop = acrylicSupported ? new ActiveAcrylicBackdrop() : null };
+            popupSurface.Children.Add(frostedBackground);
+            popupSurface.Children.Add(new Border { Background = background, Child = panel });
+            popup.Content = popupSurface;
+            popup.SystemBackdrop = new WinUIEx.TransparentTintBackdrop(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+            WinUIEx.Messaging.WindowMessageMonitor? popupFrameMonitor = null, popupRenderMonitor = null;
+            Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? popupGeometry = null;
+            IntPtr popupRenderHandle = IntPtr.Zero;
+            bool popupClosed = false;
+            void PaintPopupFrame(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
+            {
+                if (args.Message.MessageId != 0x0014 ||
+                    !GetClientRect(args.Message.Hwnd, out NativeClientRect bounds)) return;
+                IntPtr dc = (IntPtr)args.Message.WParam;
+                if (dc == IntPtr.Zero || FillRect(dc, ref bounds, GetStockObject(4)) == 0) return;
+                args.Result = (IntPtr)1;
+                args.Handled = true;
+            }
+            popup.Closed += (_, __) =>
+            {
+                popupClosed = true;
+                popupRenderMonitor?.Dispose(); popupFrameMonitor?.Dispose();
+                frostedBackground.SystemBackdrop = null;
+                popup.SystemBackdrop = null;
+                Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(popupSurface).Clip = null;
+                popupGeometry?.Dispose();
+                if (ReferenceEquals(reminderPopup, owned)) { reminderPopup = null; refreshReminderPopup = null; }
+            };
+            reminderPopup = popup;
+            var popupWindow = popup.AppWindow;
+            popupWindow.Closing += (_, e) => { e.Cancel = true; popupWindow.Hide(); };
+            if (popupWindow.Presenter is OverlappedPresenter presenter)
+            { presenter.SetBorderAndTitleBar(false, false); presenter.IsResizable = false; presenter.IsMaximizable = false; presenter.IsMinimizable = false; presenter.IsAlwaysOnTop = true; }
+            // Win10 does not round borderless windows automatically; match the settings radius in physical pixels.
+            IntPtr popupHandle = WinRT.Interop.WindowNative.GetWindowHandle(popup);
+            PositionReminderPopup(popupWindow, popupHandle);
+            int popupStyle = GetWindowLong(popupHandle, GWL_STYLE);
+            SetWindowLong(popupHandle, GWL_STYLE, (popupStyle & ~(0x00C00000 | 0x00040000 | 0x00020000 | 0x00010000)) | WS_POPUP);
+            SetWindowPos(popupHandle, IntPtr.Zero, 0, 0, 0, 0, 0x0037);
+            int noBorder = -2, ncDisabled = 1, round = 1;
+            DwmSetWindowAttribute(popupHandle, 2, ref ncDisabled, 4);
+            DwmSetWindowAttribute(popupHandle, 33, ref round, 4);
+            DwmSetWindowAttribute(popupHandle, 34, ref noBorder, 4);
+            popup.ExtendsContentIntoTitleBar = true;
+            popup.SetTitleBar(null);
+            popupFrameMonitor = new WinUIEx.Messaging.WindowMessageMonitor(popupHandle);
+            popupFrameMonitor.WindowMessageReceived += PaintPopupFrame;
+            void UpdatePopupContour()
+            {
+                if (popupClosed) return;
+                SetWindowRgn(popupHandle, IntPtr.Zero, false);
+                double w = popupSurface.ActualWidth, h = popupSurface.ActualHeight;
+                if ((w <= 0 || h <= 0) && GetClientRect(popupHandle, out NativeClientRect bounds))
+                {
+                    double dpi = Math.Max(96, GetDpiForWindow(popupHandle)) / 96d;
+                    w = (bounds.Right - bounds.Left) / dpi; h = (bounds.Bottom - bounds.Top) / dpi;
+                }
+                if (w > 0 && h > 0)
+                {
+                    var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(popupSurface);
+                    if (popupGeometry == null)
+                    {
+                        popupGeometry = visual.Compositor.CreateRoundedRectangleGeometry();
+                        visual.Clip = visual.Compositor.CreateGeometricClip(popupGeometry);
+                    }
+                    popupGeometry.Size = new System.Numerics.Vector2((float)w, (float)h);
+                    popupGeometry.CornerRadius = new System.Numerics.Vector2(24);
+                }
+                IntPtr render = FindWindowEx(popupHandle, IntPtr.Zero, "Microsoft.UI.Content.DesktopChildSiteBridge", null);
+                if (render != IntPtr.Zero && render != popupRenderHandle)
+                {
+                    popupRenderMonitor?.Dispose(); popupRenderHandle = render;
+                    popupRenderMonitor = new WinUIEx.Messaging.WindowMessageMonitor(render);
+                    popupRenderMonitor.WindowMessageReceived += PaintPopupFrame;
+                }
+                ClearTransparentWindowBackground(popupHandle);
+                if (popupRenderHandle != IntPtr.Zero) ClearTransparentWindowBackground(popupRenderHandle);
+            }
+            popupSurface.Loaded += (_, __) => UpdatePopupContour();
+            popupSurface.SizeChanged += (_, __) => UpdatePopupContour();
+            UpdatePopupContour();
+            refreshReminderPopup = newDue =>
+            {
+                bool isDark = surface.ActualTheme == ElementTheme.Dark;
+                var text = ReminderText(newDue);
+                owned.Title = text.Title;
+                headerTitle.Text = text.Title;
+                messageTitle.Text = text.Message;
+                messageBody.Text = text.Body;
+                popupSurface.RequestedTheme = isDark ? ElementTheme.Dark : ElementTheme.Light;
+                if (frostedBackground.SystemBackdrop is ActiveAcrylicBackdrop acrylic) acrylic.UpdateTheme(isDark);
+                background.Color = acrylicSupported ? (isDark ? Windows.UI.Color.FromArgb(84, 4, 8, 14) : Windows.UI.Color.FromArgb(34, 92, 104, 120)) : (isDark ? Windows.UI.Color.FromArgb(255, 38, 38, 41) : Windows.UI.Color.FromArgb(255, 248, 248, 250));
+                messageBackground.Color = isDark ? Windows.UI.Color.FromArgb(255, 65, 65, 68) : Windows.UI.Color.FromArgb(255, 250, 250, 251);
+                textBrush.Color = isDark ? Windows.UI.Color.FromArgb(255, 245, 245, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
+                secondaryBrush.Color = isDark ? Windows.UI.Color.FromArgb(255, 172, 172, 180) : Windows.UI.Color.FromArgb(255, 105, 105, 114);
+                PositionReminderPopup(popupWindow, popupHandle);
+            };
+            refreshReminderPopup(due);
+            popupWindow.Show(false);
+            GlassProfile.Event("reminder-popup-show " + due);
+        }
+        catch (Exception ex) when (ex is COMException || ex is InvalidOperationException || ex is ArgumentException)
+        {
+            Debug.WriteLine("提醒弹窗无法显示：" + ex.Message);
+            GlassProfile.Event("reminder-popup-error " + ex.GetType().Name);
+            CloseReminderPopup();
+        }
+    }
+
+    void PositionReminderPopup(AppWindow popupWindow, IntPtr popupHandle)
+    {
+        var targetPoint = new Win32Point { X = settings.ReminderX, Y = settings.ReminderY };
+        IntPtr targetMonitor = settings.ReminderPosition == "custom"
+            ? MonitorFromPoint(targetPoint, 2 /* MONITOR_DEFAULTTONEAREST */)
+            : MonitorFromWindow(hwnd, 2);
+        if (targetMonitor != IntPtr.Zero && MonitorFromWindow(popupHandle, 2) != targetMonitor)
+        {
+            // Move to the destination before measuring the popup's effective DPI.
+            double initialScale = Math.Max(1, GetDpiForWindow(popupHandle) / 96.0);
+            popupWindow.MoveAndResize(GetReminderPopupBounds(initialScale));
+        }
+        double scale = Math.Max(1, GetDpiForWindow(popupHandle) / 96.0);
+        popupWindow.MoveAndResize(GetReminderPopupBounds(scale));
+    }
+    RectInt32 GetReminderPopupBounds(double scale)
+    {
+        bool custom = settings.ReminderPosition == "custom";
+        var area = custom
+            ? DisplayArea.GetFromPoint(new PointInt32(settings.ReminderX, settings.ReminderY), DisplayAreaFallback.Nearest).WorkArea
+            : DisplayArea.GetFromWindowId(native.Id, DisplayAreaFallback.Primary).WorkArea;
+        var bounds = GetReminderBounds(area, settings.ReminderPosition, settings.ReminderWidth, settings.ReminderHeight, scale);
+        if (custom)
+        {
+            bounds.X = Math.Clamp(settings.ReminderX, area.X, area.X + area.Width - bounds.Width);
+            bounds.Y = Math.Clamp(settings.ReminderY, area.Y, area.Y + area.Height - bounds.Height);
+        }
+        return bounds;
+    }
+    // Position within the widget monitor's work area, including negative monitor coordinates.
+    internal static RectInt32 GetReminderBounds(RectInt32 area, string position, double widthDip, double heightDip, double scale)
+    {
+        int width = Math.Min(area.Width, (int)Math.Ceiling(widthDip * scale));
+        int height = Math.Min(area.Height, (int)Math.Ceiling(heightDip * scale));
+        int marginX = Math.Min(20, area.Width - width), marginY = Math.Min(20, area.Height - height);
+        int left = area.X + marginX, right = area.X + area.Width - width - marginX;
+        int top = area.Y + marginY, bottom = area.Y + area.Height - height - marginY;
+        int x = position switch { "top-left" or "bottom-left" => left, "top-right" or "bottom-right" => right, _ => area.X + (area.Width - width) / 2 };
+        int y = position switch { "top-left" or "top-right" => top, "bottom-left" or "bottom-right" => bottom, _ => area.Y + (area.Height - height) / 2 };
+        return new RectInt32(x, y, width, height);
+    }
+
+    void CloseReminderPopup()
+    {
+        reminderPopup?.AppWindow.Hide();
     }
 
     async Task StartWalk()
     {
+        if (settings.PetId == "polar-bear") { await StartPolarReminder(reminderDue); return; }
+        if (settings.PetId == "panda" || settings.PetId == "cow-cat")
+        {
+            reminderPetActive = true; walkingFrames = null;
+            petHoverTimer?.Stop(); petAnimation?.PlayOnce();
+            walkTimer.Stop(); walkTimer.Start();
+            return;
+        }
         try
         {
-            int revision = petRevision; string petId = settings.PetId;
+            string petId = settings.PetId;
             string path = Path.Combine(AppContext.BaseDirectory, "assets", petId + "-walk.png");
             var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
             using var stream = await file.OpenAsync(Windows.Storage.FileAccessMode.Read);
@@ -879,10 +1658,102 @@ public sealed class MainWindow : Window
                 using var bitmap = await decoder.GetSoftwareBitmapAsync(Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied, transform, Windows.Graphics.Imaging.ExifOrientationMode.IgnoreExifOrientation, Windows.Graphics.Imaging.ColorManagementMode.DoNotColorManage);
                 var source = new SoftwareBitmapSource(); await source.SetBitmapAsync(bitmap); frames[i] = source;
             }
-            if (exiting || disposed || revision != petRevision || petId != settings.PetId) return;
+            if (exiting || disposed || petId != settings.PetId) return;
             walkingFrames = frames; walkingFrame = 0; walkTimer.Start();
         }
         catch (Exception ex) { Debug.WriteLine(ex.Message); }
+    }
+
+    async Task StartPolarReminder(int due)
+    {
+        if (exiting || disposed || settings.PetId != "polar-bear") return;
+        int revision = ++reminderAnimationRevision;
+        CancelPolarCoinAction(false);
+        reminderPetActive = true;
+        walkingFrames = null;
+        petHoverTimer?.Stop();
+        petAnimation?.Stop();
+        petAnimation?.ShowPoster();
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        walkTimer.Stop(); walkTimer.Start();
+        // Each reminder owns the shared pet image until its display period ends.
+        bool water = (due & 1) != 0, walk = (due & 2) != 0;
+        if (water && walk)
+        {
+            var stretch = await PlayPolarPhase(false, revision).ConfigureAwait(false);
+            if (stretch == null) return;
+            await Task.Delay(stretch.Value).ConfigureAwait(false);
+            if (exiting || disposed || revision != reminderAnimationRevision || settings.PetId != "polar-bear" || DateTime.Now >= reminderUntil) return;
+            await PlayPolarPhase(true, revision).ConfigureAwait(false);
+            return;
+        }
+        await PlayPolarPhase(water, revision).ConfigureAwait(false);
+    }
+
+    async Task<TimeSpan?> PlayPolarPhase(bool water, int revision)
+    {
+        string file = water ? "polar-bear-cup-walk.frames.gz" : "polar-bear-stretch.frames.gz";
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(water ? waterPetOverlay : pet, Path.Combine(AppContext.BaseDirectory, "assets", file)).ConfigureAwait(false);
+            var duration = animation.Duration;
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != reminderAnimationRevision || settings.PetId != "polar-bear" || DateTime.Now >= reminderUntil)
+                { animation.Dispose(); return; }
+                reminderAnimation?.Dispose();
+                reminderAnimation = animation;
+                animation.ShowPoster();
+                if (water) { pet.Opacity = 0; waterPetOverlay.Visibility = Visibility.Visible; UpdateWaterOverlayBounds(); }
+                animation.PlayOnce();
+                GlassProfile.Event("pet-reminder " + (water ? "cup-walk" : "stretch"));
+            })) { animation.Dispose(); return null; }
+            return duration;
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        { Debug.WriteLine("北极熊提醒动画无法载入：" + ex.Message); GlassProfile.Event("pet-reminder-error " + ex.GetType().Name); return null; }
+    }
+
+    void UpdateWaterOverlayBounds()
+    {
+        if (waterPetOverlay.Visibility != Visibility.Visible || disposed || pet.ActualWidth <= 0 || pet.ActualHeight <= 0) return;
+        try
+        {
+            // The idle asset is square, centered within the taller Image. The
+            // 4:3 water canvas contains that square in its rightmost 3/4.
+            double side = Math.Min(pet.ActualWidth, pet.ActualHeight);
+            var origin = pet.TransformToVisual(surface).TransformPoint(new Point((pet.ActualWidth - side) / 2, (pet.ActualHeight - side) / 2));
+            double width = side * 4 / 3, left = origin.X + side - width, top = origin.Y;
+            if (!double.IsFinite(left) || !double.IsFinite(top)) return;
+            if (!double.IsFinite(waterPetOverlay.Width) || Math.Abs(waterPetOverlay.Width - width) > .01) waterPetOverlay.Width = width;
+            if (!double.IsFinite(waterPetOverlay.Height) || Math.Abs(waterPetOverlay.Height - side) > .01) waterPetOverlay.Height = side;
+            var margin = waterPetOverlay.Margin;
+            if (Math.Abs(margin.Left - left) > .01 || Math.Abs(margin.Top - top) > .01)
+                waterPetOverlay.Margin = new Thickness(left, top, 0, 0);
+        }
+        catch (Exception ex) when (ex is ArgumentException || ex is InvalidOperationException || ex is COMException)
+        { Debug.WriteLine("喝水动画位置更新失败：" + ex.Message); }
+    }
+
+    void EndPolarReminder()
+    {
+        reminderAnimationRevision++;
+        reminderPetActive = false;
+        reminderDue = 0;
+        var animation = reminderAnimation;
+        reminderAnimation = null;
+        animation?.Dispose();
+        waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
+        if (petAnimation != null)
+        {
+            petAnimation.ResetIdle();
+            UpdatePetHoverMonitor();
+        }
+        else
+        {
+            LoadPet();
+        }
+        GlassProfile.Event("pet-reminder-reset");
     }
 
     void UpdateAppearance()
@@ -1034,6 +1905,8 @@ public sealed class MainWindow : Window
         byte channel = (byte)Math.Round(20 + 235 * lightness);
         var color = Windows.UI.Color.FromArgb(255, channel, channel, channel);
         if (foreground.Color != color) foreground.Color = color;
+        var ringColor = Windows.UI.Color.FromArgb(255, (byte)Math.Round(154 + 46 * lightness), (byte)Math.Round(126 + 55 * lightness), (byte)Math.Round(67 + 67 * lightness));
+        if (coinScoreRingAccent.Color != ringColor) coinScoreRingAccent.Color = ringColor;
     }
 
     void UpdateStatsTransition()
@@ -1149,9 +2022,9 @@ public sealed class MainWindow : Window
         desktopSource.UpdateVisualBounds(x + layoutInsetX, native.Position.Y + layoutInsetY, renderWidth, renderHeight);
         bool covered = desktopSource.AtlasCovers(x + layoutInsetX, native.Position.Y + layoutInsetY, renderWidth, renderHeight);
         bool published = desktopSource.SynchronizeVisualFrame();
-        // XAML has now produced one frame at the animated width; safe to reveal
-        // the full host while the rounded clip still owns the visible edge.
-        if (layoutFrameCount == 0) UpdateLayoutHostClip(layoutHostX, layoutHostWidth);
+        // Keep the initial native outline through two render submissions, matching
+        // scale preview's reveal guard; UpdateLayout alone has not presented XAML.
+        if (layoutFrameCount == 2) UpdateLayoutHostClip(layoutHostX, layoutHostWidth);
         layoutFrameCount++;
         if (GlassProfile.Enabled)
         {
@@ -1195,9 +2068,11 @@ public sealed class MainWindow : Window
             GlassProfile.Event($"layout-host x={layoutHostX} w={layoutHostWidth} start={layoutStartX}:{layoutStartWidth} target={layoutTargetX}:{layoutTargetWidth} inset={layoutInsetX},{layoutInsetY}:{layoutInsetWidth},{layoutInsetHeight}");
         // WinUI installs its caption handler after activation; keep our spare-area hit test first.
         sessionMonitor?.Dispose();
-        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(hwnd);
+        sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(this);
         sessionMonitor.WindowMessageReceived += OnSessionChanged;
         sessionMonitor.WindowMessageReceived += OnLayoutHitTest;
+        sessionMonitor.WindowMessageReceived += OnEraseBackground;
+        sessionMonitor.WindowMessageReceived += OnKeyMessage;
     }
 
     void UpdateLayoutHostClip(int x, int width)
@@ -1211,12 +2086,12 @@ public sealed class MainWindow : Window
         const int guard = 4;
         SetProp(hwnd, "OffWorkWidget.GlassDiameterPx", new IntPtr(diameter));
         SetProp(hwnd, "OffWorkWidget.GlassGuardPx", new IntPtr(guard));
-        IntPtr region = CreateRoundRectRgn(left - guard, top - guard, left + renderWidth + guard, top + renderHeight + guard,
-            diameter + guard * 2, diameter + guard * 2);
+        IntPtr region = CreateContentRegion(left, top, left + renderWidth, top + renderHeight, diameter, guard);
         if (region == IntPtr.Zero) return;
         if (SetWindowRgn(hwnd, region, false) == 0) DeleteObject(region);
         else
         {
+            surfaceClipBounds = null;
             layoutClipLeft = left; layoutClipWidth = renderWidth;
             // Initialize the visible backing, including the XAML child that the root DC may exclude.
             ClearTransparentHostBackground();
@@ -1246,6 +2121,25 @@ public sealed class MainWindow : Window
 
     void HideSalary() { if (exiting || disposed) return; settings.HideAmount = true; Refresh(); }
 
+    static IntPtr CreateContentRegion(int left, int top, int right, int bottom, int diameter, int guard)
+    {
+        IntPtr rounded = CreateRoundRectRgn(left - guard, top - guard, right + guard, bottom + guard,
+            diameter + guard * 2, diameter + guard * 2);
+        if (rounded == IntPtr.Zero) return IntPtr.Zero;
+        // Keep the rounded AA guard inside the real XAML viewport. The parent
+        // HWND has a spare top row that XAML never paints; exposing it shows a
+        // white native edge even when the entire XAML tree is transparent.
+        IntPtr content = CreateRectRgn(left, top, right, bottom);
+        if (content == IntPtr.Zero) { DeleteObject(rounded); return IntPtr.Zero; }
+        try
+        {
+            if (CombineRgn(rounded, rounded, content, 1 /* RGN_AND */) == 0)
+            { DeleteObject(rounded); return IntPtr.Zero; }
+            return rounded;
+        }
+        finally { DeleteObject(content); }
+    }
+
     void TryRegisterSessionNotifications()
     {
         if (disposed) return;
@@ -1255,12 +2149,12 @@ public sealed class MainWindow : Window
 
     void OnLayoutHitTest(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
     {
-        if (!layoutHostActive || args.Message.MessageId != 0x0084 /* WM_NCHITTEST */) return;
+        if ((!layoutHostActive && !scalePreviewHostActive) || args.Message.MessageId != 0x0084 /* WM_NCHITTEST */) return;
         long position = args.Message.LParam.ToInt64();
-        double x = (short)(position & 0xffff) - layoutCurrentX - layoutInsetX;
-        double y = (short)((position >> 16) & 0xffff) - native.Position.Y - layoutInsetY;
-        double width = Math.Max(1, layoutCurrentWidth - layoutInsetWidth);
-        double height = Math.Max(1, layoutTargetHeight - layoutInsetHeight);
+        double x = (short)(position & 0xffff) - (scalePreviewHostActive ? native.Position.X + scalePreviewInsetX : layoutCurrentX + layoutInsetX);
+        double y = (short)((position >> 16) & 0xffff) - native.Position.Y - (scalePreviewHostActive ? scalePreviewInsetY : layoutInsetY);
+        double width = Math.Max(1, scalePreviewHostActive ? scalePreviewWidth - scalePreviewInsetWidth : layoutCurrentWidth - layoutInsetWidth);
+        double height = Math.Max(1, scalePreviewHostActive ? scalePreviewHeight - scalePreviewInsetHeight : layoutTargetHeight - layoutInsetHeight);
         double radius = Math.Min(36 * pixelScale, Math.Min(width, height) * .5);
         double dx = x - Math.Clamp(x, radius, width - radius);
         double dy = y - Math.Clamp(y, radius, height - radius);
@@ -1277,6 +2171,65 @@ public sealed class MainWindow : Window
             DispatcherQueue.TryEnqueue(() => { EndDrag(null); HideSalary(); });
     }
 
+    void OnKeyMessage(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
+    {
+        if (disposed || exiting || isDragging || !IsWindowVisible(hwnd)) return;
+        if (args.Message.MessageId != 0x0100 /* WM_KEYDOWN */) return;
+        if (unchecked((int)args.Message.WParam) != 0x0D /* VK_RETURN */) return;
+        // Ignore keyboard auto-repeat; one coin burst per physical press.
+        if ((args.Message.LParam.ToInt64() & (1L << 30)) != 0) return;
+        args.Handled = true;
+        if (petEnterHandled) return;
+        petEnterHeld = petEnterHandled = true;
+        EmitCoin();
+        GlassProfile.Event("coin-key enter");
+    }
+
+    IntPtr OnPetKeyboardHook(int code, IntPtr message, IntPtr data)
+    {
+        try
+        {
+            if (code >= 0 && Marshal.ReadInt32(data) == 0x0D /* VK_RETURN */)
+            {
+                int kind = unchecked((int)message.ToInt64());
+                if (kind == 0x0101 || kind == 0x0105) petEnterHeld = petEnterHandled = false;
+                else if ((kind == 0x0100 || kind == 0x0104) && !petEnterHeld)
+                {
+                    petEnterHeld = true;
+                    if (IsPointerOnPet())
+                    {
+                        petEnterHandled = true;
+                        DispatcherQueue.TryEnqueue(() =>
+                        {
+                            if (!disposed && !exiting) { EmitCoin(); GlassProfile.Event("coin-key hover-enter"); }
+                        });
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { Debug.WriteLine("Pet keyboard hook: " + ex.Message); }
+        return CallNextHookEx(petEnterHook, code, message, data);
+    }
+
+    bool IsPointerOnPet()
+    {
+        if (disposed || exiting || isDragging || startupMaskActive || !IsWindowVisible(hwnd) || !IsCursorOverWidget()) return false;
+        var animation = napActive && napAnimation != null ? napAnimation :
+            waterPetOverlay.Visibility == Visibility.Visible ? petAnimation : reminderAnimation ?? (coinPetActive ? coinPetAnimation : petAnimation);
+        if (animation == null || !TryGetHoverPoint(out Point point)) return false;
+        var inverse = pet.TransformToVisual(hostSurface).Inverse;
+        if (inverse == null) return false;
+        Point local = inverse.TransformPoint(point);
+        return animation.HitTest(local.X, local.Y) || (coinPetActive && petAnimation != null && petAnimation.HitTest(local.X, local.Y));
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string? module);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int count);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int hook, KeyboardHookProc callback, IntPtr module, uint threadId);
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
+
     [DllImport("wtsapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)] static extern bool WTSRegisterSessionNotification(IntPtr window, uint flags);
     [DllImport("wtsapi32.dll", SetLastError = true)]
@@ -1286,7 +2239,7 @@ public sealed class MainWindow : Window
     {
         if (exiting || disposed) return;
         if (settingsWindow != null) { settingsWindow.Activate(); return; }
-        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, PreviewPet, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
+        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
         settingsWindow.Closed += (_, __) =>
         {
             settingsWindow = null;
@@ -1320,11 +2273,20 @@ public sealed class MainWindow : Window
         CompositionTarget.Rendering -= TrackCoinLayer;
         trackingCoins = false;
         coinPopup.IsOpen = false;
+        foreach (var story in coinStories.ToArray()) story.Stop();
+        coinStories.Clear();
+        activeCoinUpgrade = null;
         coins.Children.Clear();
     }
 
     void EmitCoin()
     {
+        GlassProfile.Event("coin-emit");
+        if (settings.PetId == "polar-bear")
+        {
+            coinPetRequestedAt = elapsed.ElapsedMilliseconds;
+            PlayPolarCoinAction();
+        }
         if (!trackingCoins)
         {
             coinPopup.XamlRoot = surface.XamlRoot;
@@ -1333,34 +2295,33 @@ public sealed class MainWindow : Window
             trackingCoins = true;
             CompositionTarget.Rendering += TrackCoinLayer;
         }
-        var gold = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(.35, 1) };
-        gold.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 255, 237, 151), Offset = 0 });
-        gold.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 242, 178, 49), Offset = 1 });
+        int tier = CoinTier(emittedCoins + 1);
+        double coinSize = 27 + tier * .35, halfCoin = coinSize / 2;
+        var face = CreateCoinFace(tier, coinSize, out Border? sheen);
         var coin = new Border
         {
-            Width = 27, Height = 27, CornerRadius = new CornerRadius(14),
-            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 217, 153, 36)),
-            BorderThickness = new Thickness(1.5), Background = gold, RenderTransformOrigin = new Point(.5, .5)
+            Width = coinSize, Height = coinSize, Child = face, RenderTransformOrigin = new Point(.5, .5)
         };
-        var ring = new Border
-        {
-            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 243, 177)),
-            BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(12), Margin = new Thickness(2),
-            Child = new TextBlock
-            {
-                Text = "￥", FontSize = 16, FontFamily = new FontFamily("Microsoft YaHei"),
-                FontWeight = Microsoft.UI.Text.FontWeights.Bold,
-                Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 184, 121, 22)),
-                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
-            }
-        };
-        coin.Child = ring;
         // The popup has a different visual root: map via the main surface, then
         // convert both axes to the logical coordinates of the scaled coin canvas.
         var head = pet.TransformToVisual(surface).TransformPoint(new Point(pet.ActualWidth * .49, pet.ActualHeight * .04));
-        double left = head.X / PhysicalScale - 13.5;
-        double top = CoinHeadroom + head.Y / PhysicalScale - 27;
-        double landing = CoinHeadroom - 27 - top;
+        double left = head.X / PhysicalScale - halfCoin;
+        double top = CoinHeadroom + head.Y / PhysicalScale - coinSize;
+        double landing = CoinHeadroom - coinSize - top;
+        double glassWidth = surface.Width / PhysicalScale;
+        double startX = left + halfCoin;
+        // A balanced fan of short arcs, with small variations instead of unrelated random parameters.
+        int lane = emittedCoins % 5;
+        double offset = lane switch { 0 => -36, 1 => -12, 2 => 22, 3 => -24, _ => 10 };
+        double hitX = Math.Clamp(startX + offset + Random.Shared.NextDouble() * 6 - 3, 40, glassWidth - 40);
+        double drift = Math.Sign(hitX - startX) * (7 + Random.Shared.NextDouble() * 3);
+        double secondX = Math.Clamp(hitX + drift * .7, 40, glassWidth - 40);
+        double finalX = Math.Clamp(hitX + drift, 40, glassWidth - 40);
+        int apexAt = Random.Shared.Next(240, 257), hitAt = Random.Shared.Next(515, 542);
+        int secondAt = hitAt + 245, thirdAt = secondAt + 165;
+        double jump = (lane == 0 ? 44 : lane == 2 ? 42 : 38) + Random.Shared.NextDouble() * 4 - 2 + tier * .5;
+        double bounce = 10.5 + Random.Shared.NextDouble() * 3;
+        bool rollBorder = uiSettings.AnimationsEnabled && Random.Shared.NextDouble() < .15;
         Canvas.SetLeft(coin, left); Canvas.SetTop(coin, top);
         var transform = new CompositeTransform(); coin.RenderTransform = transform;
         coins.Children.Add(coin);
@@ -1377,35 +2338,85 @@ public sealed class MainWindow : Window
             Storyboard.SetTarget(motion, target); Storyboard.SetTargetProperty(motion, property);
             storyboard.Children.Add(motion);
         }
-        Motion(transform, "TranslateY", (0, 0, null), (280, landing - 42, EasingMode.EaseOut),
-            (530, landing, EasingMode.EaseIn), (670, landing - 14, EasingMode.EaseOut),
-            (810, landing, EasingMode.EaseIn), (900, landing - 5, EasingMode.EaseOut), (990, landing, EasingMode.EaseIn));
-        double direction = ++emittedCoins % 2 == 0 ? 1 : -1;
-        Motion(transform, "TranslateX", (0, 0, null), (530, 12 * direction, null), (1100, 18 * direction, EasingMode.EaseOut));
-        Motion(transform, "ScaleX", (0, 1, null), (130, .25, null), (280, 1, null), (410, .3, null),
-            (530, 1, null), (565, 1.12, null), (620, 1, null));
-        Motion(transform, "ScaleY", (0, 1, null), (520, 1, null), (550, .78, null), (620, 1, null),
-            (800, 1, null), (825, .9, null), (870, 1, null));
-        Motion(coin, "Opacity", (0, 1, null), (1050, 1, null), (1300, 0, null));
-
-        var impact = new Microsoft.UI.Xaml.Shapes.Ellipse
+        if (sheen?.RenderTransform is CompositeTransform shimmer)
         {
-            Width = 36, Height = 5, Opacity = 0, StrokeThickness = 1,
-            Stroke = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 225, 136)),
-            RenderTransformOrigin = new Point(.5, .5)
+            Motion(shimmer, "TranslateX", (0, -6, null), (280, 5, EasingMode.EaseOut), (530, 5, null));
+            Motion(sheen, "Opacity", (0, 0, null), (160, .2 + tier * .035, null), (380, 0, null));
+        }
+        var xKeys = new System.Collections.Generic.List<(int At, double Value, EasingMode? Ease)>
+        {
+            (0, 0, null), (apexAt, (hitX - startX) * apexAt / hitAt, null),
+            (hitAt, hitX - startX, null), (secondAt, secondX - startX, null), (thirdAt, finalX - startX, null)
         };
-        Canvas.SetLeft(impact, left + 13.5 + 12 * direction - 18);
-        Canvas.SetTop(impact, CoinHeadroom - 2.5);
-        var impactScale = new ScaleTransform(); impact.RenderTransform = impactScale;
-        coins.Children.Insert(coins.Children.Count - 1, impact);
-        Motion(impact, "Opacity", (0, 0, null), (515, 0, null), (545, .65, null), (880, 0, null));
-        Motion(impactScale, "ScaleX", (0, .35, null), (530, .35, null), (880, 1.8, EasingMode.EaseOut));
+        var yKeys = new System.Collections.Generic.List<(int At, double Value, EasingMode? Ease)>
+        {
+            (0, 0, null), (apexAt, landing - jump, EasingMode.EaseOut), (hitAt, landing, EasingMode.EaseIn),
+            (hitAt + (secondAt - hitAt) / 2, landing - bounce, EasingMode.EaseOut), (secondAt, landing, EasingMode.EaseIn),
+            (secondAt + (thirdAt - secondAt) / 2, landing - bounce * .35, EasingMode.EaseOut), (thirdAt, landing, EasingMode.EaseIn)
+        };
+        int endAt = thirdAt + 330;
+        double tilt = Math.Sign(hitX - startX) * (12 + Random.Shared.NextDouble() * 6);
+        var rotationKeys = new System.Collections.Generic.List<(int At, double Value, EasingMode? Ease)>
+        { (0, 0, null), (thirdAt, tilt, null) };
+        if (rollBorder)
+        {
+            // Stay on the straight top edge and fade during the latter half of the short roll.
+            double topLength = glassWidth - 80;
+            int direction = Random.Shared.Next(2) == 0 ? -1 : 1;
+            double available = direction > 0 ? glassWidth - 40 - finalX : finalX - 40;
+            if (available < Math.Min(70, topLength * .3))
+            {
+                direction = -direction;
+                available = direction > 0 ? glassWidth - 40 - finalX : finalX - 40;
+            }
+            double distance = Math.Min(available, topLength * (.32 + Random.Shared.NextDouble() * .18));
+            int rollDuration = Random.Shared.Next(900, 1401);
+            endAt = thirdAt + rollDuration;
+            xKeys.Add((endAt, finalX - startX + direction * distance, EasingMode.EaseOut));
+            rotationKeys.Add((endAt, tilt + direction * distance / halfCoin * 180 / Math.PI, EasingMode.EaseOut));
+        }
+        Motion(transform, "TranslateX", xKeys.ToArray());
+        Motion(transform, "TranslateY", yKeys.ToArray());
+        Motion(transform, "Rotation", rotationKeys.ToArray());
+        ++emittedCoins;
+        long goal = NextCoinGoal(emittedCoins);
+        coinScore.Text = emittedCoins.ToString("N0", CultureInfo.InvariantCulture);
+        coinScoreTarget.Text = goal.ToString("N0", CultureInfo.InvariantCulture);
+        double scoreProgress = Math.Clamp(emittedCoins / (double)goal, 0, 1);
+        double scoreAngle = -Math.PI / 2 + scoreProgress * Math.PI * 2;
+        coinScoreRingSegment.Point = new Point(13 + Math.Cos(scoreAngle) * 10, 13 + Math.Sin(scoreAngle) * 10);
+        coinScoreRingSegment.IsLargeArc = scoreProgress > .5;
+        coinScoreLastAt = elapsed.ElapsedMilliseconds;
+        coinScoreBadge.Visibility = Visibility.Visible;
+        Motion(transform, "ScaleX", (0, 1, null), (apexAt / 2, .3 + Random.Shared.NextDouble() * .06, null),
+            (apexAt, 1, null), ((apexAt + hitAt) / 2, .25, null), (hitAt, 1, null),
+            (hitAt + 30, 1.1, null), (hitAt + 80, 1, null));
+        Motion(transform, "ScaleY", (0, 1, null), (hitAt - 10, 1, null), (hitAt + 20, .8, null),
+            (hitAt + 80, 1, null), (secondAt - 10, 1, null), (secondAt + 15, .92, null), (secondAt + 65, 1, null));
+        int fadeAt = rollBorder ? thirdAt + (int)((endAt - thirdAt) * .4) : endAt - 250;
+        Motion(coin, "Opacity", (0, 1, null), (fadeAt, 1, null), (endAt, 0, null));
+
+        var impacts = new System.Collections.Generic.List<Canvas>();
+        if (uiSettings.AnimationsEnabled)
+        {
+            foreach (var hit in new[] { (At: hitAt, X: hitX, Strength: 1d), (At: secondAt, X: secondX, Strength: .36),
+                (At: thirdAt, X: finalX, Strength: .15) })
+            {
+                var impact = CreateCoinImpact(tier, hit.X, hit.At, hit.Strength, storyboard);
+                Canvas.SetTop(impact, CoinHeadroom - 16);
+                coins.Children.Insert(0, impact); impacts.Add(impact);
+            }
+        }
         storyboard.Completed += (_, __) =>
         {
-            coins.Children.Remove(coin); coins.Children.Remove(impact);
+            coinStories.Remove(storyboard);
+            coins.Children.Remove(coin);
+            foreach (var impact in impacts) coins.Children.Remove(impact);
             if (coins.Children.Count == 0) CloseCoinLayer();
         };
+        coinStories.Add(storyboard);
         storyboard.Begin();
+        if (IsCoinMilestone(emittedCoins)) CelebrateCoins(emittedCoins, left + halfCoin, top + halfCoin);
 
         // A separate transform keeps click feedback independent of breathing/hover.
         petClickAnimation?.Stop();
@@ -1418,7 +2429,382 @@ public sealed class MainWindow : Window
         petClickAnimation = new Storyboard(); petClickAnimation.Children.Add(lift); petClickAnimation.Begin();
     }
 
-    bool isDragging, endingDrag, dragMoved;
+    Canvas CreateCoinImpact(int tier, double x, int hitAt, double strength, Storyboard story)
+    {
+        int duration = 420 + tier * 65;
+        double reach = 8 + tier * 3;
+        var layer = new Canvas
+        {
+            Width = coins.Width, Height = 32, Opacity = strength, IsHitTestVisible = false,
+            Clip = new RectangleGeometry { Rect = new Rect(20, 0, Math.Max(1, coins.Width - 40), 32) }
+        };
+        var gold = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 255, 227, 162));
+        var reflection = new LinearGradientBrush { StartPoint = new Point(0, .5), EndPoint = new Point(1, .5) };
+        reflection.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, 255, 233, 179), Offset = 0 });
+        reflection.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(220, 255, 233, 179), Offset = .5 });
+        reflection.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, 255, 233, 179), Offset = 1 });
+        void Add(FrameworkElement element, double left, double top)
+        { element.Opacity = 0; Canvas.SetLeft(element, left); Canvas.SetTop(element, top); layer.Children.Add(element); }
+        void Fade(UIElement target, double peak, int delay = 0)
+        {
+            var fade = new DoubleAnimationUsingKeyFrames { BeginTime = TimeSpan.FromMilliseconds(hitAt + delay) };
+            fade.KeyFrames.Add(new LinearDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero), Value = 0 });
+            fade.KeyFrames.Add(new LinearDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(24)), Value = peak });
+            fade.KeyFrames.Add(new EasingDoubleKeyFrame
+            {
+                KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(Math.Max(25, duration - delay))), Value = 0,
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
+            });
+            Storyboard.SetTarget(fade, target); Storyboard.SetTargetProperty(fade, "Opacity"); story.Children.Add(fade);
+        }
+        void Move(DependencyObject target, string property, double from, double to, int delay = 0)
+        {
+            var animation = new DoubleAnimation
+            {
+                From = from, To = to, BeginTime = TimeSpan.FromMilliseconds(hitAt + delay),
+                Duration = new Duration(TimeSpan.FromMilliseconds(Math.Max(1, duration - delay))),
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            Storyboard.SetTarget(animation, target); Storyboard.SetTargetProperty(animation, property); story.Children.Add(animation);
+        }
+        var contact = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 10 + tier, Height = 4, Fill = reflection };
+        Add(contact, x - contact.Width / 2, 14); Fade(contact, .65);
+        if (tier >= 1)
+        {
+            int count = tier >= 2 ? 2 : 1;
+            for (int i = 0; i < count; i++)
+            {
+                double radius = (4 + reach) * (i == 0 ? 1 : .72);
+                var wave = new Microsoft.UI.Xaml.Shapes.Ellipse
+                {
+                    Width = radius * 2, Height = 2.2 + tier * .24, Stroke = gold, StrokeThickness = .7,
+                    RenderTransformOrigin = new Point(.5, .5), RenderTransform = new ScaleTransform()
+                };
+                Add(wave, x - radius, 16 - wave.Height / 2 + i * .8);
+                Fade(wave, i == 0 ? .4 : .23, i * 80);
+                Move(wave.RenderTransform, "ScaleX", .25, 1, i * 80);
+                Move(wave.RenderTransform, "ScaleY", 1, 1.6, i * 80);
+            }
+        }
+        if (tier >= 3)
+        {
+            var edgeLight = new Border { Width = reach * 2.8, Height = .8, Background = reflection, RenderTransformOrigin = new Point(.5, .5), RenderTransform = new ScaleTransform() };
+            Add(edgeLight, x - edgeLight.Width / 2, 15.6); Fade(edgeLight, .5);
+            Move(edgeLight.RenderTransform, "ScaleX", .35, 1);
+        }
+        if (tier >= 4)
+        {
+            int count = tier >= 6 ? 3 : 2;
+            for (int i = 0; i < count; i++)
+            {
+                double side = i - (count - 1) / 2d;
+                var spark = new Microsoft.UI.Xaml.Shapes.Ellipse
+                {
+                    Width = i == 1 ? 1.8 : 1.3, Height = i == 1 ? 1.8 : 1.3, Fill = gold,
+                    RenderTransform = new TranslateTransform()
+                };
+                Add(spark, x + side * 5 - spark.Width / 2, 13); Fade(spark, .6);
+                Move(spark.RenderTransform, "X", 0, side * 8);
+                Move(spark.RenderTransform, "Y", 0, -3 - (i % 2) * 3);
+            }
+        }
+        if (tier >= 5)
+        {
+            var innerReflection = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = reach * 2, Height = 4.5, Fill = reflection };
+            Add(innerReflection, x - reach, 17); Fade(innerReflection, .22);
+        }
+        GlassProfile.Event("coin-impact " + tier + " " + hitAt);
+        return layer;
+    }
+
+    static readonly uint[,] CoinMetals =
+    {
+        { 0xD9AD69, 0xC38B3D, 0x9C6327 }, { 0xFFE49A, 0xEDB94D, 0xCA8C26 },
+        { 0xFFEDAE, 0xF2BF4B, 0xCB8D25 }, { 0xFFF1C7, 0xEFD38B, 0xB99036 },
+        { 0xFFF1C3, 0xF1CC70, 0xC79531 }, { 0xFFF2BE, 0xF4D078, 0xC79531 },
+        { 0xFFF7DC, 0xECDBA4, 0xAE893A }, { 0xFFFCE9, 0xF7E5B2, 0xB6994A }
+    };
+
+    static Canvas CreateCoinFace(int tier, double size, out Border? sheen)
+    {
+        double r = size / 2;
+        Windows.UI.Color Tint(uint rgb) => Windows.UI.Color.FromArgb(255, (byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb);
+        var top = new SolidColorBrush(Tint(CoinMetals[tier, 0]));
+        var middle = Tint(CoinMetals[tier, 1]);
+        var edge = new SolidColorBrush(Tint(CoinMetals[tier, 2]));
+        var face = new Canvas { Width = size, Height = size, IsHitTestVisible = false };
+        void Add(UIElement visual, double x, double y)
+        { Canvas.SetLeft(visual, x); Canvas.SetTop(visual, y); face.Children.Add(visual); }
+        void Outline(double radius, Brush? fill, Brush stroke, double thickness, bool faceted)
+        {
+            Microsoft.UI.Xaml.Shapes.Shape shape;
+            if (faceted)
+            {
+                var polygon = new Microsoft.UI.Xaml.Shapes.Polygon();
+                for (int i = 0; i < 12; i++)
+                {
+                    double angle = -Math.PI / 2 + i * Math.PI / 6;
+                    polygon.Points.Add(new Point(radius + Math.Cos(angle) * radius, radius + Math.Sin(angle) * radius));
+                }
+                shape = polygon;
+            }
+            else shape = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = radius * 2, Height = radius * 2 };
+            shape.Fill = fill; shape.Stroke = stroke; shape.StrokeThickness = thickness;
+            Add(shape, r - radius, r - radius);
+        }
+        var metal = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(1, 1) };
+        metal.GradientStops.Add(new GradientStop { Color = top.Color, Offset = 0 });
+        metal.GradientStops.Add(new GradientStop { Color = middle, Offset = .4 });
+        metal.GradientStops.Add(new GradientStop { Color = edge.Color, Offset = .7 });
+        metal.GradientStops.Add(new GradientStop { Color = middle, Offset = 1 });
+        Outline(r - .65, metal, edge, 1.3, tier >= 6);
+        if (tier >= 1) Outline(r - 1.5, null, top, 1.15, tier >= 6);
+        if (tier >= 2)
+        {
+            var grooves = new PathGeometry();
+            for (int i = 0; i < 24; i++)
+            {
+                double angle = i * Math.PI / 12;
+                var line = new PathFigure { StartPoint = new Point(r + Math.Cos(angle) * (r - 1.8), r + Math.Sin(angle) * (r - 1.8)), IsFilled = false };
+                line.Segments.Add(new LineSegment { Point = new Point(r + Math.Cos(angle) * (r - 3.5), r + Math.Sin(angle) * (r - 3.5)) });
+                grooves.Figures.Add(line);
+            }
+            Add(new Microsoft.UI.Xaml.Shapes.Path { Data = grooves, Stroke = edge, StrokeThickness = .65 }, 0, 0);
+        }
+        if (tier >= 3)
+        {
+            var center = new LinearGradientBrush { StartPoint = new Point(.5, 0), EndPoint = new Point(.5, 1) };
+            center.GradientStops.Add(new GradientStop { Color = top.Color, Offset = 0 });
+            center.GradientStops.Add(new GradientStop { Color = middle, Offset = 1 });
+            Outline(r - 4, center, edge, .6, false);
+            Outline(r - 4.8, null, top, .6, false);
+        }
+        if (tier >= 4)
+        {
+            var wreath = new PathGeometry();
+            foreach (int side in new[] { -1, 1 })
+            {
+                var stem = new PathFigure { StartPoint = new Point(r + side * 3, r + 8), IsFilled = false };
+                stem.Segments.Add(new QuadraticBezierSegment { Point1 = new Point(r + side * 11, r + 4), Point2 = new Point(r + side * 7, r - 6) });
+                wreath.Figures.Add(stem);
+                for (int i = 0; i < 4; i++)
+                {
+                    double x = r + side * (6.3 + Math.Sin(i * .7) * 1.8), y = r + 5 - i * 2.6;
+                    var leaf = new PathFigure { StartPoint = new Point(x - .8, y), IsClosed = true };
+                    leaf.Segments.Add(new QuadraticBezierSegment { Point1 = new Point(x - side * 1.2, y - 2), Point2 = new Point(x + .8, y) });
+                    leaf.Segments.Add(new QuadraticBezierSegment { Point1 = new Point(x + side * 1.2, y + 2), Point2 = new Point(x - .8, y) });
+                    wreath.Figures.Add(leaf);
+                }
+            }
+            Add(new Microsoft.UI.Xaml.Shapes.Path { Data = wreath, Stroke = edge, StrokeThickness = .55, Fill = edge }, 0, 0);
+        }
+        Add(new Border
+        {
+            Width = size, Height = size, Padding = new Thickness(0, tier >= 5 ? 3.6 : 1, 0, 0),
+            Child = new TextBlock
+            {
+                Text = "￥", FontSize = tier >= 4 ? 12 : 16, FontFamily = new FontFamily("Microsoft YaHei"),
+                FontWeight = Microsoft.UI.Text.FontWeights.Bold, IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Tight,
+                Foreground = tier == 0 ? new SolidColorBrush(Tint(0x754817)) : edge,
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            }
+        }, 0, 0);
+        if (tier >= 5)
+            Add(new TextBlock { Text = "✦", FontSize = 7, IsTextScaleFactorEnabled = false, Foreground = edge, TextLineBounds = TextLineBounds.Tight, Width = 8, TextAlignment = TextAlignment.Center }, r - 4, r - 10);
+        sheen = null;
+        if (tier >= 1)
+        {
+            sheen = new Border
+            {
+                Width = 2, Height = size * .48, Opacity = 0, CornerRadius = new CornerRadius(1),
+                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(160, 255, 254, 240)),
+                RenderTransformOrigin = new Point(.5, .5), RenderTransform = new CompositeTransform { Rotation = -25 }
+            };
+            Add(sheen, r - 1, r - size * .24);
+        }
+        if (tier == 7)
+        {
+            var glint = new PathFigure { StartPoint = new Point(r - r * .7, r - r * .35), IsFilled = false };
+            glint.Segments.Add(new LineSegment { Point = new Point(r - r * .5, r - r * .65) });
+            glint.Segments.Add(new LineSegment { Point = new Point(r - r * .15, r - r * .81) });
+            var geometry = new PathGeometry(); geometry.Figures.Add(glint);
+            Add(new Microsoft.UI.Xaml.Shapes.Path { Data = geometry, Stroke = new SolidColorBrush(Tint(0xFFFDF1)), StrokeThickness = .7 }, 0, 0);
+        }
+        return face;
+    }
+
+    static int CoinTier(int count) => count < 10 ? 0 : count < 50 ? 1 : count < 100 ? 2 : count < 200 ? 3 :
+        count < 300 ? 4 : count < 500 ? 5 : count < 1000 ? 6 : 7;
+
+    static long NextCoinGoal(int count) => count < 10 ? 10 : count < 50 ? 50 : count < 100 ? 100 :
+        count < 200 ? 200 : count < 300 ? 300 : count < 500 ? 500 : count < 1000 ? 1000 : ((long)count / 1000 + 1) * 1000;
+
+    static bool IsCoinMilestone(int count) => count == 1 || count == 10 || count == 50 || count == 100 ||
+        count == 200 || count == 300 || count == 500 || (count >= 1000 && count % 1000 == 0);
+
+    void CelebrateCoins(int count, double x, double y)
+    {
+        int level = CoinTier(count);
+        string[] titles = { "第一枚金币", "小有收获", "渐入佳境", "百枚达成", "金币高手", "财运亨通", "闪耀时刻", "千金成就" };
+        var palette = new[] { Windows.UI.Color.FromArgb(255, 255, 230, 172), Windows.UI.Color.FromArgb(255, 245, 204, 120),
+            Windows.UI.Color.FromArgb(255, 255, 241, 204) };
+        var story = new Storyboard();
+        var visuals = new System.Collections.Generic.List<UIElement>();
+        void Add(UIElement visual, double left, double top)
+        {
+            Canvas.SetLeft(visual, left); Canvas.SetTop(visual, top);
+            visuals.Add(visual); coins.Children.Add(visual);
+        }
+        void Animate(DependencyObject target, string property, double from, double to, int start, int duration, bool ease = true)
+        {
+            var animation = new DoubleAnimation
+            {
+                From = from, To = to, BeginTime = TimeSpan.FromMilliseconds(start),
+                Duration = new Duration(TimeSpan.FromMilliseconds(duration)),
+                EasingFunction = ease ? new CubicEase { EasingMode = EasingMode.EaseOut } : null
+            };
+            Storyboard.SetTarget(animation, target); Storyboard.SetTargetProperty(animation, property);
+            story.Children.Add(animation);
+        }
+        bool paleBackground = textAppearanceInitialized && lightness < .5;
+        var gold = new SolidColorBrush(paleBackground ? Windows.UI.Color.FromArgb(255, 111, 79, 30) : Windows.UI.Color.FromArgb(255, 255, 232, 174));
+        bool upgraded = CoinTier(count) > CoinTier(Math.Max(0, count - 1));
+        double width = Math.Min(upgraded ? 216 : 204, coins.Width - 32);
+        var label = new Border
+        {
+            Width = width, Padding = new Thickness(0), BorderThickness = new Thickness(0),
+            IsHitTestVisible = false,
+        };
+        if (upgraded)
+        {
+            if (activeCoinUpgrade != null) coins.Children.Remove(activeCoinUpgrade);
+            activeCoinUpgrade = label;
+            var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, HorizontalAlignment = HorizontalAlignment.Center };
+            var rotation = new PlaneProjection();
+            var upgradedCoin = new Viewbox
+            {
+                Width = 34, Height = 34, Child = CreateCoinFace(level, 34, out _), Projection = rotation
+            };
+            row.Children.Add(upgradedCoin);
+            var wording = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Spacing = 2 };
+            wording.Children.Add(new TextBlock
+            {
+                Text = titles[level], FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                IsTextScaleFactorEnabled = false, Foreground = gold
+            });
+            wording.Children.Add(new TextBlock
+            {
+                Text = "金币升级 · " + count.ToString("N0", CultureInfo.InvariantCulture) + " 枚", FontSize = 12,
+                IsTextScaleFactorEnabled = false, Foreground = new SolidColorBrush(paleBackground ? Windows.UI.Color.FromArgb(255, 76, 76, 84) : Windows.UI.Color.FromArgb(255, 196, 198, 208))
+            });
+            row.Children.Add(wording); label.Child = row;
+            if (uiSettings.AnimationsEnabled)
+            {
+                var spin = new DoubleAnimation
+                {
+                    From = 0, To = 720, Duration = new Duration(TimeSpan.FromMilliseconds(1800)),
+                    EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+                };
+                Storyboard.SetTarget(spin, rotation); Storyboard.SetTargetProperty(spin, "RotationY"); story.Children.Add(spin);
+            }
+        }
+        else label.Child = new TextBlock
+        {
+            Text = titles[level] + " · " + count.ToString("N0", CultureInfo.InvariantCulture), FontSize = 15,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, IsTextScaleFactorEnabled = false,
+            Foreground = gold, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        Add(label, upgraded ? Math.Max(16, (coins.Width - width) / 2) : Math.Clamp(x - width / 2, 8, Math.Max(8, coins.Width - width - 8)), 10);
+        var labelMove = new TranslateTransform { Y = 8 }; label.RenderTransform = labelMove;
+        Animate(labelMove, "Y", 8, 0, 0, 260);
+        Animate(label, "Opacity", 1, 0, upgraded ? 2200 : 1300, 400, false);
+        if (uiSettings.AnimationsEnabled)
+        {
+            int particles = 4 + level * 2;
+            for (int i = 0; i < particles; i++)
+            {
+                double angle = -Math.PI + Math.PI * 2 * i / particles;
+                double distance = 20 + level * 3 + (i % 3) * 5;
+                var spark = new TextBlock
+                {
+                    Text = i % 3 == 0 ? "✦" : "•", FontSize = i % 3 == 0 ? 13 : 10,
+                    Foreground = new SolidColorBrush(palette[i % palette.Length]),
+                    IsTextScaleFactorEnabled = false, RenderTransformOrigin = new Point(.5, .5)
+                };
+                Add(spark, x - 7, y - 7);
+                var movement = new CompositeTransform(); spark.RenderTransform = movement;
+                double endX = Math.Clamp(x + Math.Cos(angle) * distance, 10, coins.Width - 18) - x;
+                double endY = Math.Clamp(y + Math.Sin(angle) * distance, 48, coins.Height - 18) - y;
+                int duration = 950 + (i % 4) * 100;
+                Animate(movement, "TranslateX", 0, endX, 0, duration);
+                Animate(movement, "TranslateY", 0, endY, 0, duration);
+                Animate(spark, "Opacity", 1, 0, 200, duration, false);
+            }
+            if (level >= 3)
+            {
+                int rings = level >= 5 ? 2 : 1;
+                for (int i = 0; i < rings; i++)
+                {
+                    var halo = new Microsoft.UI.Xaml.Shapes.Ellipse
+                    {
+                        Width = 40, Height = 40, StrokeThickness = 1,
+                        Stroke = new SolidColorBrush(palette[i]), RenderTransformOrigin = new Point(.5, .5)
+                    };
+                    Add(halo, x - 20, y - 20);
+                    var expansion = new ScaleTransform(); halo.RenderTransform = expansion;
+                    double radius = Math.Min(34 + level * 2, Math.Max(20, Math.Min(Math.Min(x - 2, coins.Width - x - 2), Math.Min(y - 2, coins.Height - y - 2))));
+                    int delay = i * 120;
+                    halo.Opacity = 0;
+                    Animate(expansion, "ScaleX", .7, radius / 20, delay, 1000);
+                    Animate(expansion, "ScaleY", level >= 5 ? .46 : .7, radius / 20 * (level >= 5 ? .66 : 1), delay, 1000);
+                    Animate(halo, "Opacity", .32, 0, delay, 1200, false);
+                }
+            }
+            if (level >= 5)
+            {
+                double radius = Math.Min(31 + level, Math.Max(10, Math.Min(x - 10, coins.Width - x - 10)));
+                for (int i = 0; i < 2; i++)
+                {
+                    var spark = new TextBlock
+                    {
+                        Text = "✦", FontSize = 12, IsTextScaleFactorEnabled = false,
+                        Foreground = new SolidColorBrush(palette[i]), Opacity = .65
+                    };
+                    Add(spark, x - 6, y - 6);
+                    var orbit = new TranslateTransform(); spark.RenderTransform = orbit;
+                    foreach (bool horizontal in new[] { true, false })
+                    {
+                        var motion = new DoubleAnimationUsingKeyFrames();
+                        for (int k = 0; k <= 18; k++)
+                        {
+                            double angle = i * Math.PI + k / 18d * Math.PI;
+                            motion.KeyFrames.Add(new LinearDoubleKeyFrame
+                            {
+                                KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(k * 100)),
+                                Value = horizontal ? Math.Cos(angle) * radius : Math.Sin(angle) * radius * .65
+                            });
+                        }
+                        Storyboard.SetTarget(motion, orbit); Storyboard.SetTargetProperty(motion, horizontal ? "X" : "Y");
+                        story.Children.Add(motion);
+                    }
+                    Animate(spark, "Opacity", .65, 0, 800, 1000, false);
+                }
+            }
+        }
+        story.Completed += (_, __) =>
+        {
+            coinStories.Remove(story);
+            if (ReferenceEquals(activeCoinUpgrade, label)) activeCoinUpgrade = null;
+            foreach (var visual in visuals) coins.Children.Remove(visual);
+            if (coins.Children.Count == 0) CloseCoinLayer();
+        };
+        coinStories.Add(story); story.Begin();
+        GlassProfile.Event("coin-milestone " + count);
+    }
+
+    bool isDragging, endingDrag, dragMoved, dragUsesMouse, dragReleasePending;
+    bool suppressPetTap;
     Win32Point initialCursor;
     PointInt32 initialWindowPos;
     PointInt32 lastDragPosition;
@@ -1428,25 +2814,25 @@ public sealed class MainWindow : Window
         var point = e.GetCurrentPoint(surface);
         if (!point.Properties.IsLeftButtonPressed) return;
         for (DependencyObject? source = e.OriginalSource as DependencyObject; source != null && source != card; source = VisualTreeHelper.GetParent(source))
-            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase || source is Image || ReferenceEquals(source, pet.Parent)) return;
+            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase ||
+                (!hoverDragArmed && (source is Image || ReferenceEquals(source, pet.Parent)))) return;
 
+        // Use the same physical coordinate source as the move/release paths.
+        if (!GetCursorPos(out Win32Point pressCursor)) return;
+
+        HideHoverEffect();
         if (layoutTransitionActive) CompleteLayoutTransition();
         if (scalePreviewHostActive) { EndScalePreviewHost(); ApplyWidgetSize(); }
+        dragUsesMouse = e.Pointer.PointerDeviceType == PointerDeviceType.Mouse;
+        dragReleasePending = false;
         isDragging = true;
-        if (!card.CapturePointer(e.Pointer)) { isDragging = false; return; }
+        if (!card.CapturePointer(e.Pointer)) { isDragging = false; dragUsesMouse = false; return; }
+        StartDragReleaseMonitor();
         desktopSource.PrepareWindowMove();
         dragMoved = false;
         initialWindowPos = native.Position;
         lastDragPosition = initialWindowPos;
-        IntPtr renderWindow = FindWindowEx(hwnd, IntPtr.Zero, "Microsoft.UI.Content.DesktopChildSiteBridge", null);
-        if (renderWindow == IntPtr.Zero) renderWindow = hwnd;
-        var origin = new Win32Point();
-        if (ClientToScreen(renderWindow, ref origin))
-        {
-            double dpi = GetDpiForWindow(hwnd) / 96.0;
-            initialCursor = new Win32Point { X = origin.X + (int)Math.Round(point.Position.X * dpi), Y = origin.Y + (int)Math.Round(point.Position.Y * dpi) };
-        }
-        else GetCursorPos(out initialCursor);
+        initialCursor = pressCursor;
         e.Handled = true;
     }
 
@@ -1457,31 +2843,94 @@ public sealed class MainWindow : Window
         if (isDragging) e.Handled = true;
     }
 
+    void StartDragReleaseMonitor()
+    {
+        if (dragReleaseTimer == null)
+        {
+            dragReleaseTimer = DispatcherQueue.CreateTimer();
+            dragReleaseTimer.Tick += (_, __) => CheckDragRelease();
+        }
+        // Only a release watchdog. HWND motion and atlas sampling share Rendering.
+        dragReleaseTimer.Interval = TimeSpan.FromMilliseconds(50);
+        dragReleaseTimer.Start();
+    }
+
+    bool CheckDragRelease()
+    {
+        if (!isDragging || disposed || dragReleasePending) return true;
+        // Pointer events can be lost while the HWND moves under the cursor.
+        if (dragUsesMouse && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
+        {
+            dragReleasePending = true;
+            GlassProfile.Event("drag-auto-release");
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (!dragReleasePending) return;
+                dragReleasePending = false;
+                if (isDragging) EndDrag(null, sampleFinalPosition: true);
+            });
+            return true;
+        }
+        return false;
+    }
+
     void UpdateDragFrame()
     {
-        if (!isDragging || disposed) return;
+        if (CheckDragRelease()) return;
         if (!GetCursorPos(out Win32Point currentCursor)) return;
         int dx = currentCursor.X - initialCursor.X, dy = currentCursor.Y - initialCursor.Y;
         if (!dragMoved && Math.Abs(dx) < GetSystemMetrics(68) && Math.Abs(dy) < GetSystemMetrics(69)) return;
-        var position = ClampDragPosition(new PointInt32(initialWindowPos.X + dx, initialWindowPos.Y + dy));
+        var target = new PointInt32(initialWindowPos.X + dx, initialWindowPos.Y + dy);
+        if (target.X == lastDragPosition.X && target.Y == lastDragPosition.Y) return;
+        var position = ClampDragPosition(target);
         if (position.X == lastDragPosition.X && position.Y == lastDragPosition.Y) return;
         // Keep the HWND at normal size. Pure motion reuses one uploaded scene
         // instead of cropping and uploading the card bitmap at each position.
-        if (!dragMoved) desktopSource.BeginWindowMove();
+        bool firstMove = !dragMoved;
+        long moveStarted = GlassProfile.Timestamp();
         native.Move(position);
+        if (GlassProfile.Enabled)
+        {
+            double moveMs = GlassProfile.Ms(moveStarted);
+            if (moveMs >= 4) GlassProfile.Event($"drag-move {moveMs:F1}ms");
+        }
+        suppressPetTap = true;
         lastDragPosition = position;
         dragMoved = true;
+        if (firstMove) desktopSource.BeginWindowMove();
     }
 
     PointInt32 ClampDragPosition(PointInt32 position)
     {
         var size = native.Size;
-        var center = new PointInt32(position.X + size.Width / 2, position.Y + size.Height / 2);
-        var bounds = DisplayArea.GetFromPoint(center, DisplayAreaFallback.Nearest).OuterBounds;
+        var center = new Win32Point { X = position.X + size.Width / 2, Y = position.Y + size.Height / 2 };
+        int left, top, right, bottom;
+        if (TryGetMonitorBounds(center, out var bounds))
+        {
+            left = bounds.Left; top = bounds.Top; right = bounds.Right; bottom = bounds.Bottom;
+        }
+        else
+        {
+            var area = DisplayArea.GetFromPoint(new PointInt32(center.X, center.Y), DisplayAreaFallback.Nearest).OuterBounds;
+            left = area.X; top = area.Y; right = area.X + area.Width; bottom = area.Y + area.Height;
+        }
         // Keep the entire glass source on a real display, including the taskbar area.
         return new PointInt32(
-            Math.Clamp(position.X, bounds.X, Math.Max(bounds.X, bounds.X + bounds.Width - size.Width)),
-            Math.Clamp(position.Y, bounds.Y, Math.Max(bounds.Y, bounds.Y + bounds.Height - size.Height)));
+            Math.Clamp(position.X, left, Math.Max(left, right - size.Width)),
+            Math.Clamp(position.Y, top, Math.Max(top, bottom - size.Height)));
+    }
+
+    bool TryGetMonitorBounds(Win32Point point, out NativeClientRect bounds)
+    {
+        IntPtr monitor = MonitorFromPoint(point, 2 /* MONITOR_DEFAULTTONEAREST */);
+        var info = new MonitorInfoEx { Size = Marshal.SizeOf<MonitorInfoEx>() };
+        if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
+        {
+            bounds = info.MonitorRect;
+            return true;
+        }
+        bounds = default;
+        return false;
     }
 
     void EnsureRenderEraseMonitor()
@@ -1538,7 +2987,7 @@ public sealed class MainWindow : Window
 
     void OnCardPointerReleased(object sender, PointerRoutedEventArgs e)
     {
-        EndDrag(e.Pointer);
+        EndDrag(e.Pointer, sampleFinalPosition: true);
         e.Handled = true;
     }
 
@@ -1547,22 +2996,26 @@ public sealed class MainWindow : Window
         EndDrag(e.Pointer);
     }
 
-    void EndDrag(Pointer? pointer)
+    void EndDrag(Pointer? pointer, bool sampleFinalPosition = false)
     {
         if (!isDragging || endingDrag) return;
         endingDrag = true;
         isDragging = false;
         try
         {
-            // A very short gesture may finish before the next Rendering callback.
-            // Sample its final point without creating or restoring a larger host.
-            if (GetCursorPos(out Win32Point cursor))
+            // Only a normal release can add the final unsampled movement.
+            // Cancellation/activation loss keeps the last position already shown.
+            if (sampleFinalPosition && GetCursorPos(out Win32Point cursor))
             {
                 int dx = cursor.X - initialCursor.X, dy = cursor.Y - initialCursor.Y;
                 if (dragMoved || Math.Abs(dx) >= GetSystemMetrics(68) || Math.Abs(dy) >= GetSystemMetrics(69))
                 {
                     lastDragPosition = ClampDragPosition(new PointInt32(initialWindowPos.X + dx, initialWindowPos.Y + dy));
-                    if (native.Position.X != lastDragPosition.X || native.Position.Y != lastDragPosition.Y) native.Move(lastDragPosition);
+                    if (native.Position.X != lastDragPosition.X || native.Position.Y != lastDragPosition.Y)
+                    {
+                        native.Move(lastDragPosition);
+                        suppressPetTap = true;
+                    }
                 }
             }
             settings.X = native.Position.X; settings.Y = native.Position.Y;
@@ -1573,44 +3026,810 @@ public sealed class MainWindow : Window
         {
             try { desktopSource.EndWindowMove(); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
             try { card.ReleasePointerCaptures(); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
+            dragReleaseTimer?.Stop();
             dragMoved = false;
+            dragUsesMouse = false;
+            dragReleasePending = false;
             endingDrag = false;
+            if (hoverDragArmed && settings.MouseClickThrough)
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    if (isDragging) return;
+                    DisarmHoverDrag();
+                    // Disarming resets the dwell timer so hovering can start again in place.
+                });
         }
+    }
+
+    void OnSurfacePointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        var point = e.GetCurrentPoint(surface);
+        if (point.Properties.PointerUpdateKind != PointerUpdateKind.RightButtonReleased) return;
+        if (e.Pointer.PointerDeviceType != PointerDeviceType.Mouse) return;
+        ShowContextMenu(point.Position);
+        e.Handled = true;
+    }
+
+    void OnSurfaceRightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        // Card releases are handled before they bubble, so RightTapped remains
+        // the reliable mouse entry, and it also covers touch long-press.
+        if (e.PointerDeviceType == PointerDeviceType.Mouse &&
+            Environment.TickCount64 - widgetMenuShownAt < 600) { e.Handled = true; return; }
+        ShowContextMenu(e.GetPosition(surface));
+        e.Handled = true;
     }
 
     void ShowContextMenu(Point point)
     {
-        if (disposed) return;
-        var menu = CreateWidgetMenu();
-        Add(menu, "设置", OpenSettings);
-        Add(menu, "隐藏到托盘", () => native.Hide());
-        Add(menu, "退出", Exit);
+        if (disposed || widgetMenuOpen) return;
+        if (isDragging) EndDrag(null, sampleFinalPosition: true);
+        var menu = EnsureWidgetMenu();
+        widgetMenuShownAt = Environment.TickCount64;
+        GlassProfile.Event("context-menu-show");
         menu.ShowAt(surface, point);
     }
 
     void ApplyMouseClickThrough()
     {
-        if (settings.MouseClickThrough)
+        if (!settings.MouseClickThrough) HideHoverEffect();
+        bool clickThrough = settings.MouseClickThrough && !hoverDragArmed;
+        if (clickThrough)
         {
             EndDrag(null);
             glass.SetInteraction(0, 0, false);
         }
         int extended = GetWindowLong(hwnd, GWL_EXSTYLE);
-        int next = settings.MouseClickThrough
+        int next = clickThrough
             ? extended | WS_EX_LAYERED | WS_EX_TRANSPARENT
             : extended & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT);
+        if (startupMaskActive) next |= WS_EX_LAYERED;
         if (next == extended) return;
         SetWindowLong(hwnd, GWL_EXSTYLE, next);
         // Keep XAML opaque at the window level; only mouse input passes through.
-        if (settings.MouseClickThrough) SetLayeredWindowAttributes(hwnd, 0, 255, 2 /* LWA_ALPHA */);
+        if (clickThrough || startupMaskActive) SetLayeredWindowAttributes(hwnd, 0, startupMaskActive ? (byte)0 : (byte)255, 2 /* LWA_ALPHA */);
         SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, 0x0037 /* FRAMECHANGED | NOACTIVATE | NOZORDER | NOMOVE | NOSIZE */);
+    }
+
+    int HoverDragDelaySeconds => Math.Clamp(settings.HoverDragSeconds, 1, 3);
+
+    void ResetHoverHold()
+    {
+        hoverHoldSinceTick = 0;
+        hoverHoldX = hoverHoldY = hoverSampleX = hoverSampleY = 0;
+    }
+
+    void UpdateHoverDragMonitor()
+    {
+        UpdatePetHoverMonitor();
+        bool active = !exiting && !disposed && settings.MouseClickThrough && !startupMaskActive && startupRevealStarted && IsWindowVisible(hwnd);
+        if (hoverMonitorActive != active)
+        {
+            hoverMonitorActive = active;
+            GlassProfile.Event(active ? "hover-monitor-start" : "hover-monitor-stop");
+        }
+        if (!active)
+        {
+            hoverDragTimer?.Stop();
+            hoverDragSinceTick = 0;
+            ResetHoverHold();
+            HideHoverEffect();
+            if (hoverDragArmed) DisarmHoverDrag(false);
+            return;
+        }
+        if (hoverDragTimer == null)
+        {
+            hoverDragTimer = DispatcherQueue.CreateTimer();
+            hoverDragTimer.Interval = TimeSpan.FromMilliseconds(100);
+            hoverDragTimer.Tick += (_, __) => OnHoverDragTick();
+        }
+        hoverDragTimer.Start();
+    }
+
+    bool IsCursorOverWidget()
+    {
+        if (!GetCursorPos(out Win32Point cursor) || !GetClientRect(hwnd, out NativeClientRect client)) return false;
+        var origin = new Win32Point();
+        if (!ClientToScreen(hwnd, ref origin)) return false;
+        const int inset = 2;
+        if (cursor.X < origin.X + inset || cursor.X >= origin.X + client.Right - inset ||
+            cursor.Y < origin.Y + inset || cursor.Y >= origin.Y + client.Bottom - inset) return false;
+        // WindowFromPoint skips this click-through widget. If the window it does
+        // return is above us, the widget is visually covered and must not take input.
+        IntPtr under = WindowFromPoint(cursor);
+        if (under != IntPtr.Zero)
+        {
+            IntPtr cover = GetAncestor(under, GA_ROOT);
+            if (cover == IntPtr.Zero) cover = under;
+            if (cover != hwnd && trackingCoins)
+            {
+                GetWindowThreadProcessId(cover, out uint ownerProcess);
+                var name = new System.Text.StringBuilder(128);
+                GetClassName(cover, name, name.Capacity);
+                if (ownerProcess == (uint)Environment.ProcessId && name.ToString().Contains("PopupWindowSiteBridge", StringComparison.Ordinal)) return true;
+            }
+            if (cover != hwnd)
+            {
+                for (IntPtr window = GetTopWindow(IntPtr.Zero); window != IntPtr.Zero; window = GetWindow(window, GW_HWNDNEXT))
+                {
+                    if (window == hwnd) break;
+                    if (window == cover) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void OnHoverDragTick()
+    {
+        if (exiting || disposed || !settings.MouseClickThrough || startupMaskActive || !IsWindowVisible(hwnd))
+        {
+            UpdateHoverDragMonitor();
+            return;
+        }
+        if (isDragging) return;
+        bool inside = IsCursorOverWidget();
+        if (!inside)
+        {
+            hoverDragSinceTick = 0;
+            ResetHoverHold();
+            HideHoverEffect();
+            if (hoverDragArmed && !isDragging) DisarmHoverDrag();
+            return;
+        }
+        if (hoverDragArmed)
+        {
+            if (uiSettings.AnimationsEnabled)
+            {
+                if (!hoverEffectVisible)
+                    ShowHoverEffect(HoverEffects.Normalize(settings.HoverEffect), Environment.TickCount64 - HoverDragDelaySeconds * 1000L);
+                SetHoverEffectReady();
+            }
+            return;
+        }
+        long now = Environment.TickCount64;
+        if (!GetCursorPos(out Win32Point cursor))
+        {
+            hoverDragSinceTick = 0;
+            ResetHoverHold();
+            HideHoverEffect();
+            return;
+        }
+        bool moved = hoverHoldSinceTick != 0 &&
+            ((cursor.X - hoverSampleX) * (cursor.X - hoverSampleX) + (cursor.Y - hoverSampleY) * (cursor.Y - hoverSampleY) > HoverMoveSamplePx * HoverMoveSamplePx ||
+             (cursor.X - hoverHoldX) * (cursor.X - hoverHoldX) + (cursor.Y - hoverHoldY) * (cursor.Y - hoverHoldY) > HoverHoldDriftPx * HoverHoldDriftPx);
+        if (hoverHoldSinceTick == 0 || moved)
+        {
+            bool wasCounting = hoverDragSinceTick != 0;
+            hoverHoldSinceTick = now;
+            hoverHoldX = hoverSampleX = cursor.X;
+            hoverHoldY = hoverSampleY = cursor.Y;
+            hoverDragSinceTick = 0;
+            HideHoverEffect();
+            GlassProfile.Event(moved ? "hover-hold-reset" : "hover-hold-start");
+            if (wasCounting) GlassProfile.Event("hover-drag-count-cancel");
+            return;
+        }
+        hoverSampleX = cursor.X;
+        hoverSampleY = cursor.Y;
+        if (now - hoverHoldSinceTick < HoverHoldDelayMs)
+        {
+            hoverDragSinceTick = 0;
+            HideHoverEffect();
+            return;
+        }
+        if (hoverDragSinceTick == 0)
+        {
+            hoverDragSinceTick = now;
+            GlassProfile.Event("hover-drag-count-start");
+        }
+        EnsureHoverEffect(hoverDragSinceTick);
+        if (now - hoverDragSinceTick >= HoverDragDelaySeconds * 1000L) ArmHoverDrag();
+    }
+
+    void ArmHoverDrag()
+    {
+        if (hoverDragArmed || !settings.MouseClickThrough || exiting || disposed) return;
+        hoverDragArmed = true;
+        hoverDragSinceTick = 0;
+        ResetHoverHold();
+        // Drop only the input mask; the click-through setting stays enabled, so
+        // the next leave/drag-end can hand mouse input back to the desktop.
+        ApplyMouseClickThrough();
+        if (uiSettings.AnimationsEnabled)
+        {
+            if (!hoverEffectVisible)
+                ShowHoverEffect(HoverEffects.Normalize(settings.HoverEffect), Environment.TickCount64 - HoverDragDelaySeconds * 1000L);
+            SetHoverEffectReady();
+        }
+        GlassProfile.Event("hover-drag-armed");
+    }
+
+    void DisarmHoverDrag(bool applyStyle = true)
+    {
+        if (!hoverDragArmed) return;
+        hoverDragArmed = false;
+        hoverDragSinceTick = 0;
+        ResetHoverHold();
+        HideHoverEffect();
+        GlassProfile.Event("hover-drag-disarmed");
+        if (applyStyle && settings.MouseClickThrough && !startupMaskActive && !exiting && !disposed)
+            ApplyMouseClickThrough();
+    }
+
+    void HideWidget()
+    {
+        CancelPolarCoinAction(true);
+        hoverDragArmed = false;
+        hoverDragSinceTick = 0;
+        ResetHoverHold();
+        HideHoverEffect();
+        hoverDragTimer?.Stop();
+        native.Hide();
+    }
+
+    void BuildHoverEffect()
+    {
+        hoverEffectRoot.RenderTransform = hoverEffectTransform;
+        hoverEffectTransform.ScaleX = hoverEffectTransform.ScaleY = (float)PhysicalScale;
+        hoverEffectHalo.Center = new Point(.5, .5);
+        hoverEffectHalo.GradientOrigin = new Point(.5, .5);
+        hoverEffectHalo.RadiusX = hoverEffectHalo.RadiusY = .5;
+        foreach (double offset in new[] { 0d, .35, .62, .84, 1d })
+            hoverEffectHalo.GradientStops.Add(new GradientStop { Offset = offset });
+
+        var transparent = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        hoverHaloVisual = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 92, Height = 92, Fill = hoverEffectHalo, Opacity = 0, IsHitTestVisible = false, RenderTransformOrigin = new Point(.5, .5), RenderTransform = hoverHaloScale };
+        Canvas.SetLeft(hoverHaloVisual, 14); Canvas.SetTop(hoverHaloVisual, 14);
+        hoverEffectRoot.Children.Add(hoverHaloVisual);
+
+        hoverReadyRingOuter = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 56, Height = 56, Stroke = hoverEffectCompanion, StrokeThickness = 4.5,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false,
+            RenderTransformOrigin = new Point(.5, .5), RenderTransform = hoverReadyOuterScale
+        };
+        Canvas.SetLeft(hoverReadyRingOuter, 32); Canvas.SetTop(hoverReadyRingOuter, 32);
+        hoverEffectRoot.Children.Add(hoverReadyRingOuter);
+
+        hoverReadyRing = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 42, Height = 42, Stroke = hoverEffectAccent, StrokeThickness = 1.3,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false,
+            RenderTransformOrigin = new Point(.5, .5), RenderTransform = hoverReadyScale
+        };
+        Canvas.SetLeft(hoverReadyRing, 39); Canvas.SetTop(hoverReadyRing, 39);
+        hoverEffectRoot.Children.Add(hoverReadyRing);
+
+        hoverRipple1Scale = new ScaleTransform();
+        hoverRipple1 = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 52, Height = 52, Stroke = hoverEffectCompanion, StrokeThickness = 3.4,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false,
+            RenderTransformOrigin = new Point(.5, .5), RenderTransform = hoverRipple1Scale
+        };
+        Canvas.SetLeft(hoverRipple1, 34); Canvas.SetTop(hoverRipple1, 34);
+        hoverEffectRoot.Children.Add(hoverRipple1);
+
+        hoverRipple2Scale = new ScaleTransform();
+        hoverRipple2 = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 52, Height = 52, Stroke = hoverEffectAccent, StrokeThickness = 1.1,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false,
+            RenderTransformOrigin = new Point(.5, .5), RenderTransform = hoverRipple2Scale
+        };
+        Canvas.SetLeft(hoverRipple2, 34); Canvas.SetTop(hoverRipple2, 34);
+        hoverEffectRoot.Children.Add(hoverRipple2);
+
+        hoverOrbitTrack = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 46, Height = 46, Stroke = hoverOrbitRingBrush, StrokeThickness = 1,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false
+        };
+        Canvas.SetLeft(hoverOrbitTrack, 37); Canvas.SetTop(hoverOrbitTrack, 37);
+        hoverEffectRoot.Children.Add(hoverOrbitTrack);
+
+        hoverOrbitProgress = CreateOrbitArc(20, hoverOrbitInk, 2.4, out hoverOrbitProgressFigure, out hoverOrbitProgressSegment);
+        hoverEffectRoot.Children.Add(hoverOrbitProgress);
+
+        hoverOrbitTrailSoft = CreateOrbitTrail(out hoverOrbitTrailSoftFigure, out hoverOrbitTrailSoftSegment);
+        hoverEffectRoot.Children.Add(hoverOrbitTrailSoft);
+
+        hoverOrbitTrail = CreateOrbitTrail(out hoverOrbitTrailFigure, out hoverOrbitTrailSegment);
+        hoverEffectRoot.Children.Add(hoverOrbitTrail);
+
+        hoverOrbitGlowBrush.Center = new Point(.5, .5);
+        hoverOrbitGlowBrush.GradientOrigin = new Point(.5, .5);
+        hoverOrbitGlowBrush.RadiusX = hoverOrbitGlowBrush.RadiusY = .5;
+        hoverOrbitGlowBrush.GradientStops.Add(new GradientStop { Offset = 0, Color = Windows.UI.Color.FromArgb(232, 255, 255, 255) });
+        hoverOrbitGlowBrush.GradientStops.Add(new GradientStop { Offset = .34, Color = Windows.UI.Color.FromArgb(110, 255, 255, 255) });
+        hoverOrbitGlowBrush.GradientStops.Add(new GradientStop { Offset = .68, Color = Windows.UI.Color.FromArgb(28, 255, 255, 255) });
+        hoverOrbitGlowBrush.GradientStops.Add(new GradientStop { Offset = 1, Color = Windows.UI.Color.FromArgb(0, 255, 255, 255) });
+        hoverOrbitGlow = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 28, Height = 28, Fill = hoverOrbitGlowBrush, Opacity = 0, IsHitTestVisible = false
+        };
+        Canvas.SetLeft(hoverOrbitGlow, 46); Canvas.SetTop(hoverOrbitGlow, 46);
+        hoverEffectRoot.Children.Add(hoverOrbitGlow);
+
+        hoverOrbitHead = new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 5.6, Height = 5.6, Fill = hoverOrbitHeadBrush, Opacity = 0, IsHitTestVisible = false
+        };
+        Canvas.SetLeft(hoverOrbitHead, 57.2); Canvas.SetTop(hoverOrbitHead, 57.2);
+        hoverEffectRoot.Children.Add(hoverOrbitHead);
+
+        var auraA = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.45, .4), RadiusX = .5, RadiusY = .5 };
+        auraA.GradientStops.Add(new GradientStop { Offset = 0, Color = Windows.UI.Color.FromArgb(86, 234, 245, 255) });
+        auraA.GradientStops.Add(new GradientStop { Offset = .55, Color = Windows.UI.Color.FromArgb(28, 234, 245, 255) });
+        auraA.GradientStops.Add(new GradientStop { Offset = 1, Color = Windows.UI.Color.FromArgb(0, 234, 245, 255) });
+        var auraB = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
+        auraB.GradientStops.Add(new GradientStop { Offset = 0, Color = Windows.UI.Color.FromArgb(92, 159, 212, 255) });
+        auraB.GradientStops.Add(new GradientStop { Offset = .6, Color = Windows.UI.Color.FromArgb(26, 159, 212, 255) });
+        auraB.GradientStops.Add(new GradientStop { Offset = 1, Color = Windows.UI.Color.FromArgb(0, 159, 212, 255) });
+        var auraC = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
+        auraC.GradientStops.Add(new GradientStop { Offset = 0, Color = Windows.UI.Color.FromArgb(70, 255, 217, 168) });
+        auraC.GradientStops.Add(new GradientStop { Offset = .6, Color = Windows.UI.Color.FromArgb(20, 255, 217, 168) });
+        auraC.GradientStops.Add(new GradientStop { Offset = 1, Color = Windows.UI.Color.FromArgb(0, 255, 217, 168) });
+
+        hoverAuroraA = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 110, Height = 110, Fill = auraA, Opacity = 0, IsHitTestVisible = false };
+        hoverAuroraB = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 96, Height = 96, Fill = auraB, Opacity = 0, IsHitTestVisible = false };
+        hoverAuroraC = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 72, Height = 72, Fill = auraC, Opacity = 0, IsHitTestVisible = false };
+        Canvas.SetLeft(hoverAuroraA, 4); Canvas.SetTop(hoverAuroraA, 4);
+        Canvas.SetLeft(hoverAuroraB, 6); Canvas.SetTop(hoverAuroraB, 6);
+        Canvas.SetLeft(hoverAuroraC, 48); Canvas.SetTop(hoverAuroraC, 46);
+
+        var auraLayer = new Canvas { Width = 120, Height = 120, RenderTransformOrigin = new Point(.5, .5), IsHitTestVisible = false };
+        var auraGroup = new TransformGroup();
+        auraGroup.Children.Add(hoverAuroraScale);
+        auraGroup.Children.Add(hoverAuroraRotate);
+        auraLayer.RenderTransform = auraGroup;
+        auraLayer.Children.Add(hoverAuroraA);
+        auraLayer.Children.Add(hoverAuroraB);
+        auraLayer.Children.Add(hoverAuroraC);
+        hoverAuroraLayer = auraLayer;
+        hoverEffectRoot.Children.Insert(1, auraLayer);
+
+        double auraStart = 200 * Math.PI / 180, auraEnd = 320 * Math.PI / 180, auraRadius = 28;
+        var crescentFigure = new PathFigure
+        {
+            StartPoint = new Point(60 + auraRadius * Math.Cos(auraStart), 60 + auraRadius * Math.Sin(auraStart)),
+            IsClosed = false
+        };
+        crescentFigure.Segments.Add(new ArcSegment
+        {
+            Size = new Size(auraRadius, auraRadius), SweepDirection = SweepDirection.Clockwise,
+            IsLargeArc = false, Point = new Point(60 + auraRadius * Math.Cos(auraEnd), 60 + auraRadius * Math.Sin(auraEnd))
+        });
+        var crescentGeometry = new PathGeometry(); crescentGeometry.Figures.Add(crescentFigure);
+        hoverAuroraCrescent = new Microsoft.UI.Xaml.Shapes.Path
+        {
+            Data = crescentGeometry, Stroke = hoverEffectCompanion, StrokeThickness = 1.5,
+            StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+            Fill = transparent, Opacity = 0, IsHitTestVisible = false
+        };
+        hoverEffectRoot.Children.Add(hoverAuroraCrescent);
+
+        var bloom = new Storyboard();
+        AddHoverWave(bloom, hoverRipple1, hoverRipple1Scale, 0, .16, 1300);
+        AddHoverWave(bloom, hoverRipple2, hoverRipple2Scale, 240, .42, 1300);
+        hoverBloomStoryboard = bloom;
+
+        hoverEffectLayer.Children.Add(hoverEffectRoot);
+        surface.Children.Add(hoverEffectLayer);
+        UpdateHoverEffectTheme();
+    }
+
+    static Microsoft.UI.Xaml.Shapes.Path CreateOrbitArc(double radius, Brush stroke, double thickness, out PathFigure? figure, out ArcSegment? segment)
+    {
+        figure = new PathFigure { StartPoint = new Point(60, 60 - radius), IsClosed = false };
+        segment = new ArcSegment
+        {
+            Size = new Size(radius, radius), SweepDirection = SweepDirection.Clockwise,
+            IsLargeArc = false, Point = new Point(60, 60 - radius)
+        };
+        figure.Segments.Add(segment);
+        var geometry = new PathGeometry();
+        geometry.Figures.Add(figure);
+        return new Microsoft.UI.Xaml.Shapes.Path
+        {
+            Data = geometry, Stroke = stroke, StrokeThickness = thickness,
+            StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round,
+            Fill = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0, IsHitTestVisible = false
+        };
+    }
+
+    static Microsoft.UI.Xaml.Shapes.Path CreateOrbitTrail(out PathFigure? figure, out PolyLineSegment? segment)
+    {
+        figure = new PathFigure { StartPoint = new Point(60, 40), IsClosed = true, IsFilled = true };
+        segment = new PolyLineSegment();
+        // Reuse the strip's points on each frame instead of allocating geometry.
+        for (int i = 0; i < 65; i++) segment.Points.Add(new Point(60, 40));
+        figure.Segments.Add(segment);
+        var geometry = new PathGeometry();
+        geometry.Figures.Add(figure);
+        var fill = new LinearGradientBrush { MappingMode = BrushMappingMode.Absolute };
+        foreach (double offset in new[] { 0d, .3, .65, 1d })
+            fill.GradientStops.Add(new GradientStop { Offset = offset });
+        return new Microsoft.UI.Xaml.Shapes.Path
+        {
+            Width = 120, Height = 120, Data = geometry, Fill = fill,
+            Opacity = 0, IsHitTestVisible = false
+        };
+    }
+
+    static void AddHoverWave(Storyboard storyboard, Microsoft.UI.Xaml.Shapes.Ellipse ripple, ScaleTransform scale, double delayMs, double peakOpacity, double durationMs)
+    {
+        var begin = TimeSpan.FromMilliseconds(delayMs);
+        var duration = new Duration(TimeSpan.FromMilliseconds(durationMs));
+        var growEase = new CubicEase { EasingMode = EasingMode.EaseOut };
+        foreach (string property in new[] { "ScaleX", "ScaleY" })
+        {
+            var grow = new DoubleAnimationUsingKeyFrames { BeginTime = begin, Duration = duration };
+            grow.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = TimeSpan.Zero, Value = .9, EasingFunction = growEase });
+            grow.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = TimeSpan.FromMilliseconds(durationMs), Value = 2.3, EasingFunction = growEase });
+            Storyboard.SetTarget(grow, scale); Storyboard.SetTargetProperty(grow, property);
+            storyboard.Children.Add(grow);
+        }
+        var fade = new DoubleAnimationUsingKeyFrames { BeginTime = begin, Duration = duration };
+        fade.KeyFrames.Add(new LinearDoubleKeyFrame { KeyTime = TimeSpan.Zero, Value = 0 });
+        fade.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = TimeSpan.FromMilliseconds(90), Value = peakOpacity, EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        fade.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = TimeSpan.FromMilliseconds(540), Value = peakOpacity * .45, EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        fade.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = TimeSpan.FromMilliseconds(durationMs), Value = 0, EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        Storyboard.SetTarget(fade, ripple); Storyboard.SetTargetProperty(fade, "Opacity");
+        storyboard.Children.Add(fade);
+    }
+
+    void UpdateHoverEffectTheme()
+    {
+        bool dark = surface.ActualTheme == ElementTheme.Dark;
+        if (surface.ActualTheme == ElementTheme.Default) dark = !settings.AutomaticAppearance && settings.NightMode;
+        bool pale = !dark && (desktopSource is null || !desktopSource.IsReady || desktopSource.Luminance > .62);
+        if (hoverEffectDark == dark && hoverEffectPale == pale) return;
+        hoverEffectDark = dark;
+        hoverEffectPale = pale;
+        Windows.UI.Color accent = dark
+            ? Windows.UI.Color.FromArgb(214, 255, 255, 255)
+            : Windows.UI.Color.FromArgb(238, 255, 255, 255);
+        Windows.UI.Color companion;
+        Windows.UI.Color halo;
+        int[] alphas;
+        if (dark)
+        {
+            companion = Windows.UI.Color.FromArgb(140, 220, 235, 250);
+            halo = Windows.UI.Color.FromArgb(255, 255, 255, 255);
+            alphas = new[] { 28, 12, 4, 0, 0 };
+        }
+        else if (pale)
+        {
+            companion = Windows.UI.Color.FromArgb(255, 70, 86, 108);
+            halo = companion;
+            alphas = new[] { 100, 48, 20, 5, 0 };
+        }
+        else
+        {
+            companion = Windows.UI.Color.FromArgb(255, 124, 142, 159);
+            halo = companion;
+            alphas = new[] { 48, 22, 8, 2, 0 };
+        }
+        hoverEffectAccent.Color = accent;
+        hoverEffectCompanion.Color = companion;
+        if (hoverReadyRing != null) hoverReadyRing.Stroke = pale ? hoverEffectCompanion : hoverEffectAccent;
+        var orbitColor = dark ? Windows.UI.Color.FromArgb(255, 222, 241, 255) : Windows.UI.Color.FromArgb(255, 130, 190, 242);
+        hoverOrbitInk.Color = orbitColor;
+        hoverOrbitRingBrush.Color = Windows.UI.Color.FromArgb(dark ? (byte)100 : (byte)135, 174, 213, 246);
+        hoverOrbitHeadBrush.Color = dark ? Microsoft.UI.Colors.White : Windows.UI.Color.FromArgb(255, 210, 236, 255);
+        foreach (var path in new[] { hoverOrbitTrail, hoverOrbitTrailSoft })
+        {
+            if (path?.Fill is not LinearGradientBrush fill) continue;
+            int[] opacity = { 0, 30, 130, 245 };
+            for (int i = 0; i < opacity.Length; i++)
+                fill.GradientStops[i].Color = Windows.UI.Color.FromArgb((byte)opacity[i], orbitColor.R, orbitColor.G, orbitColor.B);
+        }
+        if (hoverEffectStyle == HoverEffects.Orbit)
+        {
+            if (hoverReadyRing != null) hoverReadyRing.Stroke = hoverOrbitRingBrush;
+            if (hoverReadyRingOuter != null) hoverReadyRingOuter.Stroke = hoverOrbitRingBrush;
+        }
+        if (hoverOrbitGlowBrush.GradientStops.Count == 4)
+        {
+            Windows.UI.Color glow = orbitColor;
+            int[] glowAlphas = { 210, 90, 20, 0 };
+            for (int i = 0; i < 4; i++)
+                hoverOrbitGlowBrush.GradientStops[i].Color = Windows.UI.Color.FromArgb((byte)glowAlphas[i], glow.R, glow.G, glow.B);
+        }
+        if (hoverEffectHalo.GradientStops.Count == 5)
+        {
+            for (int i = 0; i < 5; i++)
+                hoverEffectHalo.GradientStops[i].Color = Windows.UI.Color.FromArgb((byte)alphas[i], halo.R, halo.G, halo.B);
+        }
+    }
+
+    void ApplyHoverEffectStyle(bool ready)
+    {
+        string style = hoverEffectStyle;
+        if (hoverReadyRing != null) hoverReadyRing.Stroke = style == HoverEffects.Orbit ? hoverOrbitRingBrush : hoverEffectPale ? hoverEffectCompanion : hoverEffectAccent;
+        if (hoverReadyRingOuter != null) hoverReadyRingOuter.Stroke = style == HoverEffects.Orbit ? hoverOrbitRingBrush : hoverEffectCompanion;
+        if (hoverReadyRing != null) hoverReadyRing.Opacity = 0;
+        if (hoverReadyRingOuter != null) hoverReadyRingOuter.Opacity = 0;
+        hoverReadyScale.ScaleX = hoverReadyScale.ScaleY = 1;
+        hoverReadyOuterScale.ScaleX = hoverReadyOuterScale.ScaleY = 1;
+        if (hoverRipple2 != null) hoverRipple2.Visibility = style == HoverEffects.Halo ? Visibility.Collapsed : Visibility.Visible;
+        if (ready) return;
+        if (hoverHaloVisual != null) hoverHaloVisual.Opacity = .12;
+        hoverHaloScale.ScaleX = hoverHaloScale.ScaleY = 1;
+        if (hoverRipple1 != null) { hoverRipple1.Opacity = 0; if (hoverRipple1Scale != null) hoverRipple1Scale.ScaleX = hoverRipple1Scale.ScaleY = 1; }
+        if (hoverRipple2 != null) { hoverRipple2.Opacity = 0; if (hoverRipple2Scale != null) hoverRipple2Scale.ScaleX = hoverRipple2Scale.ScaleY = 1; }
+    }
+
+    void ResetHoverEffectVisuals()
+    {
+        if (hoverReadyRing != null) hoverReadyRing.Opacity = 0;
+        if (hoverReadyRingOuter != null) hoverReadyRingOuter.Opacity = 0;
+        if (hoverOrbitTrack != null) hoverOrbitTrack.Opacity = 0;
+        if (hoverOrbitProgress != null) hoverOrbitProgress.Opacity = 0;
+        if (hoverOrbitTrail != null) hoverOrbitTrail.Opacity = 0;
+        if (hoverOrbitTrailSoft != null) hoverOrbitTrailSoft.Opacity = 0;
+        if (hoverOrbitHead != null) hoverOrbitHead.Opacity = 0;
+        if (hoverOrbitGlow != null) hoverOrbitGlow.Opacity = 0;
+        if (hoverAuroraA != null) hoverAuroraA.Opacity = 0;
+        if (hoverAuroraB != null) hoverAuroraB.Opacity = 0;
+        if (hoverAuroraC != null) hoverAuroraC.Opacity = 0;
+        if (hoverAuroraCrescent != null) hoverAuroraCrescent.Opacity = 0;
+        hoverAuroraScale.ScaleX = hoverAuroraScale.ScaleY = 1;
+        hoverAuroraRotate.Angle = 0;
+        hoverReadyScale.ScaleX = hoverReadyScale.ScaleY = 1;
+        hoverReadyOuterScale.ScaleX = hoverReadyOuterScale.ScaleY = 1;
+        if (hoverRipple1 != null) { hoverRipple1.Opacity = 0; if (hoverRipple1Scale != null) hoverRipple1Scale.ScaleX = hoverRipple1Scale.ScaleY = 1; }
+        if (hoverRipple2 != null) { hoverRipple2.Opacity = 0; if (hoverRipple2Scale != null) hoverRipple2Scale.ScaleX = hoverRipple2Scale.ScaleY = 1; }
+        if (hoverHaloVisual != null) hoverHaloVisual.Opacity = .12;
+        hoverHaloScale.ScaleX = hoverHaloScale.ScaleY = 1;
+        hoverEffectRoot.Opacity = 0;
+    }
+
+    void ShowHoverEffect(string style, long startTick)
+    {
+        hoverEffectStyle = HoverEffects.Normalize(style);
+        hoverEffectStartTick = startTick;
+        hoverEffectReady = false;
+        hoverBloomStoryboard?.Stop();
+        UpdateHoverEffectTheme();
+        ResetHoverEffectVisuals();
+        ApplyHoverEffectStyle(false);
+        hoverEffectTransform.ScaleX = hoverEffectTransform.ScaleY = (float)PhysicalScale;
+        if (TryGetHoverPoint(out Point point))
+        {
+            hoverEffectTransform.TranslateX = point.X - 60;
+            hoverEffectTransform.TranslateY = point.Y - 60;
+        }
+        hoverEffectLayer.Visibility = Visibility.Visible;
+        hoverEffectVisible = true;
+        if (!hoverEffectLoopActive)
+        {
+            hoverEffectLoopActive = true;
+            CompositionTarget.Rendering += AnimateHoverEffect;
+        }
+    }
+
+    void HideHoverEffect()
+    {
+        if (!hoverEffectVisible && hoverEffectLayer.Visibility == Visibility.Collapsed) return;
+        hoverEffectVisible = false;
+        hoverEffectReady = false;
+        if (hoverEffectLoopActive)
+        {
+            CompositionTarget.Rendering -= AnimateHoverEffect;
+            hoverEffectLoopActive = false;
+        }
+        hoverBloomStoryboard?.Stop();
+        hoverEffectLayer.Visibility = Visibility.Collapsed;
+        ResetHoverEffectVisuals();
+    }
+
+    void EnsureHoverEffect(long startTick)
+    {
+        if (!uiSettings.AnimationsEnabled)
+        {
+            HideHoverEffect();
+            return;
+        }
+        string style = HoverEffects.Normalize(settings.HoverEffect);
+        if (!hoverEffectVisible || hoverEffectStyle != style) ShowHoverEffect(style, startTick);
+    }
+
+    void SetHoverEffectReady()
+    {
+        if (!hoverEffectVisible || hoverEffectReady) return;
+        hoverEffectReady = true;
+        hoverEffectReadyAt = Environment.TickCount64;
+        UpdateHoverEffectTheme();
+        ApplyHoverEffectStyle(true);
+        if (hoverRipple1 != null) { hoverRipple1.Opacity = 0; if (hoverRipple1Scale != null) hoverRipple1Scale.ScaleX = hoverRipple1Scale.ScaleY = .9; }
+        if (hoverRipple2 != null) { hoverRipple2.Opacity = 0; if (hoverRipple2Scale != null) hoverRipple2Scale.ScaleX = hoverRipple2Scale.ScaleY = .9; }
+        hoverBloomStoryboard?.Stop();
+        if (hoverEffectStyle == HoverEffects.Orbit || hoverEffectStyle == HoverEffects.Aurora)
+        {
+            if (hoverRipple1 != null) { hoverRipple1.Opacity = 0; if (hoverRipple1Scale != null) hoverRipple1Scale.ScaleX = hoverRipple1Scale.ScaleY = 1; }
+            if (hoverRipple2 != null) { hoverRipple2.Opacity = 0; if (hoverRipple2Scale != null) hoverRipple2Scale.ScaleX = hoverRipple2Scale.ScaleY = 1; }
+            if (hoverOrbitProgress != null) hoverOrbitProgress.Opacity = 0;
+        }
+        else
+        {
+            hoverBloomStoryboard?.Begin();
+        }
+    }
+
+    void AnimateHoverEffect(object? sender, object args)
+    {
+        if (disposed || !hoverEffectVisible || !settings.MouseClickThrough || startupMaskActive || exiting || !IsWindowVisible(hwnd))
+        {
+            HideHoverEffect();
+            return;
+        }
+        if (!TryGetHoverPoint(out Point point) || point.X < 0 || point.Y < 0 || point.X > surface.ActualWidth || point.Y > surface.ActualHeight)
+        {
+            HideHoverEffect();
+            return;
+        }
+        if (hoverEffectReady)
+        {
+            hoverEffectTransform.TranslateX = point.X - 60;
+            hoverEffectTransform.TranslateY = point.Y - 60;
+        }
+        long now = Environment.TickCount64;
+        UpdateHoverEffectTheme();
+        hoverEffectRoot.Opacity = Math.Min(1, Math.Max(0, (now - hoverEffectStartTick) / 180.0));
+        string style = hoverEffectStyle;
+        if (!hoverEffectReady)
+        {
+            double progress = Math.Clamp((now - hoverEffectStartTick) / (double)(HoverDragDelaySeconds * 1000), 0, 1);
+            if (style == HoverEffects.Halo)
+            {
+                if (hoverHaloVisual != null) hoverHaloVisual.Opacity = .12 + .4 * progress;
+            }
+            else if (style == HoverEffects.Orbit)
+            {
+                if (hoverOrbitTrack != null) hoverOrbitTrack.Opacity = .4;
+                UpdateOrbit(-Math.PI / 2 + progress * Math.PI * 2, 1.1 + .4 * progress, .5 + .5 * progress);
+                UpdateOrbitProgress(progress);
+                if (hoverHaloVisual != null) hoverHaloVisual.Opacity = 0;
+            }
+            else
+            {
+                hoverAuroraScale.ScaleX = hoverAuroraScale.ScaleY = .82 + .18 * progress;
+                hoverAuroraRotate.Angle = progress * 26;
+                if (hoverAuroraA != null) hoverAuroraA.Opacity = .22 + .4 * progress;
+                if (hoverAuroraB != null) hoverAuroraB.Opacity = .22 + .42 * progress;
+                if (hoverAuroraC != null) hoverAuroraC.Opacity = .18 + .36 * progress;
+                if (hoverAuroraCrescent != null) hoverAuroraCrescent.Opacity = .06 + .2 * progress;
+                if (hoverHaloVisual != null) hoverHaloVisual.Opacity = hoverEffectPale ? .05 + .03 * progress : 0;
+            }
+        }
+        else
+        {
+            double readyElapsed = now - hoverEffectReadyAt;
+
+            double appear = 1 - Math.Pow(1 - Math.Clamp(readyElapsed / 340.0, 0, 1), 3);
+            double breath = .5 + .5 * Math.Sin(readyElapsed / 2600.0 * Math.PI * 2);
+            if (hoverReadyRing != null)
+            {
+                hoverReadyRing.Opacity = .46 * appear * (.9 + .1 * breath);
+                hoverReadyScale.ScaleX = hoverReadyScale.ScaleY = .92 + .08 * appear + .012 * breath;
+            }
+            if (hoverReadyRingOuter != null)
+            {
+                hoverReadyRingOuter.Opacity = .16 * appear * (.7 + .3 * breath);
+                hoverReadyOuterScale.ScaleX = hoverReadyOuterScale.ScaleY = .95 + .05 * appear + .03 * breath;
+            }
+            if (hoverHaloVisual != null)
+            {
+                double from = style == HoverEffects.Halo ? .52 : .30;
+                double to = style == HoverEffects.Halo ? .62 : .44;
+                hoverHaloVisual.Opacity = from + (to - from) * appear + .03 * breath;
+                hoverHaloScale.ScaleX = hoverHaloScale.ScaleY = 1 + .025 * appear + .015 * breath;
+            }
+            if (style == HoverEffects.Orbit)
+            {
+                // Keep the light orbiting while its tail recedes to a point and grows back.
+                double tailWave = Math.Clamp((.5 + .5 * Math.Cos(readyElapsed / 3000.0 * Math.PI * 2) - .12) / .88, 0, 1);
+                double tailLength = 1.7 * tailWave * tailWave * (3 - 2 * tailWave);
+                UpdateOrbit(-Math.PI / 2 + readyElapsed * .0017, tailLength, .9 * appear + .08 * breath);
+                if (hoverOrbitProgress != null) hoverOrbitProgress.Opacity = 0;
+                if (hoverOrbitTrack != null) hoverOrbitTrack.Opacity = .4 * appear + .04 * breath;
+                if (hoverReadyRing != null) hoverReadyRing.Opacity = .32 * appear * (.9 + .1 * breath);
+                if (hoverReadyRingOuter != null) hoverReadyRingOuter.Opacity = .14 * appear * (.7 + .3 * breath);
+                if (hoverHaloVisual != null) hoverHaloVisual.Opacity = 0;
+            }
+            else if (style == HoverEffects.Aurora)
+            {
+                if (hoverReadyRing != null) hoverReadyRing.Opacity = (hoverEffectPale ? .1 : .04) * appear * (.9 + .1 * breath);
+                if (hoverReadyRingOuter != null) hoverReadyRingOuter.Opacity = (hoverEffectPale ? .06 : .03) * appear;
+                if (hoverHaloVisual != null) hoverHaloVisual.Opacity = hoverEffectPale ? .07 + .02 * breath : 0;
+                hoverAuroraScale.ScaleX = hoverAuroraScale.ScaleY = 1.05 + .06 * breath;
+                hoverAuroraRotate.Angle = readyElapsed * .012;
+                if (hoverAuroraA != null) hoverAuroraA.Opacity = .65 * appear + .06 * breath;
+                if (hoverAuroraB != null) hoverAuroraB.Opacity = .6 * appear + .05 * breath;
+                if (hoverAuroraC != null) hoverAuroraC.Opacity = .5 * appear + .05 * breath;
+                if (hoverAuroraCrescent != null) hoverAuroraCrescent.Opacity = .22 * appear + .04 * breath;
+            }
+        }
+    }
+
+    void UpdateOrbit(double angle, double trail, double headOpacity)
+    {
+        if (hoverOrbitHead == null || hoverOrbitGlow == null) return;
+        double x = 60 + 20 * Math.Cos(angle);
+        double y = 60 + 20 * Math.Sin(angle);
+        Canvas.SetLeft(hoverOrbitHead, x - hoverOrbitHead.Width / 2);
+        Canvas.SetTop(hoverOrbitHead, y - hoverOrbitHead.Height / 2);
+        Canvas.SetLeft(hoverOrbitGlow, x - hoverOrbitGlow.Width / 2);
+        Canvas.SetTop(hoverOrbitGlow, y - hoverOrbitGlow.Height / 2);
+        hoverOrbitHead.Opacity = headOpacity;
+        hoverOrbitGlow.Opacity = headOpacity * (hoverEffectPale ? .55 : .9);
+        UpdateOrbitTrail(hoverOrbitTrailFigure, hoverOrbitTrailSegment, hoverOrbitTrail, angle, trail, headOpacity * .95, 3.8);
+        UpdateOrbitTrail(hoverOrbitTrailSoftFigure, hoverOrbitTrailSoftSegment, hoverOrbitTrailSoft, angle, trail, headOpacity * .2, 7);
+    }
+
+    static void UpdateOrbitTrail(PathFigure? figure, PolyLineSegment? segment, Microsoft.UI.Xaml.Shapes.Path? path, double angle, double trail, double opacity, double width)
+    {
+        if (figure == null || segment == null || path == null) return;
+        if (trail < .02 || opacity < .005)
+        {
+            path.Opacity = 0;
+            return;
+        }
+        double start = angle - trail;
+        figure.StartPoint = new Point(60 + 20 * Math.Cos(start), 60 + 20 * Math.Sin(start));
+        for (int i = 1; i <= 32; i++)
+        {
+            double t = i / 32.0, at = start + trail * t;
+            double radius = 20 + width * .5 * Math.Pow(t, .85);
+            segment.Points[i - 1] = new Point(60 + radius * Math.Cos(at), 60 + radius * Math.Sin(at));
+        }
+        for (int i = 32; i >= 0; i--)
+        {
+            double t = i / 32.0, at = start + trail * t;
+            double radius = 20 - width * .5 * Math.Pow(t, .85);
+            segment.Points[64 - i] = new Point(60 + radius * Math.Cos(at), 60 + radius * Math.Sin(at));
+        }
+        if (path.Fill is LinearGradientBrush fill)
+        {
+            fill.StartPoint = figure.StartPoint;
+            fill.EndPoint = new Point(60 + 20 * Math.Cos(angle), 60 + 20 * Math.Sin(angle));
+        }
+        path.Opacity = opacity;
+    }
+
+    void UpdateOrbitProgress(double progress)
+    {
+        if (hoverOrbitProgress == null || hoverOrbitProgressFigure == null || hoverOrbitProgressSegment == null) return;
+        progress = Math.Clamp(progress, 0, 1);
+        double end = -Math.PI / 2 + progress * Math.PI * 2;
+        hoverOrbitProgressFigure.StartPoint = new Point(60, 40);
+        hoverOrbitProgressSegment.Point = new Point(60 + 20 * Math.Cos(end), 60 + 20 * Math.Sin(end));
+        hoverOrbitProgressSegment.IsLargeArc = progress > .5;
+        hoverOrbitProgress.Opacity = progress > .02 ? .18 : 0;
+    }
+
+    bool TryGetHoverPoint(out Point point)
+    {
+        point = default;
+        var origin = new Win32Point();
+        if (!GetCursorPos(out Win32Point cursor) || !ClientToScreen(hwnd, ref origin)) return false;
+        double dpi = Math.Max(96, GetDpiForWindow(hwnd)) / 96.0;
+        point = new Point((cursor.X - origin.X) / dpi, (cursor.Y - origin.Y) / dpi);
+        return true;
     }
 
     void ToggleMouseClickThrough()
     {
         if (exiting || disposed) return;
         settings.MouseClickThrough = !settings.MouseClickThrough;
+        hoverDragArmed = false;
+        hoverDragSinceTick = 0;
+        ResetHoverHold();
         ApplyMouseClickThrough();
+        UpdateHoverDragMonitor();
         settingsWindow?.RefreshMouseClickThrough(settings.MouseClickThrough);
         Save(true);
     }
@@ -1620,6 +3839,7 @@ public sealed class MainWindow : Window
         if (exiting || disposed) return;
         native.Show();
         ApplyMouseClickThrough();
+        UpdateHoverDragMonitor();
         Activate();
         try
         {
@@ -1641,6 +3861,9 @@ public sealed class MainWindow : Window
         {
             Start = s.Start,
             End = s.End,
+            LunchEnabled = s.LunchEnabled,
+            LunchStart = s.LunchStart,
+            LunchEnd = s.LunchEnd,
             WorkScheduleMode = s.WorkScheduleMode,
             WorkSchedules = s.WorkSchedules != null ? s.WorkSchedules.ConvertAll(p => new WorkScheduleProfile { Mode = p.Mode, Start = p.Start, End = p.End, SaturdayEnabled = p.SaturdayEnabled, SaturdayStart = p.SaturdayStart, SaturdayEnd = p.SaturdayEnd, DayTimes = p.DayTimes != null ? p.DayTimes.ConvertAll(d => new DayWorkTime { Day = d.Day, Enabled = d.Enabled, Start = d.Start, End = d.End }) : new System.Collections.Generic.List<DayWorkTime>() }) : new System.Collections.Generic.List<WorkScheduleProfile>(),
             Salary = 0, // privacy protected
@@ -1648,6 +3871,8 @@ public sealed class MainWindow : Window
             PayDay = s.PayDay,
             Topmost = s.Topmost,
             MouseClickThrough = s.MouseClickThrough,
+            HoverDragSeconds = s.HoverDragSeconds,
+            HoverEffect = HoverEffects.Normalize(s.HoverEffect),
             NightMode = s.NightMode,
             AutomaticAppearance = s.AutomaticAppearance,
             PetId = s.PetId,
@@ -1659,9 +3884,19 @@ public sealed class MainWindow : Window
             DoubleRestWeekStart = s.DoubleRestWeekStart,
             HideAmount = true,
             ShowSalaryLayout = s.ShowSalaryLayout,
+            WishEnabled = s.WishEnabled,
+            WishName = s.WishName,
+            WishTarget = s.WishTarget,
+            WishSaved = s.WishSaved,
             AmountVisibleSeconds = s.AmountVisibleSeconds,
             WaterReminder = s.WaterReminder,
             WalkReminder = s.WalkReminder,
+            ReminderPopup = s.ReminderPopup,
+            ReminderPosition = s.ReminderPosition,
+            ReminderX = s.ReminderX,
+            ReminderY = s.ReminderY,
+            ReminderWidth = s.ReminderWidth,
+            ReminderHeight = s.ReminderHeight,
             WaterMinutes = s.WaterMinutes,
             WalkMinutes = s.WalkMinutes,
             Scale = s.Scale,
@@ -1713,6 +3948,8 @@ public sealed class MainWindow : Window
         if (exiting) return; exiting = true;
         try
         {
+            EndDrag(null);
+            RememberWindowPosition();
             if (!smoke)
             {
                 long revision = System.Threading.Interlocked.Increment(ref saveRevision);
@@ -1742,10 +3979,28 @@ public sealed class MainWindow : Window
         if (disposed) return;
         try { EndDrag(null); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
         disposed = true;
+        hoverDragArmed = false;
+        ResetHoverHold();
+        HideHoverEffect();
+        hoverDragTimer?.Stop();
+        dragReleaseTimer?.Stop();
         CloseCoinLayer();
+        petAnimationRevision++;
+        if (petEnterHook != IntPtr.Zero) { UnhookWindowsHookEx(petEnterHook); petEnterHook = IntPtr.Zero; }
+        petEnterHookProc = null;
+        petHoverTimer?.Stop(); petAnimation?.Dispose(); petAnimation = null;
+        coinPetActive = false;
+        coinPetAnimation?.Dispose(); coinPetAnimation = null;
+        reminderAnimationRevision++;
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        CloseReminderPopup();
+        reminderPetActive = false; pendingReminders = reminderDue = 0;
+        petBreathing?.Stop();
 
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
         timer?.Stop();
+        startupRevealTimer?.Stop();
+        scalePreviewSettleTimer?.Stop();
         walkTimer?.Stop();
         smokeTimer?.Stop();
         if (sessionNotificationRegistered) { WTSUnRegisterSessionNotification(hwnd); sessionNotificationRegistered = false; }
@@ -1763,13 +4018,16 @@ public sealed class MainWindow : Window
         statsAppearanceClock.Stop(); textAppearanceClock.Stop(); glassAppearanceClock.Stop();
         stats.Background = null;
         glass.Dispose();
-        try { timeEndPeriod(1); } catch { }
         privacy.Dispose();
         GlassProfile.Shutdown();
     }
 
     [StructLayout(LayoutKind.Sequential)] struct NativeClientRect { internal int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out NativeClientRect rect);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Win32Point point);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr parent);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint command);
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
     [DllImport("user32.dll")] static extern int FillRect(IntPtr dc, ref NativeClientRect rect, IntPtr brush);
@@ -1781,6 +4039,8 @@ public sealed class MainWindow : Window
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out Win32Point lpPoint);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+    const int VK_LBUTTON = 0x01;
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? title);
@@ -1791,9 +4051,9 @@ public sealed class MainWindow : Window
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool SetProp(IntPtr hwnd, string name, IntPtr value);
     [DllImport("user32.dll", SetLastError = true)] static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);
     [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int cx, int cy);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int x1, int y1, int x2, int y2);
+    [DllImport("gdi32.dll")] static extern int CombineRgn(IntPtr destination, IntPtr first, IntPtr second, int mode);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr value);
-    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint uPeriod);
-    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint uPeriod);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     const int GWL_STYLE = -16;
@@ -1808,5 +4068,19 @@ public sealed class MainWindow : Window
     const int WS_EX_APPWINDOW = 0x00040000;
     const int WS_EX_LAYERED = 0x00080000;
     const int WS_EX_TRANSPARENT = 0x00000020;
+    const uint GA_ROOT = 2;
+    const uint GW_HWNDNEXT = 2;
     [DllImport("user32.dll")] static extern bool SetLayeredWindowAttributes(IntPtr window, uint colorKey, byte alpha, uint flags);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct MonitorInfoEx
+    {
+        internal int Size;
+        internal NativeClientRect MonitorRect;
+        internal NativeClientRect WorkRect;
+        internal uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] internal string Device;
+    }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Win32Point point, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfoEx info);
 }

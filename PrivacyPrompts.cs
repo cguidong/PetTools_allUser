@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using System.Threading;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Microsoft.UI.Windowing;
@@ -78,6 +79,9 @@ namespace OffWorkWidget.WinUI
             if (mode == Mode.Reset) panel.Children.Add(consent);
             panel.Children.Add(error);
             bool resetRequested = false;
+            bool submitting = false, closed = false;
+            using var cancellation = new CancellationTokenSource();
+            var form = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
             var dialog = new ContentDialog
             {
                 XamlRoot = root,
@@ -85,7 +89,7 @@ namespace OffWorkWidget.WinUI
                 Background = SurfaceBrush(dark), BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(14),
                 Title = mode == Mode.Unlock ? "验证密码" : mode == Mode.Create ? "设置金额密码" :
                     mode == Mode.Change ? "修改金额密码" : "忘记密码 · 重置",
-                Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
+                Content = form,
                 PrimaryButtonText = mode == Mode.Unlock ? "验证并显示" : mode == Mode.Reset ? "归零并重设" : "保存密码",
                 CloseButtonText = "取消",
                 DefaultButton = ContentDialogButton.Primary
@@ -101,7 +105,7 @@ namespace OffWorkWidget.WinUI
                     BorderThickness = new Thickness(0),
                     Background = FieldBrush(dark)
                 };
-                forgot.Click += (_, _) => { resetRequested = true; dialog.Hide(); };
+                forgot.Click += (_, _) => { if (submitting) return; resetRequested = true; dialog.Hide(); };
                 panel.Children.Add(forgot);
             }
             bool succeeded = false;
@@ -110,13 +114,26 @@ namespace OffWorkWidget.WinUI
                 (mode == Mode.Unlock || mode == Mode.Change ? current : next).Focus(FocusState.Programmatic);
                 if (hostedWindow != null) FitHostedDialog(hostedWindow, root, dialog, panel);
             };
-            dialog.PrimaryButtonClick += delegate(ContentDialog sender, ContentDialogButtonClickEventArgs args)
+            var hostAppWindow = hostedWindow?.AppWindow;
+            Windows.Foundation.TypedEventHandler<ContentDialog, ContentDialogClosingEventArgs> closing = (_, _) => { WinUI.GlassProfile.Event("privacy-closing"); if (!succeeded) cancellation.Cancel(); };
+            Windows.Foundation.TypedEventHandler<ContentDialog, ContentDialogClosedEventArgs> dialogClosed = (_, _) => { WinUI.GlassProfile.Event("privacy-closed"); closed = true; cancellation.Cancel(); };
+            Windows.Foundation.TypedEventHandler<AppWindow, AppWindowClosingEventArgs> hostClosing = (_, _) => cancellation.Cancel();
+            dialog.Closing += closing;
+            dialog.Closed += dialogClosed;
+            if (hostAppWindow != null) hostAppWindow.Closing += hostClosing;
+            dialog.PrimaryButtonClick += async (ContentDialog sender, ContentDialogButtonClickEventArgs args) =>
             {
+                if (submitting || cancellation.IsCancellationRequested) { args.Cancel = true; return; }
+                var deferral = args.GetDeferral();
+                WinUI.GlassProfile.Event("privacy-submit");
+                submitting = true;
+                dialog.IsPrimaryButtonEnabled = false;
+                form.IsEnabled = false;
                 try
                 {
                     if (mode == Mode.Unlock)
                     {
-                        if (!store.Verify(current.Password)) throw new ArgumentException("密码不正确，请重新输入。");
+                        if (!await store.VerifyAsync(current.Password, cancellation.Token)) throw new ArgumentException("密码不正确，请重新输入。");
                     }
                     else
                     {
@@ -124,26 +141,44 @@ namespace OffWorkWidget.WinUI
                         if (next.Password != confirm.Password) throw new ArgumentException("两次输入的新密码不一致。");
                         if (mode == Mode.Reset && consent.IsChecked != true)
                             throw new ArgumentException("请先确认清除原密码并将薪资归零。");
-                        if (mode == Mode.Create) store.SetInitialPassword(next.Password);
-                        else if (mode == Mode.Change) store.ChangePassword(current.Password, next.Password);
-                        else store.ResetPasswordAndSalary(next.Password);
+                        if (mode == Mode.Create) await store.SetInitialPasswordAsync(next.Password, cancellation.Token);
+                        else if (mode == Mode.Change) await store.ChangePasswordAsync(current.Password, next.Password, cancellation.Token);
+                        else await store.ResetPasswordAndSalaryAsync(next.Password, cancellation.Token);
                     }
                     succeeded = true;
+                    WinUI.GlassProfile.Event("privacy-succeeded");
                 }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { WinUI.GlassProfile.Event("privacy-canceled"); }
                 catch (Exception ex)
                 {
+                    WinUI.GlassProfile.Event("privacy-error-" + ex.GetType().Name);
+                    if (closed || cancellation.IsCancellationRequested) return;
                     args.Cancel = true;
                     error.Text = ex.Message;
                     error.Visibility = Visibility.Visible;
                     if (hostedWindow != null) FitHostedDialog(hostedWindow, root, dialog, panel);
                     current.Password = string.Empty;
-                    (mode == Mode.Unlock || mode == Mode.Change ? current : next).Focus(FocusState.Programmatic);
+                }
+                finally
+                {
+                    submitting = false;
+                    if (!closed && !cancellation.IsCancellationRequested)
+                    {
+                        dialog.IsPrimaryButtonEnabled = true;
+                        form.IsEnabled = true;
+                        if (args.Cancel) (mode == Mode.Unlock || mode == Mode.Change ? current : next).Focus(FocusState.Programmatic);
+                    }
+                    deferral.Complete();
                 }
             };
             ContentDialogResult result;
             try { result = await dialog.ShowAsync(); }
             finally
             {
+                cancellation.Cancel();
+                dialog.Closing -= closing;
+                dialog.Closed -= dialogClosed;
+                if (hostAppWindow != null) hostAppWindow.Closing -= hostClosing;
                 current.Password = string.Empty;
                 next.Password = string.Empty;
                 confirm.Password = string.Empty;

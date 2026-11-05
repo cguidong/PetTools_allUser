@@ -24,11 +24,13 @@ internal static class WindowBackdropCapture
         internal int Width { get; init; }
         internal int Height { get; init; }
         internal byte[] PixelsBGRA { get; init; } = Array.Empty<byte>();
-        internal double Luminance { get; init; } = .5;
-        internal double TextLuminance { get; init; } = .5;
         internal int CapturedWindows { get; init; }
         internal string? Error { get; init; }
         internal bool PendingRegion { get; init; }
+        internal int ScreenX { get; init; }
+        internal int ScreenY { get; init; }
+        internal ulong LayoutStamp { get; init; }
+        internal IntPtr[] SourceWindows { get; init; } = Array.Empty<IntPtr>();
         internal bool Success => Error == null && PixelsBGRA.Length != 0;
     }
 
@@ -376,8 +378,37 @@ internal static class WindowBackdropCapture
         return stamp;
     }
 
+    // A pending replacement must not keep pixels from a source that left the desktop.
+    internal static bool CanReuseFrame(Frame frame) => Array.TrueForAll(frame.SourceWindows, IsWindowAvailable);
+
+    // Even a desktop-only snapshot becomes stale when a window enters its screen region.
+    internal static bool CanReuseFrame(Frame frame, IntPtr excludedHandle, int x, int y, int width, int height) =>
+        !frame.PendingRegion && frame.ScreenX == x && frame.ScreenY == y &&
+        frame.Width == width && frame.Height == height && CanReuseFrame(frame) &&
+        frame.LayoutStamp == GetLayoutStamp(excludedHandle, x, y, width, height);
+
+    // A complete texture can bridge a moving crop request without publishing a lower-layer flash.
+    // This is a display hold only; the caller must keep requesting fresh frames during the drag.
+    internal static bool CanHoldFrameDuringDrag(Frame frame, int x, int y, int width, int height) =>
+        !frame.PendingRegion && frame.SourceWindows.Length != 0 &&
+        FrameCovers(frame, x, y, width, height) && CanReuseFrame(frame);
+
+    internal static bool FrameCovers(Frame frame, int x, int y, int width, int height) =>
+        frame.Success && width > 0 && height > 0 && x >= frame.ScreenX && y >= frame.ScreenY &&
+        (long)x + width <= (long)frame.ScreenX + frame.Width &&
+        (long)y + height <= (long)frame.ScreenY + frame.Height;
+
+    internal static bool IsWindowAvailable(IntPtr window) =>
+        IsWindow(window) && IsWindowVisible(window) && !IsIconic(window) && !IsCloaked(window);
+
+    // On Windows 10, do not ask Chromium to repaint while its GPU capture is unavailable.
+    // The previous complete scene is retained until a compositor frame is ready.
+    internal static bool AvoidBrowserPrintFallback(string className, bool windows11OrNewer) =>
+        !windows11OrNewer && className.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal);
+
     internal static Frame CaptureAt(IntPtr excludedHandle, int targetX, int targetY, int width, int height,
-        byte[]? reusableOutput = null, byte[]? sliceBuffer = null)
+        byte[]? reusableOutput = null, byte[]? sliceBuffer = null, bool preservePendingScene = true,
+        bool avoidBlockingSources = false)
     {
         // Capture underlying windows individually so the widget can remain visible
         // to remote desktop and screenshots without sampling itself.
@@ -388,8 +419,19 @@ internal static class WindowBackdropCapture
                 return Failed("背景采样必须在工作线程执行。", width, height, captured);
             if (width <= 0 || height <= 0 || (long)width * height > 8_000_000)
                 return Failed("组件尺寸超出采样范围。", width, height, captured);
+            if (ScreenCaptureExperiment.Enabled)
+            {
+                if (!ScreenCaptureExperiment.AffinityReady)
+                    return Failed("实验采样无法排除挂件，已停止采样。", width, height, captured);
+                byte[] pixels = ScreenCaptureExperiment.Capture(targetX, targetY, width, height, reusableOutput);
+                return new Frame { Width = width, Height = height, PixelsBGRA = pixels,
+                    CapturedWindows = 1, ScreenX = targetX, ScreenY = targetY,
+                    LayoutStamp = GetLayoutStamp(excludedHandle, targetX, targetY, width, height) };
+            }
             var target = new Rect(targetX, targetY, checked(targetX + width), checked(targetY + height));
+            ulong sceneLayout = GetLayoutStamp(excludedHandle, targetX, targetY, width, height);
             var uncovered = new List<Rect> { target };
+            var sourceWindows = new List<IntPtr>();
             int outputLength = checked(width * height * 4);
             var output = reusableOutput?.Length == outputLength ? reusableOutput : new byte[outputLength];
             if (ReferenceEquals(output, reusableOutput)) Array.Clear(output);
@@ -413,7 +455,7 @@ internal static class WindowBackdropCapture
                 // Only the widget itself starts the below-widget Z-order range.
                 if (window == excludedHandle) return true;
                 if (IsDesktopWindow(window)) return true;
-                if (!IsWindowVisible(window) || IsIconic(window) || IsCloaked(window)) return true;
+                if (!IsWindowAvailable(window)) return true;
                 if (!GetWindowVisualBounds(window, out Rect bounds)) return true;
 
                 // Check if bounds intersects any piece in uncovered
@@ -439,7 +481,13 @@ internal static class WindowBackdropCapture
                     using var frameLease = frame;
                     // A resized HWND can expose PrintWindow's stale black backing.
                     // Wait for a matching compositor snapshot instead of stretching it.
-                    if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds)) return true;
+                    if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds))
+                    {
+                        CompositorWindowCapture.RequestRefresh(window);
+                        pendingRegion = true;
+                        return !preservePendingScene;
+                    }
+                    if (!IsWindowAvailable(window)) return true;
                     var fullBounds = frameBounds;
                     frameBounds = new Rect(frameBounds.Left + frame.PixelLeft, frameBounds.Top + frame.PixelTop,
                         frameBounds.Left + frame.PixelLeft + frame.PixelWidth, frameBounds.Top + frame.PixelTop + frame.PixelHeight);
@@ -449,7 +497,7 @@ internal static class WindowBackdropCapture
                     {
                         CompositorWindowCapture.RequestRefresh(window);
                         pendingRegion = true;
-                        return false;
+                        return !preservePendingScene;
                     }
                     if (!GetWindowRect(window, out Rect nativeBounds)) return true;
                     var compositorCoverage = new List<Rect>();
@@ -462,20 +510,34 @@ internal static class WindowBackdropCapture
                             if (Intersect(remaining, visible, out Rect hit) && Intersect(hit, frameBounds, out Rect clipped))
                                 CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
                     hasTransparency = true;
+                    sourceWindows.Add(window);
                     captured++;
                     uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
                     return uncovered.Count > 0;
                 }
-                // Keep the previous complete scene during GPU warm-up. PrintWindow
+                // Keep a still-valid scene during GPU warm-up; otherwise fill from lower layers. PrintWindow
                 // can synchronously stall the source app's UI (notably Qt windows).
                 if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.IsStarting(window))
                 {
                     pendingRegion = true;
-                    return false;
+                    return !preservePendingScene;
                 }
+                // PrintWindow sends paint requests into the source browser. On Windows 10
+                // keep the last valid glass scene instead of repeatedly repainting Chromium.
+                if (AvoidBrowserPrintFallback(windowClass.ToString(), OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)))
+                {
+                    pendingRegion = true;
+                    return !preservePendingScene;
+                }
+
                 // PrintWindow flattens transparent screenshot/glass windows onto black.
                 // Only ordinary opaque windows may use it while compositor capture warms up.
-                if (requiresAlpha) return true;
+                if (requiresAlpha)
+                {
+                    // An unavailable GPU source is not uncovered desktop wallpaper.
+                    pendingRegion = true;
+                    return !preservePendingScene;
+                }
 
                 var trayCoverage = IsTrayOverflowWindow(window) ? new List<Rect>() : null;
                 var windowCoverage = new List<Rect>();
@@ -487,9 +549,18 @@ internal static class WindowBackdropCapture
 
                 if (pieces.Count != 0)
                 {
-                    byte[]? slice = CaptureWindowSlice(window, bounds, target, sliceBuffer, trayCoverage, windowCoverage);
-                    if (slice != null)
+                    // PrintWindow is synchronous and can stall the source app (notably
+                    // Qt) while it is moving behind the widget. Hold the previous
+                    // complete scene instead of repainting a moving source.
+                    if (avoidBlockingSources)
                     {
+                        pendingRegion = true;
+                        return !preservePendingScene;
+                    }
+                    byte[]? slice = CaptureWindowSlice(window, bounds, target, sliceBuffer, trayCoverage, windowCoverage);
+                    if (slice != null && IsWindowAvailable(window))
+                    {
+                        sourceWindows.Add(window);
                         pieces.Clear();
                         foreach (Rect remaining in uncovered)
                             foreach (Rect visible in windowCoverage)
@@ -534,6 +605,9 @@ internal static class WindowBackdropCapture
                 return uncovered.Count > 0;
             }, IntPtr.Zero);
 
+            // A window under the widget that is still warming up is not uncovered
+            // desktop wallpaper. Publish a pending frame and let the glass hold the
+            // last complete layer instead of flashing a lower layer during fast drags.
             if (pendingRegion)
                 return new Frame { Error = "等待背景裁剪更新。", PendingRegion = true };
 
@@ -542,24 +616,15 @@ internal static class WindowBackdropCapture
             {
                 IntPtr deskHost = GetDesktopHostHandle();
                 byte[]? deskSlice = null;
+                bool opaqueDesktopFrame = false;
                 if (deskHost != IntPtr.Zero && GetWindowVisualBounds(deskHost, out Rect deskBounds))
                 {
-                    deskSlice = CaptureDesktopSlice(deskHost, deskBounds, target, sliceBuffer);
+                    deskSlice = CaptureDesktopSlice(deskHost, deskBounds, target, sliceBuffer, out opaqueDesktopFrame);
                 }
 
-                // Check if deskSlice has wallpaper content
-                int blackPixels = 0;
-                if (deskSlice != null)
-                {
-                    for (int i = 0; i < deskSlice.Length; i += 4)
-                    {
-                        if (deskSlice[i] == 0 && deskSlice[i + 1] == 0 && deskSlice[i + 2] == 0)
-                            blackPixels++;
-                    }
-                }
-
-                int totalPixels = width * height;
-                bool deskSliceHasWallpaper = deskSlice != null && (blackPixels * 2 < totalPixels);
+                // Valid opaque compositor frames may contain a black wallpaper or video.
+                // The RGB heuristic is only for legacy shell screenshots with no reliable alpha.
+                bool deskSliceHasWallpaper = HasDesktopContent(deskSlice, width * height, opaqueDesktopFrame);
 
                 if (deskSlice != null && deskSliceHasWallpaper)
                 {
@@ -655,38 +720,16 @@ internal static class WindowBackdropCapture
 
             for (int index = 3; index < output.Length; index += 4) output[index] = 255;
 
-            double totalLight = 0;
-            int totalSamples = 0;
-            double textLight = 0;
-            int textSamples = 0;
-            int textBoundaryX = (int)(width * 0.55);
-
-            for (int y = 0; y < height; y += 4)
-            {
-                int rowOffset = y * width * 4;
-                for (int x = 0; x < width; x += 4)
-                {
-                    int index = rowOffset + x * 4;
-                    if (index + 2 >= output.Length) break;
-                    double lum = (output[index] * .0722 + output[index + 1] * .7152 + output[index + 2] * .2126) / 255.0;
-                    totalLight += lum;
-                    totalSamples++;
-                    if (x <= textBoundaryX)
-                    {
-                        textLight += lum;
-                        textSamples++;
-                    }
-                }
-            }
-
+            // Card and text-region analysis is performed by DesktopGlassSource on the capture worker.
             return new Frame
             {
                 Width = width,
                 Height = height,
                 PixelsBGRA = output,
-                Luminance = totalSamples == 0 ? .5 : totalLight / totalSamples,
-                TextLuminance = textSamples == 0 ? .5 : textLight / textSamples,
-                CapturedWindows = captured
+                CapturedWindows = captured,
+                SourceWindows = sourceWindows.ToArray(),
+                ScreenX = targetX, ScreenY = targetY, LayoutStamp = sceneLayout,
+                PendingRegion = pendingRegion
             };
         }
         catch (Exception exception)
@@ -888,8 +931,20 @@ internal static class WindowBackdropCapture
     private static bool refreshingSnapshot;
     private const int SnapshotPixelBudget = 12_000_000;
 
-    private static byte[]? CaptureDesktopSlice(IntPtr window, Rect bounds, Rect target, byte[]? reusable)
+    internal static bool HasDesktopContent(byte[]? pixels, int pixelCount, bool opaqueCompositor)
     {
+        if (pixels == null || pixelCount <= 0 || (long)pixelCount * 4 > pixels.Length) return false;
+        if (opaqueCompositor) return true;
+        int blackPixels = 0;
+        for (int i = 0; i < pixelCount * 4; i += 4)
+            if (pixels[i] == 0 && pixels[i + 1] == 0 && pixels[i + 2] == 0) blackPixels++;
+        return blackPixels * 2 < pixelCount;
+    }
+
+    private static byte[]? CaptureDesktopSlice(IntPtr window, Rect bounds, Rect target, byte[]? reusable,
+        out bool opaqueCompositor)
+    {
+        opaqueCompositor = false;
         int width = target.Right - target.Left, height = target.Bottom - target.Top;
         // Observe the shell without asking Explorer to repaint an entire monitor.
         // Retain the compatibility snapshot only as a bounded fallback.
@@ -916,7 +971,12 @@ internal static class WindowBackdropCapture
                         for (int x = needed.Left; x < needed.Right; x++)
                             if (slice[((y - target.Top) * width + x - target.Left) * 4 + 3] != 255)
                             { opaque = false; break; }
-                    if (opaque) return slice;
+                    if (opaque)
+                    {
+                        opaqueCompositor = needed.Left == target.Left && needed.Top == target.Top &&
+                            needed.Right == target.Right && needed.Bottom == target.Bottom;
+                        return slice;
+                    }
                 }
                 else CompositorWindowCapture.RequestRefresh(window);
             }
@@ -927,7 +987,7 @@ internal static class WindowBackdropCapture
     private static byte[]? CaptureWindowSlice(IntPtr window, Rect bounds, Rect target, byte[]? reusable = null,
         List<Rect>? trayCoverage = null, List<Rect>? windowCoverage = null, int minimumRefreshMilliseconds = 100)
     {
-        if (!GetWindowRect(window, out bounds)) return null;
+        if (!IsWindowAvailable(window) || !GetWindowRect(window, out bounds)) return null;
         int width = bounds.Right - bounds.Left, height = bounds.Bottom - bounds.Top;
         if (width <= 0 || height <= 0 || (long)width * height > SnapshotPixelBudget)
         {
@@ -941,7 +1001,7 @@ internal static class WindowBackdropCapture
         {
             var expired = new List<IntPtr>();
             foreach (var entry in snapshots)
-                if (now - entry.Value.Used >= 10000 || !IsWindow(entry.Key)) expired.Add(entry.Key);
+                if (now - entry.Value.Used >= 10000 || !IsWindowAvailable(entry.Key)) expired.Add(entry.Key);
             foreach (var key in expired) snapshots.Remove(key);
             snapshots.TryGetValue(window, out snapshot);
             if (snapshot != null && (snapshot.Width != width || snapshot.Height != height))
@@ -989,11 +1049,11 @@ internal static class WindowBackdropCapture
                         byte[]? fresh = null;
                         Rect[] coverage = Array.Empty<Rect>();
                         lock (printLock)
-                            if (GetWindowRect(window, out Rect current) && current.Right - current.Left == width && current.Bottom - current.Top == height)
+                            if (IsWindowAvailable(window) && GetWindowRect(window, out Rect current) && current.Right - current.Left == width && current.Bottom - current.Top == height)
                                 fresh = CaptureShapedWindow(window, current, pending.Spare, out coverage);
                         lock (snapshotLock)
                         {
-                            if (fresh != null && snapshots.TryGetValue(window, out var existing) && ReferenceEquals(existing, pending))
+                            if (fresh != null && IsWindowAvailable(window) && snapshots.TryGetValue(window, out var existing) && ReferenceEquals(existing, pending))
                             {
                                 pending.Spare = pending.Pixels;
                                 pending.Pixels = fresh;
@@ -1109,7 +1169,7 @@ internal static class WindowBackdropCapture
     {
         // PrintWindow includes the non-client frame. DWM visual bounds can exclude
         // invisible resize borders, so they must not be used as the bitmap origin.
-        if (!GetWindowRect(window, out bounds)) return null;
+        if (!IsWindowAvailable(window) || !GetWindowRect(window, out bounds)) return null;
         int targetW = target.Right - target.Left;
         int targetH = target.Bottom - target.Top;
         if (targetW <= 0 || targetH <= 0 || targetW > 4096 || targetH > 4096)

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Globalization;
 
 namespace OffWorkWidget
@@ -25,10 +25,30 @@ namespace OffWorkWidget
         public string SaturdayStart = "09:00";
         public string SaturdayEnd = "12:00";
     }
+    public static class HoverEffects
+    {
+        public const string Halo = "halo";
+        public const string Aurora = "aurora";
+        public const string Orbit = "orbit";
+        public static string Normalize(string? value) =>
+            value == Aurora || value == "ticks" ? Aurora
+            : value == Orbit ? Orbit
+            : Halo;
+        public static string DisplayName(string? value)
+        {
+            string normalized = Normalize(value);
+            return normalized == Aurora ? "液态极光"
+                : normalized == Orbit ? "轨道光点"
+                : "柔光呼吸";
+        }
+    }
     public class Settings
     {
         public string Start = "09:00";
         public string End = "18:00";
+        public bool LunchEnabled = true; // Retained for compatibility with older settings files.
+        public string LunchStart = "12:00";
+        public string LunchEnd = "13:00";
         public string WorkScheduleMode = "";
         public System.Collections.Generic.List<WorkScheduleProfile> WorkSchedules = new System.Collections.Generic.List<WorkScheduleProfile>();
         public decimal Salary = 8000;
@@ -36,9 +56,11 @@ namespace OffWorkWidget
         public int PayDay = 10;
         public bool Topmost = true;
         public bool MouseClickThrough = false;
+        public int HoverDragSeconds = 3;
+        public string HoverEffect = HoverEffects.Halo;
         public bool NightMode = false;
         public bool AutomaticAppearance = true;
-        public string PetId = "cow-cat";
+        public string PetId = "polar-bear";
         public bool UseChinaHolidays = true;
         internal ChinaHolidayCalendar Calendar;
         public int RestDays = 65; // Sunday = bit 0, Saturday = bit 6.
@@ -47,11 +69,21 @@ namespace OffWorkWidget
         public bool AlternatingWeekends = false;
         public string DoubleRestWeekStart = "";
         public System.Collections.Generic.List<DateAdjustment> DateAdjustments = new System.Collections.Generic.List<DateAdjustment>();
+        public bool WishEnabled = false;
+        public string WishName = "";
+        public decimal WishTarget = 0;
+        public decimal WishSaved = 0;
         public bool HideAmount = true;
         public bool ShowSalaryLayout = false;
         public int AmountVisibleSeconds = 0;
         public bool WaterReminder = true;
         public bool WalkReminder = true;
+        public bool ReminderPopup = false;
+        public string ReminderPosition = "bottom-right";
+        public int ReminderX = 0;
+        public int ReminderY = 0;
+        public double ReminderWidth = 360;
+        public double ReminderHeight = 205;
         public int WaterMinutes = 60;
         public int WalkMinutes = 90;
         public double Scale = 1;
@@ -190,7 +222,17 @@ namespace OffWorkWidget
             if (!WorkingDay(now, s)) return 0;
             var hours = WorkHours(now, s);
             double start = hours.Start.TotalSeconds, end = hours.End.TotalSeconds;
-            double ratio = Math.Max(0, Math.Min(1, (now.TimeOfDay.TotalSeconds - start) / (end - start)));
+            double elapsed = Math.Max(0, Math.Min(end - start, now.TimeOfDay.TotalSeconds - start));
+            double duration = end - start;
+            // Lunch is always applied, including when an older settings file stored false.
+            double lunchStart = Math.Max(start, Time(s.LunchStart).TotalSeconds);
+            double lunchEnd = Math.Min(end, Time(s.LunchEnd).TotalSeconds);
+            if (lunchEnd > lunchStart)
+            {
+                duration -= lunchEnd - lunchStart;
+                elapsed -= Math.Max(0, Math.Min(now.TimeOfDay.TotalSeconds, lunchEnd) - lunchStart);
+            }
+            double ratio = duration > 0 ? Math.Max(0, Math.Min(1, elapsed / duration)) : 0;
             return s.Salary / s.WorkDays * (decimal)ratio;
         }
         public static int UntilPay(DateTime now, int day)
@@ -202,6 +244,12 @@ namespace OffWorkWidget
         public static void Validate(Settings s)
         {
             if (Time(s.End) <= Time(s.Start)) throw new FormatException("下班时间须晚于上班时间，当前版本支持当天班次。");
+            // Validate lunch even when an older settings file stored LunchEnabled=false.
+            try
+            {
+                if (Time(s.LunchEnd) <= Time(s.LunchStart)) throw new FormatException();
+            }
+            catch (FormatException) { throw new FormatException("午休结束时间须晚于开始时间，格式为 HH:mm。"); }
             var modes = new System.Collections.Generic.HashSet<string>();
             if (s.WorkScheduleMode != "" && s.WorkScheduleMode != "double" && s.WorkScheduleMode != "single" && s.WorkScheduleMode != "alternating" && s.WorkScheduleMode != "custom")
                 throw new FormatException("工作时间所属休息规则无效。");
@@ -241,7 +289,21 @@ namespace OffWorkWidget
                 throw new FormatException("请检查月薪、月计薪天数（大于 0 且不超过 31）和发薪日（1–31）。");
             try { _ = 100000000m / s.WorkDays; }
             catch (OverflowException) { throw new FormatException("计薪天数过小，超出薪资计算范围，请增大计薪天数。"); }
+            if (s.WishEnabled)
+            {
+                if (string.IsNullOrWhiteSpace(s.WishName)) throw new FormatException("请填写心愿名称。");
+                if (s.WishTarget <= 0 || s.WishTarget > 100000000m) throw new FormatException("心愿目标金额须大于 0 且不超过 1 亿元。");
+                if (s.WishSaved < 0 || s.WishSaved > 100000000m) throw new FormatException("已攒金额须在 0 到 1 亿元之间。");
+            }
             if (s.WaterMinutes < 1 || s.WaterMinutes > 720 || s.WalkMinutes < 1 || s.WalkMinutes > 720) throw new FormatException("提醒间隔须为 1–720 分钟。");
+            if (s.ReminderPosition != "custom" && s.ReminderPosition != "center" && s.ReminderPosition != "top-left" && s.ReminderPosition != "top-center" && s.ReminderPosition != "top-right" &&
+                s.ReminderPosition != "center-left" && s.ReminderPosition != "center-right" && s.ReminderPosition != "bottom-left" &&
+                s.ReminderPosition != "bottom-center" && s.ReminderPosition != "bottom-right")
+                throw new FormatException("提醒弹窗位置无效。");
+            if (double.IsNaN(s.ReminderWidth) || double.IsInfinity(s.ReminderWidth) || s.ReminderWidth < 280 || s.ReminderWidth > 800 ||
+                double.IsNaN(s.ReminderHeight) || double.IsInfinity(s.ReminderHeight) || s.ReminderHeight < 190 || s.ReminderHeight > 600)
+                throw new FormatException("提醒弹窗宽度须为 280–800，高度须为 190–600。");
+            if (s.HoverDragSeconds < 1 || s.HoverDragSeconds > 3) throw new FormatException("穿透悬停拖动时长须为 1–3 秒。");
             if (s.AmountVisibleSeconds < 0 || s.AmountVisibleSeconds > 86400) throw new FormatException("金额显示时长须为 0–86400 秒，0 表示一直显示。");
             if (s.RestDays < 0 || s.RestDays > 127) throw new FormatException("休息日设置无效。");
             if (s.SingleRestDays < 0 || s.SingleRestDays > 127 || RestDayCount(s.SingleRestDays) != 1)
