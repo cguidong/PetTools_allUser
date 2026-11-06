@@ -16,7 +16,7 @@ namespace OffWorkWidget.WinUI;
 // Windows 10 uses square corners; high contrast uses system window/highlight colors.
 internal sealed class TrayMenuWindow : Window
 {
-    const double MenuWidth = 156, MenuHeight = 119;
+    const double MenuWidth = 136, MenuHeight = 119;
     readonly Action<uint> selected;
     readonly Action dismissed;
     readonly IntPtr hwnd;
@@ -246,5 +246,7 @@ internal sealed class TrayMenuWindow : Window
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);
+    [StructLayout(LayoutKind.Sequential)] struct Margins { internal int Left, Right, Top, Bottom; }
+    [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref Margins margins);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 }

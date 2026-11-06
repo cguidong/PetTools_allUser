@@ -2,7 +2,8 @@
 
 namespace OffWorkWidget
 {
-    // Count time only while the app is running inside a configured work session.
+    // Count time only while the app is running inside a configured work session,
+    // excluding the lunch break; counters restart at zero after lunch.
     public class ReminderSchedule
     {
         DateTime lastWall;
@@ -17,7 +18,9 @@ namespace OffWorkWidget
         public int Tick(DateTime now, TimeSpan elapsed, Settings settings)
         {
             var hours = Logic.WorkHours(now, settings);
-            bool active = Logic.WorkingDay(now, settings) && now.TimeOfDay >= hours.Start && now.TimeOfDay < hours.End;
+            bool workday = Logic.WorkingDay(now, settings);
+            bool lunch = workday && Logic.LunchCovered(now, settings) && Logic.IsLunchTime(now, settings);
+            bool active = workday && !lunch && now.TimeOfDay >= hours.Start && now.TimeOfDay < hours.End;
             double delta = hasSample ? (elapsed - lastElapsed).TotalSeconds : 0;
             bool continuous = hasSample && active && wasActive && now.Date == lastWall.Date && delta >= 0 && delta <= 15;
             lastElapsed = elapsed; lastWall = now; hasSample = true; wasActive = active;

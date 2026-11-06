@@ -170,7 +170,7 @@ public sealed class MainWindow : Window
     int statsWishCount, statsDotActiveIndex = -1;
     int statsPageIndex, statsAvailablePages;
     bool statsPageAnimating;
-    int statsPageQueued = -1;
+    int statsPageQueued = -1, statsPageQueuedDirection, statsPagePending = -1;
     Storyboard? statsPageStory, statsDotStory, statsDragStory;
     readonly RectangleGeometry statsPageClip = new();
     double statsDragStartY, statsDragOffset;
@@ -191,6 +191,9 @@ public sealed class MainWindow : Window
     bool napActive, napPending;
     int napRevision;
     DateTime napEndAt = DateTime.MinValue;
+    PetAnimationPlayer? startWorkAnimation;
+    bool startWorkActive;
+    int startWorkRevision;
     DispatcherQueueTimer? petHoverTimer;
     delegate IntPtr KeyboardHookProc(int code, IntPtr message, IntPtr data);
     KeyboardHookProc? petEnterHookProc;
@@ -323,12 +326,15 @@ public sealed class MainWindow : Window
         settings.Calendar = calendar;
         privacy = new PrivacyStore(Path.Combine(dataFolder, "privacy.db"), settings.Salary);
         settings.Salary = privacy.LoadSalary(); settings.HideAmount = true;
+        bool smokeSettings = false;
         if (smoke)
         {
             foreach (string arg in Environment.GetCommandLineArgs())
             {
                 if (arg.StartsWith("--smoke-scale=") && double.TryParse(arg.Substring(14), NumberStyles.Float, CultureInfo.InvariantCulture, out double size)) settings.Scale = Math.Clamp(size, .5, 1.5);
                 if (arg == "--smoke-dark") { settings.AutomaticAppearance = false; settings.NightMode = true; }
+                if (arg == "--smoke-light") { settings.AutomaticAppearance = false; settings.NightMode = false; }
+                if (arg == "--smoke-settings") smokeSettings = true;
             }
         }
         foreach (string arg in Environment.GetCommandLineArgs())
@@ -487,6 +493,13 @@ public sealed class MainWindow : Window
             if (!reminderPetActive && walkingFrames != null) pet.Source = walkingFrames[(walkingFrame++) % walkingFrames.Length];
         };
         timer.Start();
+        if (smokeSettings)
+        {
+            var settingsTimer = DispatcherQueue.CreateTimer();
+            settingsTimer.Interval = TimeSpan.FromMilliseconds(1200);
+            settingsTimer.Tick += (_, __) => { settingsTimer.Stop(); OpenSettings(); };
+            settingsTimer.Start();
+        }
         if (!smoke) CreateTray(icon);
         Refresh();
         UpdateAppearance();
@@ -822,9 +835,9 @@ public sealed class MainWindow : Window
         double Size(double logical) => Math.Round(logical * scale * dpi) / dpi;
         double size = count > 8 ? 3.4 : count > 5 ? 4.4 : 5.2;
         double gap = count > 8 ? 3.0 : 4.8;
-        statsDots.Width = Size(12);
+        statsDots.Width = Size(8);
         statsDots.Spacing = Size(gap);
-        statsDots.Margin = new Thickness(Size(8), 0, 0, 0);
+        statsDots.Margin = new Thickness(Size(4), 0, 0, 0);
         foreach (var dot in statsDotShapes) { dot.Width = dot.Height = Size(size); dot.HorizontalAlignment = HorizontalAlignment.Center; }
     }
 
@@ -876,7 +889,7 @@ public sealed class MainWindow : Window
     void StopStatsPageAnimation()
     {
         statsPageStory?.Stop(); statsPageStory = null;
-        statsPageAnimating = false; statsPageQueued = -1;
+        statsPageAnimating = false; statsPageQueued = -1; statsPageQueuedDirection = 0; statsPagePending = -1;
     }
 
     double StatsPagePitch => Math.Max(20, statsPages.ActualHeight) + 8 * PhysicalScale;
@@ -994,7 +1007,7 @@ public sealed class MainWindow : Window
         story.Begin();
     }
 
-    void ShowStatsPage(int index, bool animate)
+    void ShowStatsPage(int index, bool animate, int direction = 0)
     {
         if (statsDragging || statsDragSettling) return;
         int count = statsAvailablePages;
@@ -1015,13 +1028,17 @@ public sealed class MainWindow : Window
             }
             statsPageIndex = index; UpdateStatsDotState(); return;
         }
-        if (statsPageAnimating) { statsPageQueued = index; return; }
+        if (statsPageAnimating) { statsPageQueued = index; statsPageQueuedDirection = direction; return; }
         if (index == statsPageIndex) { UpdateStatsDotState(); return; }
         var outgoing = statsPageItems[statsPageIndex];
         var incoming = statsPageItems[index];
-        int step = index > statsPageIndex ? 1 : -1;
-        if (statsPageIndex == count - 1 && index == 0) step = 1;
-        else if (statsPageIndex == 0 && index == count - 1) step = -1;
+        int step = direction != 0 ? Math.Sign(direction) : index > statsPageIndex ? 1 : -1;
+        if (direction == 0)
+        {
+            if (index == 0 && statsPageIndex != 0) step = -1;
+            else if (statsPageIndex == 0 && index == count - 1) step = -1;
+        }
+        GlassProfile.Event($"stats-page {statsPageIndex}->{index} step={step} count={count} direction={direction}");
         double pitch = StatsPagePitch;
         for (int i = 0; i < count; i++)
         {
@@ -1040,15 +1057,16 @@ public sealed class MainWindow : Window
         Storyboard.SetTarget(slideOut, outTransform); Storyboard.SetTargetProperty(slideOut, "TranslateY"); story.Children.Add(slideOut);
         var slideIn = new DoubleAnimation { From = step > 0 ? pitch : -pitch, To = 0, Duration = new Duration(TimeSpan.FromMilliseconds(380)), EasingFunction = new QuinticEase { EasingMode = EasingMode.EaseInOut } };
         Storyboard.SetTarget(slideIn, inTransform); Storyboard.SetTargetProperty(slideIn, "TranslateY"); story.Children.Add(slideIn);
-        statsPageStory = story; statsPageAnimating = true;
+        statsPageStory = story; statsPageAnimating = true; statsPagePending = index;
         story.Completed += (_, __) =>
         {
             outgoing.Opacity = 0; outTransform.TranslateY = 0;
             incoming.Opacity = 1; inTransform.TranslateY = 0; incoming.IsHitTestVisible = true;
-            statsPageIndex = index; statsPageAnimating = false; statsPageStory = null;
+            statsPageIndex = index; statsPageAnimating = false; statsPageStory = null; statsPagePending = -1;
             UpdateStatsDotState();
-            int queued = statsPageQueued; statsPageQueued = -1;
-            if (queued >= 0 && queued != statsPageIndex) ShowStatsPage(queued, animate: true);
+            int queued = statsPageQueued, queuedDirection = statsPageQueuedDirection;
+            statsPageQueued = -1; statsPageQueuedDirection = 0;
+            if (queued >= 0 && queued != statsPageIndex) ShowStatsPage(queued, animate: true, direction: queuedDirection);
         };
         story.Begin();
     }
@@ -1059,7 +1077,9 @@ public sealed class MainWindow : Window
         if (statsDragging || statsDragSettling) { e.Handled = true; return; }
         int delta = e.GetCurrentPoint(stats).Properties.MouseWheelDelta;
         if (delta == 0) return;
-        ShowStatsPage(statsPageIndex + (delta < 0 ? 1 : -1), animate: true);
+        int current = statsPageAnimating && statsPagePending >= 0 ? statsPagePending : statsPageIndex;
+        int direction = delta < 0 ? 1 : -1;
+        ShowStatsPage(current + direction, animate: true, direction);
         e.Handled = true;
     }
 
@@ -1110,6 +1130,8 @@ public sealed class MainWindow : Window
         napActive = false; napPending = false; napRevision++;
         napEndAt = DateTime.MinValue;
         napAnimation?.Dispose(); napAnimation = null;
+        startWorkRevision++; startWorkActive = false;
+        startWorkAnimation?.Dispose(); startWorkAnimation = null;
         reminderPetActive = false;
         coinPetActive = false; coinPetRequestedAt = -10000;
         coinPetAnimation?.Dispose(); coinPetAnimation = null;
@@ -1171,7 +1193,7 @@ public sealed class MainWindow : Window
     void PlayPolarCoinAction()
     {
         var source = napActive ? napAnimation : petAnimation;
-        if (settings.PetId != "polar-bear" || reminderPetActive || source == null || coinPetAnimation == null ||
+        if (settings.PetId != "polar-bear" || reminderPetActive || startWorkActive || source == null || coinPetAnimation == null ||
             !uiSettings.AnimationsEnabled || disposed || exiting || !IsWindowVisible(hwnd)) return;
         if (coinPetActive) { coinPetAnimation.PulseTriggeredLoop(); return; }
         var from = source.CaptureFrame();
@@ -1200,7 +1222,7 @@ public sealed class MainWindow : Window
 
     void UpdatePetHoverMonitor()
     {
-        bool active = petAnimation != null && !reminderPetActive && !napActive && !napPending && !exiting && !disposed && !startupMaskActive && startupRevealStarted && IsWindowVisible(hwnd);
+        bool active = petAnimation != null && !reminderPetActive && !napActive && !napPending && !startWorkActive && !exiting && !disposed && !startupMaskActive && startupRevealStarted && IsWindowVisible(hwnd);
         if (!active) { petHoverTimer?.Stop(); CancelPolarCoinAction(true); petAnimation?.Stop(); return; }
         if (petHoverTimer == null)
         {
@@ -1213,7 +1235,7 @@ public sealed class MainWindow : Window
 
     void UpdatePetAnimationHover()
     {
-        if (petAnimation == null || reminderPetActive || napActive || napPending || exiting || disposed) return;
+        if (petAnimation == null || reminderPetActive || napActive || napPending || startWorkActive || exiting || disposed) return;
         if (!IsWindowVisible(hwnd) || startupMaskActive) { UpdatePetHoverMonitor(); return; }
         if (coinPetActive) return;
         bool inside = false, overPetPixels = false;
@@ -1800,6 +1822,10 @@ public sealed class MainWindow : Window
 
     void UpdateNap(DateTime now)
     {
+        // Lunch is a break for every pet: discard queued drink/walk reminders;
+        // ReminderSchedule restarts both counters from zero when lunch ends.
+        if (Logic.IsWorkdayLunch(now, settings))
+            pendingReminders = 0;
         if (settings.PetId != "polar-bear")
         {
             if (napActive) EndNap();
@@ -1809,7 +1835,9 @@ public sealed class MainWindow : Window
         if (napActive)
         {
             if (now < napEndAt) return;
-            EndNap();
+            bool playStartWork = settings.PetId == "polar-bear";
+            if (playStartWork) PlayStartWork();
+            else { EndNap(); StartNextReminder(); }
             return;
         }
         (DateTime? PlayFrom, DateTime End, bool Lunch)? window;
@@ -1838,20 +1866,26 @@ public sealed class MainWindow : Window
         napEndAt = window.End;
         int revision = ++napRevision;
         petHoverTimer?.Stop();
-        petAnimation?.Stop();
-        CancelPolarCoinAction(false);
-        reminderAnimation?.Dispose(); reminderAnimation = null;
-        waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
         // Entering near the start plays the transition; opening the app mid-lunch
         // or after work goes straight to the sleeping frame.
         bool play = window.PlayFrom.HasValue &&
             now >= window.PlayFrom.Value && now - window.PlayFrom.Value <= TimeSpan.FromSeconds(6) &&
             window.End - now >= TimeSpan.FromSeconds(11);
-        _ = LoadNapAsync(revision, play);
+        byte[]? fromFrame = null;
+        if (play)
+        {
+            try { fromFrame = petAnimation?.CaptureFrame(); }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is ObjectDisposedException) { }
+        }
+        petAnimation?.Stop();
+        CancelPolarCoinAction(false);
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
+        _ = LoadNapAsync(revision, play, fromFrame);
         GlassProfile.Event($"pet-nap-start {(play ? "play" : "hold")} {(window.Lunch ? "lunch" : "off-work")} remain={(int)(window.End - now).TotalSeconds}");
     }
 
-    async Task LoadNapAsync(int revision, bool play)
+    async Task LoadNapAsync(int revision, bool play, byte[]? fromFrame)
     {
         try
         {
@@ -1861,7 +1895,7 @@ public sealed class MainWindow : Window
                 if (exiting || disposed || revision != napRevision || !napActive || settings.PetId != "polar-bear")
                 { animation.Dispose(); return; }
                 napAnimation = animation;
-                if (play) animation.PlayOnce(); else animation.ShowLastFrame();
+                if (play) animation.PlayOnceFrom(fromFrame, 180); else animation.ShowLastFrame();
                 GlassProfile.Event("pet-nap-ready " + (play ? "play" : "last"));
             })) animation.Dispose();
         }
@@ -1869,11 +1903,11 @@ public sealed class MainWindow : Window
         {
             Debug.WriteLine("北极熊午睡动画无法载入：" + ex.Message);
             GlassProfile.Event("pet-nap-error " + ex.GetType().Name);
-            DispatcherQueue.TryEnqueue(EndNap);
+            DispatcherQueue.TryEnqueue(() => EndNap());
         }
     }
 
-    void EndNap()
+    void EndNap(bool startReminders = true, bool resetIdle = true)
     {
         if (!napActive && napAnimation == null) return;
         napActive = false; napPending = false; napRevision++;
@@ -1881,13 +1915,76 @@ public sealed class MainWindow : Window
         CancelPolarCoinAction(false);
         var animation = napAnimation; napAnimation = null;
         animation?.Dispose();
+        if (resetIdle)
+        {
+            if (petAnimation != null)
+            {
+                petAnimation.ResetIdle();
+                UpdatePetHoverMonitor();
+            }
+            else LoadPet();
+        }
+        GlassProfile.Event("pet-nap-end");
+        if (startReminders) StartNextReminder();
+    }
+
+    void PlayStartWork()
+    {
+        if (exiting || disposed || startWorkActive || settings.PetId != "polar-bear") return;
+        startWorkActive = true;
+        int revision = ++startWorkRevision;
+        petHoverTimer?.Stop();
+        CancelPolarCoinAction(false);
+        reminderAnimation?.Dispose(); reminderAnimation = null;
+        // Keep the nap's last frame visible while the next pack loads; EndNap
+        // happens only when the wake-up animation is ready, so there is no
+        // idle-frame flash between the two animations.
+        GlassProfile.Event("pet-start-work-load");
+        _ = LoadStartWorkAsync(revision);
+    }
+
+    async Task LoadStartWorkAsync(int revision)
+    {
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-start-work.frames.br")).ConfigureAwait(false);
+            var duration = animation.Duration;
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != startWorkRevision || !startWorkActive || settings.PetId != "polar-bear")
+                { animation.Dispose(); return; }
+                startWorkAnimation?.Dispose();
+                startWorkAnimation = animation;
+                if (napActive) EndNap(startReminders: false, resetIdle: false);
+                petAnimation?.Stop();
+                animation.PlayOnce();
+                GlassProfile.Event("pet-start-work-play");
+            })) { animation.Dispose(); return; }
+            await Task.Delay(duration + TimeSpan.FromMilliseconds(120)).ConfigureAwait(false);
+            DispatcherQueue.TryEnqueue(() => EndStartWork(revision));
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        {
+            Debug.WriteLine("北极熊上班动画无法载入：" + ex.Message);
+            GlassProfile.Event("pet-start-work-error " + ex.GetType().Name);
+            DispatcherQueue.TryEnqueue(() => EndStartWork(revision));
+        }
+    }
+
+    void EndStartWork(int revision)
+    {
+        if (revision != startWorkRevision || !startWorkActive) return;
+        startWorkActive = false;
+        var animation = startWorkAnimation; startWorkAnimation = null;
+        animation?.Dispose();
+        if (napActive) EndNap(startReminders: false, resetIdle: false);
         if (petAnimation != null)
         {
             petAnimation.ResetIdle();
             UpdatePetHoverMonitor();
         }
         else LoadPet();
-        GlassProfile.Event("pet-nap-end");
+        GlassProfile.Event("pet-start-work-end");
         StartNextReminder();
     }
 
@@ -1899,11 +1996,15 @@ public sealed class MainWindow : Window
 
     void StartNextReminder()
     {
-        if (reminderDue != 0 || pendingReminders == 0 || napActive || napPending || exiting || disposed) return;
+        // Never start a queued reminder during lunch, even if it was queued
+        // in the last tick before lunch began.
+        if (pendingReminders != 0 && Logic.IsWorkdayLunch(DateTime.Now, settings))
+            pendingReminders = 0;
+        if (reminderDue != 0 || pendingReminders == 0 || napActive || napPending || startWorkActive || exiting || disposed) return;
         bool water = (pendingReminders & 1) != 0, walk = (pendingReminders & 2) != 0;
         reminderDue = (water ? 1 : 0) | (walk ? 2 : 0);
         pendingReminders = 0;
-        // A combined reminder plays the walk pose first, then the cup pose.
+        // A combined reminder plays the stretch pose first, then the cup-walk pose.
         reminderUntil = DateTime.Now.AddSeconds(reminderDue == 3 ? 22 : 20);
         if (settings.ReminderPopup) ShowReminderPopup(reminderDue);
         GlassProfile.Event("pet-reminder-queued-start " + reminderDue);
@@ -2163,22 +2264,22 @@ public sealed class MainWindow : Window
         bool water = (due & 1) != 0, walk = (due & 2) != 0;
         if (water && walk)
         {
-            var stretch = await PlayPolarPhase(false, revision).ConfigureAwait(false);
+            var stretch = await PlayPolarPhase(true, revision).ConfigureAwait(false);
             if (stretch == null) return;
             await Task.Delay(stretch.Value).ConfigureAwait(false);
             if (exiting || disposed || revision != reminderAnimationRevision || settings.PetId != "polar-bear" || DateTime.Now >= reminderUntil) return;
-            await PlayPolarPhase(true, revision).ConfigureAwait(false);
+            await PlayPolarPhase(false, revision).ConfigureAwait(false);
             return;
         }
         await PlayPolarPhase(water, revision).ConfigureAwait(false);
     }
 
-    async Task<TimeSpan?> PlayPolarPhase(bool water, int revision)
+    async Task<TimeSpan?> PlayPolarPhase(bool stretch, int revision)
     {
-        string file = water ? "polar-bear-cup-walk.frames.br" : "polar-bear-stretch.frames.br";
+        string file = stretch ? "polar-bear-stretch.frames.br" : "polar-bear-cup-walk.frames.br";
         try
         {
-            var animation = await PetAnimationPlayer.LoadAsync(water ? waterPetOverlay : pet, Path.Combine(AppContext.BaseDirectory, "assets", file)).ConfigureAwait(false);
+            var animation = await PetAnimationPlayer.LoadAsync(stretch ? pet : waterPetOverlay, Path.Combine(AppContext.BaseDirectory, "assets", file)).ConfigureAwait(false);
             var duration = animation.Duration;
             if (!DispatcherQueue.TryEnqueue(() =>
             {
@@ -2187,9 +2288,9 @@ public sealed class MainWindow : Window
                 reminderAnimation?.Dispose();
                 reminderAnimation = animation;
                 animation.ShowPoster();
-                if (water) { pet.Opacity = 0; waterPetOverlay.Visibility = Visibility.Visible; UpdateWaterOverlayBounds(); }
+                if (!stretch) { pet.Opacity = 0; waterPetOverlay.Visibility = Visibility.Visible; UpdateWaterOverlayBounds(); }
                 animation.PlayOnce();
-                GlassProfile.Event("pet-reminder " + (water ? "cup-walk" : "stretch"));
+                GlassProfile.Event("pet-reminder " + (stretch ? "stretch" : "cup-walk"));
             })) { animation.Dispose(); return null; }
             return duration;
         }
@@ -2269,9 +2370,15 @@ public sealed class MainWindow : Window
         }
         else
         {
-            double manual = settings.NightMode ? 1.0 : 0.0;
-            textTarget = manual;
-            glassTarget = manual;
+            glassTarget = settings.NightMode ? 1.0 : 0.0;
+            if (desktopSource.IsReady)
+            {
+                // Both manual materials are fixed, but the ink follows the text
+                // area so it stays readable on dark or light wallpapers.
+                double textLight = desktopSource.TextRegionLuminance ?? desktopSource.TextLuminance;
+                textTarget = textLight < .43 ? 1 : textLight > .53 ? 0 : textAppearanceInitialized ? textTargetTone : textLight < .48 ? 1 : 0;
+            }
+            else textTarget = uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R < 128 ? 1.0 : 0.0;
         }
 
         if (!textAppearanceInitialized)
@@ -2287,12 +2394,10 @@ public sealed class MainWindow : Window
         }
         UpdateTextTransition();
 
-        if (settings.AutomaticAppearance)
-        {
-            if (desktopSource.IsReady && desktopSource.StatsDark is bool dark) statsDark = dark;
-            else if (!desktopSource.IsReady && !statsAppearanceInitialized) statsDark = textTarget > .5;
-        }
-        else statsDark = settings.NightMode;
+        // The inner stats/wish card follows the background in every mode, so its
+        // ink stays readable inside the fixed day/night outer material.
+        if (desktopSource.IsReady && desktopSource.StatsDark is bool dark) statsDark = dark;
+        else if (!desktopSource.IsReady && !statsAppearanceInitialized) statsDark = textTarget > .5;
         double targetTone = statsDark ? 1 : 0;
         if (!statsAppearanceInitialized)
         {
@@ -2312,7 +2417,15 @@ public sealed class MainWindow : Window
         var expBg = string.IsNullOrEmpty(LiquidGlassWinUI.LiquidGlassBrush.LastError) ? (Brush)glass.Brush : glassFallback;
         if (backdropCard.Background != expBg) backdropCard.Background = expBg;
 
-        double tintTarget = settings.AutomaticAppearance ? 0 : .54;
+        // Manual modes only dye the glass when the wallpaper fights the chosen
+        // palette; on a matching background a flat dye washes out the glass.
+        double tintTarget = 0;
+        // Manual night is a fixed smoked-black material; day stays clear frost.
+        if (!settings.AutomaticAppearance && settings.NightMode) tintTarget = .5;
+        // Manual day is a clear frost, manual night a smoked frost: both diffuse
+        // the wallpaper instead of switching material with the background.
+        double blurTarget = !settings.AutomaticAppearance ? 6 : 0;
+        if (Math.Abs(glass.Brush.BlurAmount - blurTarget) > .01) glass.Brush.BlurAmount = blurTarget;
         if (!glassAppearanceInitialized)
         {
             glassAppearanceInitialized = true;
@@ -3393,7 +3506,7 @@ public sealed class MainWindow : Window
     }
 
     bool isDragging, endingDrag, dragMoved, dragUsesMouse, dragReleasePending;
-    bool suppressPetTap;
+    bool suppressPetTap, dragStartedOnPet;
     Win32Point initialCursor;
     PointInt32 initialWindowPos;
     PointInt32 lastDragPosition;
@@ -3403,10 +3516,11 @@ public sealed class MainWindow : Window
         var point = e.GetCurrentPoint(surface);
         if (!point.Properties.IsLeftButtonPressed) return;
         bool overStats = false;
+        dragStartedOnPet = false;
         for (DependencyObject? source = e.OriginalSource as DependencyObject; source != null && source != card; source = VisualTreeHelper.GetParent(source))
         {
-            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase ||
-                (!hoverDragArmed && (source is Image || ReferenceEquals(source, pet.Parent)))) return;
+            if (source is Microsoft.UI.Xaml.Controls.Primitives.ButtonBase) return;
+            if (source is Image || ReferenceEquals(source, pet.Parent)) dragStartedOnPet = true;
             if (ReferenceEquals(source, stats)) overStats = true;
         }
 
@@ -3608,7 +3722,10 @@ public sealed class MainWindow : Window
             e.Handled = true;
             return;
         }
+        bool petClick = isDragging && dragStartedOnPet && !dragMoved;
+        if (petClick) suppressPetTap = true;
         EndDrag(e.Pointer, sampleFinalPosition: true);
+        if (petClick) EmitCoin();
         e.Handled = true;
     }
 
@@ -3657,6 +3774,7 @@ public sealed class MainWindow : Window
             dragMoved = false;
             dragUsesMouse = false;
             dragReleasePending = false;
+            dragStartedOnPet = false;
             endingDrag = false;
             if (hoverDragArmed && settings.MouseClickThrough)
                 DispatcherQueue.TryEnqueue(() =>
@@ -4654,6 +4772,8 @@ public sealed class MainWindow : Window
         if (petEnterHook != IntPtr.Zero) { UnhookWindowsHookEx(petEnterHook); petEnterHook = IntPtr.Zero; }
         petEnterHookProc = null;
         petHoverTimer?.Stop(); petAnimation?.Dispose(); petAnimation = null;
+        startWorkRevision++; startWorkActive = false;
+        startWorkAnimation?.Dispose(); startWorkAnimation = null;
         coinPetActive = false;
         coinPetAnimation?.Dispose(); coinPetAnimation = null;
         reminderAnimationRevision++;

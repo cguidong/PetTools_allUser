@@ -18,18 +18,21 @@ if (!$SkipPublish) {
     if ($LASTEXITCODE -ne 0) { throw '发布失败。' }
 }
 $PayloadDir = (Resolve-Path -LiteralPath $PayloadDir).Path
-foreach ($required in @('OffWorkWidget.WinUI.exe','OffWorkWidget.WinUI.dll','App.xbf','OffWorkWidget.WinUI.pri','OffWorkWidget.WinUI.runtimeconfig.json','coreclr.dll','Microsoft.UI.Xaml.dll','CustomEffectRuntimeNative.dll','assets\app-icon.ico','assets\polar-bear-idle.frames.br','assets\polar-bear-nap.frames.br','prerequisites\VC_redist.x64.exe')) {
+$vcRuntime = Join-Path $root 'prerequisites\vc-runtime-x64'
+if (Test-Path -LiteralPath $vcRuntime) {
+    Copy-Item -Path (Join-Path $vcRuntime '*.dll') -Destination $PayloadDir -Force
+}
+foreach ($required in @('OffWorkWidget.WinUI.exe','OffWorkWidget.WinUI.dll','App.xbf','OffWorkWidget.WinUI.pri','OffWorkWidget.WinUI.runtimeconfig.json','coreclr.dll','Microsoft.UI.Xaml.dll','CustomEffectRuntimeNative.dll','vcruntime140.dll','msvcp140.dll','assets\app-icon.ico','assets\polar-bear-idle.frames.br','assets\polar-bear-nap.frames.br','assets\polar-bear-start-work.frames.br')) {
     if (!(Test-Path -LiteralPath (Join-Path $PayloadDir $required))) { throw "发布包缺少 $required" }
 }
 # WinUI ships MUI files for every Windows language. Keep Chinese, English and the app assets only.
-$keepDirs = @('assets','prerequisites','Microsoft.UI.Xaml','en-us','zh-CN','zh-TW')
+$keepDirs = @('assets','Microsoft.UI.Xaml','en-us','zh-CN','zh-TW')
 Get-ChildItem -LiteralPath $PayloadDir -Directory | Where-Object {
     $_.Name -notin $keepDirs -and (Get-ChildItem -LiteralPath $_.FullName -Filter *.mui -File -Recurse -ErrorAction SilentlyContinue)
 } | Remove-Item -Recurse -Force
-$redist = Join-Path $PayloadDir 'prerequisites\VC_redist.x64.exe'
-$signature = Get-AuthenticodeSignature -LiteralPath $redist
-if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') { throw 'VC++ 运行库微软签名验证失败。' }
-if ([version](Get-Item -LiteralPath $redist).VersionInfo.ProductVersion -lt [version]'14.51.36247.0') { throw 'VC++ 运行库版本过低。' }
+# The VC++ runtime is app-local; the old redist payload is no longer installed.
+$legacyRedist = Join-Path $PayloadDir 'prerequisites\VC_redist.x64.exe'
+if (Test-Path -LiteralPath $legacyRedist) { Remove-Item -LiteralPath $legacyRedist -Force }
 $version = (Get-Item -LiteralPath (Join-Path $PayloadDir 'OffWorkWidget.WinUI.exe')).VersionInfo.ProductVersion.Split('+')[0]
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
@@ -38,7 +41,7 @@ if ($InstallerQATest) { $arguments += '/DInstallerQATest' }
 & $CompilerPath @arguments (Join-Path $PSScriptRoot 'OffWorkWidget.iss')
 if ($LASTEXITCODE -ne 0) { throw '安装包编译失败。' }
 if (!$InstallerQATest) {
-    Copy-Item -LiteralPath $redist -Destination (Join-Path $OutputDir 'VC_redist.x64.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-Path $OutputDir 'README.md') -Force
 }
 $name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } else { "有盼-Setup-$version-x64.exe" }
 $artifact = Join-Path $OutputDir $name

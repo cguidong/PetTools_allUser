@@ -186,15 +186,40 @@ namespace OffWorkWidget
         {
             return days == 0 || (days == 1 && now.TimeOfDay >= WorkHours(now, s).End);
         }
+        public static bool IsLunchTime(DateTime now, Settings s)
+        {
+            try
+            {
+                var start = Time(s.LunchStart);
+                var end = Time(s.LunchEnd);
+                return end > start && now.TimeOfDay >= start && now.TimeOfDay < end;
+            }
+            catch (FormatException) { return false; }
+        }
+        public static bool LunchCovered(DateTime date, Settings s)
+        {
+            var hours = WorkHours(date, s);
+            var lunchStart = Time(s.LunchStart);
+            var lunchEnd = Time(s.LunchEnd);
+            return lunchEnd > lunchStart && hours.Start <= lunchStart && lunchEnd <= hours.End;
+        }
+        public static bool IsWorkdayLunch(DateTime now, Settings s)
+        {
+            try { return WorkingDay(now, s) && LunchCovered(now, s) && IsLunchTime(now, s); }
+            catch (FormatException) { return false; }
+        }
         public static (DateTime? PlayFrom, DateTime End, bool Lunch)? NapWindow(DateTime now, Settings s)
         {
             bool workday = WorkingDay(now, s);
             if (workday)
             {
                 var hours = WorkHours(now, s);
-                var lunchStart = now.Date.Add(Time(s.LunchStart));
-                var lunchEnd = now.Date.Add(Time(s.LunchEnd));
-                if (now >= lunchStart && now < lunchEnd) return (lunchStart, lunchEnd, true);
+                var lunchStartTime = Time(s.LunchStart);
+                var lunchEndTime = Time(s.LunchEnd);
+                var lunchStart = now.Date.Add(lunchStartTime);
+                var lunchEnd = now.Date.Add(lunchEndTime);
+                if (hours.Start <= lunchStartTime && lunchEndTime <= hours.End &&
+                    now >= lunchStart && now < lunchEnd) return (lunchStart, lunchEnd, true);
                 if (now.TimeOfDay >= hours.Start && now.TimeOfDay < hours.End) return null;
             }
             var next = NextWorkStart(now, s);

@@ -5,7 +5,7 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.44"
+  #define AppVersion "1.0.70"
 #endif
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
@@ -15,7 +15,7 @@
 #else
   #define ProductId "{{B312EA3B-93C3-481D-AF00-5F60D9B84B35}"
   #define OutputName "有盼-Setup-" + AppVersion + "-x64"
-  #define InstallLeaf "OffWorkWidget"
+  #define InstallLeaf "YouPan"
   #define ShortcutName "有盼"
 #endif
 [Setup]
@@ -38,7 +38,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputName}
 SetupIconFile={#PayloadDir}\assets\app-icon.ico
 UninstallDisplayIcon={app}\OffWorkWidget.WinUI.exe
-Compression=lzma2
+Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern dynamic windows11 hidebevels
 CloseApplications=no
@@ -58,8 +58,7 @@ FinishedLabel=有盼已准备就绪。%n愿每一天，都有值得期待的下�
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："
 [Files]
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,prerequisites\*"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDir}\prerequisites\VC_redist.x64.exe"; Flags: dontcopy
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,prerequisites\*,createdump.exe,mscordaccore.dll,mscordaccore_amd64_*.dll,Microsoft.DiaSymReader.Native.amd64.dll,RestartAgent.exe,Microsoft.Windows.Widgets.dll,Microsoft.Windows.Widgets.Projection.dll,Microsoft.Windows.Widgets.winmd"; Flags: ignoreversion recursesubdirs createallsubdirs
 #include "ObsoleteRuntimeFiles.iss"
 [InstallDelete]
 Type: files; Name: "{autodesktop}\下班倒计时.lnk"
@@ -97,6 +96,27 @@ begin
     (Separator > 1) and (Separator < Length(Tail));
 end;
 
+function IsSharedParentFolder(Path: string): Boolean;
+var
+  P, Home, PublicDir: string;
+begin
+  P := AddBackslash(Path);
+  Home := GetEnv('USERPROFILE');
+  PublicDir := GetEnv('PUBLIC');
+  Result :=
+    (CompareText(P, AddBackslash(Home + '\Desktop')) = 0) or
+    (CompareText(P, AddBackslash(PublicDir + '\Desktop')) = 0) or
+    (CompareText(P, AddBackslash(Home + '\Documents')) = 0) or
+    (CompareText(P, AddBackslash(PublicDir + '\Documents')) = 0) or
+    (CompareText(P, AddBackslash(Home)) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('LOCALAPPDATA'))) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('APPDATA'))) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('PROGRAMDATA'))) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('ProgramFiles'))) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('ProgramFiles(x86)'))) = 0) or
+    (CompareText(P, AddBackslash(GetEnv('ProgramW6432'))) = 0);
+end;
+
 function NormalizeInstallPath(Path: string): string;
 var
   Drive: string;
@@ -108,7 +128,8 @@ begin
   StringChangeEx(Result, '/', '\', True);
   Drive := ExtractFileDrive(Result);
   if (Copy(Drive, 1, 2) = '\\') and not HasUNCShare(Drive) then exit;
-  if (Drive <> '') and (CompareText(AddBackslash(Result), AddBackslash(Drive)) = 0) then
+  if (Drive <> '') and
+    ((CompareText(AddBackslash(Result), AddBackslash(Drive)) = 0) or IsSharedParentFolder(Result)) then
     Result := AddBackslash(Result) + '{#InstallLeaf}';
 end;
 
@@ -308,7 +329,7 @@ end;
 
 function HasVCRuntime: Boolean;
 var
-  Installed, Major, Minor, Build, Revision: Cardinal;
+  Installed, Major: Cardinal;
   Key: string;
 begin
 #ifdef InstallerQATest
@@ -318,15 +339,9 @@ begin
 #else
   Key := 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
   Result := RegQueryDWordValue(HKLM64, Key, 'Installed', Installed) and
-    RegQueryDWordValue(HKLM64, Key, 'Major', Major) and
-    RegQueryDWordValue(HKLM64, Key, 'Minor', Minor) and
-    RegQueryDWordValue(HKLM64, Key, 'Bld', Build) and
-    RegQueryDWordValue(HKLM64, Key, 'Rbld', Revision);
+    RegQueryDWordValue(HKLM64, Key, 'Major', Major);
   if Result then
-    Result := (Installed = 1) and
-      ((Major > 14) or ((Major = 14) and ((Minor > 51) or
-      ((Minor = 51) and ((Build > 36247) or
-      ((Build = 36247) and (Revision >= 0)))))));
+    Result := (Installed = 1) and (Major >= 14);
 #endif
 end;
 
@@ -339,39 +354,91 @@ begin
     Result := '请先从旧版有盼的托盘菜单选择“退出”，然后重试安装。';
     exit;
   end;
-  if not HasVCRuntime then begin
-    ExtractTemporaryFile('VC_redist.x64.exe');
-    if not ShellExec('runas', ExpandConstant('{tmp}\VC_redist.x64.exe'),
-      '/install /passive /norestart', '', SW_SHOWNORMAL,
-      ewWaitUntilTerminated, ExitCode) then begin
-      Log('VC++ runtime launch failed: ' + IntToStr(ExitCode));
-      if ExitCode = 1223 then
-        Result := '已取消运行库安装授权。安装包已包含运行库；请返回上一步后重试，并在 Windows 授权窗口中允许 Microsoft Visual C++ 安装。'
-      else
-        Result := '无法启动包内 Microsoft Visual C++ x64 运行库安装程序。错误：' + IntToStr(ExitCode);
-      exit;
-    end;
-    if (ExitCode <> 0) and (ExitCode <> 3010) and (ExitCode <> 1638) then begin
-      Log('VC++ runtime installation failed: ' + IntToStr(ExitCode));
-      if ExitCode = 1602 then
-        Result := '已取消 Microsoft Visual C++ x64 运行库安装。请返回上一步后重试；运行库安装成功后才能运行挂件。'
-      else
-        Result := 'Microsoft Visual C++ x64 运行库安装失败，错误：' + IntToStr(ExitCode);
-      exit;
-    end;
-    RuntimeReboot := ExitCode = 3010;
-    if not HasVCRuntime then begin
-      if RuntimeReboot then
-        Result := '运行库安装程序要求重启。请重启电脑后重新安装。'
-      else
-        Result := '运行库安装后检测未通过。请手动运行发布目录 prerequisites 中的 VC_redist.x64.exe，完成后重试。';
-    end;
-  end;
+  // VC++ 2015-2022 x64 runtime ships inside the app folder (app-local), so the
+  // per-user installer no longer needs an administrator-only prerequisite step.
 end;
 
 function NeedRestart: Boolean;
 begin
   Result := RuntimeReboot;
+end;
+
+function AskUninstallOptions: Boolean;
+var
+  Dialog: TForm;
+  Heading, Subheading, Description, Warning: TNewStaticText;
+  Divider: TPanel;
+  RemoveCheck: TNewCheckBox;
+  ContinueButton, CancelButton: TNewButton;
+begin
+  Result := False;
+  Dialog := TForm.Create(nil);
+  try
+    Dialog.Caption := '有盼 卸载';
+    Dialog.BorderStyle := bsDialog;
+    Dialog.Color := clWhite;
+    Dialog.ClientWidth := ScaleX(700);
+    Dialog.ClientHeight := ScaleY(470);
+    Dialog.Position := poScreenCenter;
+    Dialog.Font.Name := 'Microsoft YaHei UI';
+    Dialog.Font.Size := 10;
+    Heading := TNewStaticText.Create(Dialog);
+    Heading.Parent := Dialog;
+    Heading.SetBounds(ScaleX(28), ScaleY(24), ScaleX(644), ScaleY(36));
+    Heading.Caption := '卸载有盼';
+    Heading.Font.Size := 18;
+    Heading.Font.Style := [fsBold];
+    Subheading := TNewStaticText.Create(Dialog);
+    Subheading.Parent := Dialog;
+    Subheading.SetBounds(ScaleX(28), ScaleY(66), ScaleX(644), ScaleY(22));
+    Subheading.Caption := '卸载选项';
+    Subheading.Font.Size := 11;
+    Subheading.Font.Color := clGray;
+    Divider := TPanel.Create(Dialog);
+    Divider.Parent := Dialog;
+    Divider.BevelOuter := bvNone;
+    Divider.Color := clSilver;
+    Divider.SetBounds(ScaleX(28), ScaleY(102), ScaleX(644), ScaleY(1));
+    Description := TNewStaticText.Create(Dialog);
+    Description.Parent := Dialog;
+    Description.SetBounds(ScaleX(28), ScaleY(126), ScaleX(644), ScaleY(56));
+    Description.AutoSize := False;
+    Description.WordWrap := True;
+    Description.Caption := '将移除有盼的程序文件。本机设置、心愿和金额密码默认保留，重新安装后可以继续使用。';
+    RemoveCheck := TNewCheckBox.Create(Dialog);
+    RemoveCheck.Parent := Dialog;
+    RemoveCheck.SetBounds(ScaleX(28), ScaleY(202), ScaleX(644), ScaleY(26));
+    RemoveCheck.Caption := '同时删除本机设置、心愿和金额密码';
+    RemoveCheck.Checked := False;
+    Warning := TNewStaticText.Create(Dialog);
+    Warning.Parent := Dialog;
+    Warning.SetBounds(ScaleX(28), ScaleY(238), ScaleX(644), ScaleY(44));
+    Warning.AutoSize := False;
+    Warning.WordWrap := True;
+    Warning.Font.Size := 9;
+    Warning.Font.Color := clGray;
+    Warning.Caption := '勾选后，卸载会同时删除这些本机数据，且无法恢复。';
+    ContinueButton := TNewButton.Create(Dialog);
+    ContinueButton.Parent := Dialog;
+    ContinueButton.SetBounds(ScaleX(460), ScaleY(410), ScaleX(110), ScaleY(32));
+    ContinueButton.Caption := '继续卸载';
+    ContinueButton.ModalResult := mrOk;
+    ContinueButton.Default := True;
+    CancelButton := TNewButton.Create(Dialog);
+    CancelButton.Parent := Dialog;
+    CancelButton.SetBounds(ScaleX(582), ScaleY(410), ScaleX(90), ScaleY(32));
+    CancelButton.Caption := '取消';
+    CancelButton.ModalResult := mrCancel;
+    CancelButton.Cancel := True;
+    Dialog.ActiveControl := ContinueButton;
+    if Dialog.ShowModal = mrOk then
+    begin
+      RemoveUserData := RemoveCheck.Checked;
+      Result := True;
+    end;
+  finally
+    Dialog.Free;
+  end;
 end;
 
 function InitializeUninstall: Boolean;
@@ -382,8 +449,7 @@ begin
   else if UninstallSilent then
     RemoveUserData := False
   else
-    RemoveUserData := MsgBox('是否同时删除本机设置、心愿和金额密码？' + #13#10 +
-      '选择“否”将保留，重新安装后可继续使用。', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+    Result := AskUninstallOptions;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -413,3 +479,5 @@ begin
     DeleteFile(ExpandConstant('{localappdata}\OffWorkWidget\privacy.db-shm'));
   end;
 end;
+
+

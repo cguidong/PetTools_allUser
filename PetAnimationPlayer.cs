@@ -24,7 +24,8 @@ internal sealed class PetAnimationPlayer : IDisposable
     bool playing, hoverPlayback, armed = true, outside = true, disposed;
     bool triggeredLoop, returning, blended;
     long lastTriggerAt, transitionAt;
-    byte[]? transitionFrom, returnFrame, blendBuffer;
+    byte[]? transitionFrom, returnFrame, blendBuffer, fadeFrom;
+    int fadeMs;
     Action? loopCompleted;
     internal const int TriggerQuietMilliseconds = 1000;
     const int EnterMilliseconds = 220, ReturnMilliseconds = 240;
@@ -101,8 +102,31 @@ internal sealed class PetAnimationPlayer : IDisposable
     internal void PlayOnce()
     {
         if (disposed) return;
+        fadeFrom = null; fadeMs = 0;
         if (playing) Stop();
         armed = false; StartPlayback(false);
+    }
+
+    internal void PlayOnceFrom(byte[]? fromFrame, int fadeMilliseconds)
+    {
+        if (disposed) return;
+        if (fromFrame == null || fromFrame.Length != frameBytes || fadeMilliseconds <= 0)
+        {
+            PlayOnce();
+            return;
+        }
+        if (playing) Stop();
+        armed = false;
+        fadeFrom = fromFrame; fadeMs = fadeMilliseconds;
+        blendBuffer ??= new byte[frameBytes];
+        Buffer.BlockCopy(fromFrame, 0, blendBuffer, 0, frameBytes);
+        target.Source = bitmap;
+        pixels.Position = 0; pixels.Write(blendBuffer, 0, frameBytes); bitmap.Invalidate();
+        frame = 0; blended = true;
+        clock.Restart();
+        playing = true; hoverPlayback = false;
+        CompositionTarget.Rendering += Render;
+        GlassProfile.Event("pet-animation-fade-start");
     }
 
     internal TimeSpan Duration => TimeSpan.FromSeconds((double)count / fps);
@@ -180,6 +204,19 @@ internal sealed class PetAnimationPlayer : IDisposable
     {
         if (disposed || !playing) return;
         if (triggeredLoop) { RenderTriggeredLoop(); return; }
+        if (fadeFrom != null)
+        {
+            long ms = clock.ElapsedMilliseconds;
+            if (ms < fadeMs)
+            {
+                int blendFrame = Math.Min(count - 1, (int)(clock.Elapsed.TotalSeconds * fps));
+                ShowBlend(fadeFrom, 0, frames, blendFrame * frameBytes, ms / (double)fadeMs);
+                frame = blendFrame;
+                return;
+            }
+            fadeFrom = null;
+            GlassProfile.Event("pet-animation-fade-end");
+        }
         int next = (int)(clock.Elapsed.TotalSeconds * fps);
         if (next >= count)
         {
@@ -250,6 +287,7 @@ internal sealed class PetAnimationPlayer : IDisposable
         playing = false; hoverPlayback = false; armed = false; clock.Stop();
         triggeredLoop = returning = false;
         transitionFrom = returnFrame = null; loopCompleted = null;
+        fadeFrom = null; fadeMs = 0;
     }
 
     public void Dispose()

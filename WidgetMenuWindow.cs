@@ -14,8 +14,8 @@ namespace OffWorkWidget.WinUI;
 
 internal sealed class WidgetMenuWindow : Window
 {
-    const double MenuWidth = 128, RowHeight = 34, MenuPadding = 6;
-    const double DividerSpace = 9;
+    const double MenuWidth = 100, RowHeight = 30, MenuPadding = 4;
+    const double DividerSpace = 7;
     const double MenuHeight = RowHeight * 3 + DividerSpace + MenuPadding * 2;
     readonly Action<uint> selected;
     readonly Action dismissed;
@@ -60,6 +60,10 @@ internal sealed class WidgetMenuWindow : Window
         DwmSetWindowAttribute(hwnd, 2, ref rendering, 4);
         int corner = rounded ? 2 : 1;
         DwmSetWindowAttribute(hwnd, 33, ref corner, 4);
+        int noBorder = unchecked((int)0xFFFFFFFE);
+        DwmSetWindowAttribute(hwnd, 34, ref noBorder, 4);
+        var frameMargins = new Margins { Left = -1, Right = -1, Top = -1, Bottom = -1 };
+        DwmExtendFrameIntoClientArea(hwnd, ref frameMargins);
 
         panel = new StackPanel { Spacing = 0 };
         surface = new Border
@@ -116,7 +120,7 @@ internal sealed class WidgetMenuWindow : Window
     internal void ShowAt(int physicalX, int physicalY, bool dark, double scale)
     {
         if (closed) return;
-        uiScale = Math.Clamp(scale, .85, 1.3);
+        uiScale = Math.Clamp(scale, .85, 1.15);
         ApplyScale();
         ApplyTheme(dark);
         // Move first so the popup picks up the target monitor's DPI.
@@ -137,8 +141,13 @@ internal sealed class WidgetMenuWindow : Window
         Activate();
         SetForegroundWindow(hwnd);
         items[0].Focus(FocusState.Pointer);
-        DispatcherQueue.TryEnqueue(() => { if (IsOpen) items[0].Focus(FocusState.Pointer); });
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            if (!IsOpen) return;
+            items[0].Focus(FocusState.Pointer);
+        });
     }
+
 
     internal void Hide()
     {
@@ -184,15 +193,15 @@ internal sealed class WidgetMenuWindow : Window
     void ApplyScale()
     {
         panel.Margin = new Thickness(MenuPadding * uiScale);
-        surface.CornerRadius = new CornerRadius((rounded ? 14 : 0) * uiScale);
+        surface.CornerRadius = new CornerRadius((rounded ? 12 : 0) * uiScale);
         surface.BorderThickness = new Thickness(Math.Max(1, uiScale));
         divider.Height = Math.Max(1, uiScale);
-        divider.Margin = new Thickness(6 * uiScale, 4 * uiScale, 6 * uiScale, 4 * uiScale);
+        divider.Margin = new Thickness(5 * uiScale, 3 * uiScale, 5 * uiScale, 3 * uiScale);
         foreach (Button button in items)
         {
             button.Height = RowHeight * uiScale;
-            button.Padding = new Thickness(10 * uiScale, 0, 10 * uiScale, 0);
-            if (button.Content is TextBlock text) text.FontSize = 13 * uiScale;
+            button.Padding = new Thickness(8 * uiScale, 0, 8 * uiScale, 0);
+            if (button.Content is TextBlock text) text.FontSize = 12.5 * uiScale;
         }
     }
 
@@ -236,5 +245,10 @@ internal sealed class WidgetMenuWindow : Window
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int width, int height);
+    [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr window, IntPtr region, bool redraw);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [StructLayout(LayoutKind.Sequential)] struct Margins { internal int Left, Right, Top, Bottom; }
+    [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref Margins margins);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 }
