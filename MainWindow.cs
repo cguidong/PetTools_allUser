@@ -146,9 +146,9 @@ public sealed class MainWindow : Window
 
     readonly Button earningsEye = new Button { Padding = new Thickness(0), BorderThickness = new Thickness(0), Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0)), MinWidth = 0, MinHeight = 0 };
     readonly FontIcon earningsVisibilityIcon = new() { FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), Glyph = "\uED1A", IsTextScaleFactorEnabled = false };
-    readonly SolidColorBrush eyeBackground = new(Windows.UI.Color.FromArgb(16, 0, 0, 0));
-    readonly SolidColorBrush eyeHoverBackground = new(Windows.UI.Color.FromArgb(32, 0, 0, 0));
-    readonly SolidColorBrush eyePressedBackground = new(Windows.UI.Color.FromArgb(48, 0, 0, 0));
+    readonly RadialGradientBrush eyeGlass = new();
+    readonly RadialGradientBrush eyeHoverGlass = new();
+    readonly RadialGradientBrush eyePressedGlass = new();
     readonly StackPanel salaryArea = new StackPanel { Spacing = 5 };
     readonly Grid statsRow = new Grid();
     readonly InteractiveCursorGrid statsPages = new InteractiveCursorGrid { Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
@@ -166,6 +166,8 @@ public sealed class MainWindow : Window
     readonly System.Collections.Generic.List<ColumnDefinition> wishBarFillColumns = new();
     readonly System.Collections.Generic.List<ColumnDefinition> wishBarRestColumns = new();
     bool statsWishMode;
+    readonly System.Collections.Generic.HashSet<string> completedWishKeys = new();
+    bool wishCompletionPrimed;
     string statsWishSignature = "";
     int statsWishCount, statsDotActiveIndex = -1;
     int statsPageIndex, statsAvailablePages;
@@ -291,7 +293,7 @@ public sealed class MainWindow : Window
                 var loaded = (Settings?)new XmlSerializer(typeof(Settings)).Deserialize(stream);
                 if (loaded == null) throw new InvalidDataException("设置文件内容为空。");
                 if (loaded.Scale > 1.5 && loaded.Scale <= 2) loaded.Scale = 1.5; // Preserve existing settings from the former range.
-                if (loaded.HoverDragSeconds < 1 || loaded.HoverDragSeconds > 3) loaded.HoverDragSeconds = 3;
+                if (loaded.HoverDragSeconds < 1 || loaded.HoverDragSeconds > 3) loaded.HoverDragSeconds = 1;
                 loaded.HoverEffect = HoverEffects.Normalize(loaded.HoverEffect);
                 // Previously a disabled lunch could retain an invalid range. Repair only
                 // that unused range, rather than rejecting the entire settings file.
@@ -303,6 +305,22 @@ public sealed class MainWindow : Window
                     }
                     catch (FormatException) { loaded.LunchStart = "12:00"; loaded.LunchEnd = "13:00"; }
                 }
+                // Repair a missing alternating-week anchor instead of rejecting
+                // the whole settings file (which would reset every preference).
+                if (loaded.AlternatingWeekends &&
+                    (!DateTime.TryParseExact(loaded.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime weekAnchor) ||
+                     weekAnchor.DayOfWeek != DayOfWeek.Monday))
+                    loaded.DoubleRestWeekStart = Logic.WeekStart(DateTime.Today).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                // Existing wish pools keep the current cycle's progress, then never
+                // drop back when the next payday arrives.
+                bool wishAnchorRepaired = false;
+                if (loaded.WishEnabled &&
+                    !DateTime.TryParseExact(loaded.WishStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+                {
+                    loaded.WishStartDate = Logic.CurrentPayCycleStart(DateTime.Today, loaded).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                    wishAnchorRepaired = true;
+                }
+                Logic.Repair(loaded);
                 Logic.Validate(loaded);
                 string configText = File.ReadAllText(config);
                 if (!configText.Contains("<ScaleReferenceVersion>") || loaded.ScaleReferenceVersion < 1)
@@ -312,6 +330,7 @@ public sealed class MainWindow : Window
                 }
                 if (!configText.Contains("<ShowSalaryLayout>")) loaded.ShowSalaryLayout = !loaded.HideAmount;
                 settings = loaded;
+                if (wishAnchorRepaired) Save();
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is FormatException || ex is IOException || ex is UnauthorizedAccessException || ex is OverflowException)
             {
@@ -326,6 +345,14 @@ public sealed class MainWindow : Window
         settings.Calendar = calendar;
         privacy = new PrivacyStore(Path.Combine(dataFolder, "privacy.db"), settings.Salary);
         settings.Salary = privacy.LoadSalary(); settings.HideAmount = true;
+        // Manual make-up work/rest entries only matter on their date; drop the
+        // ones that have already passed so the list cleans itself up.
+        string todayKey = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        bool prunedAdjustments = settings.DateAdjustments != null &&
+            settings.DateAdjustments.RemoveAll(a => a == null || string.CompareOrdinal(a.Date, todayKey) < 0) > 0;
+        if (prunedAdjustments) Save();
+        // Keep the Run entry pointing at the current install when the app moved.
+        try { StartupRegistration.RepairPathIfNeeded(); } catch { }
         bool smokeSettings = false;
         if (smoke)
         {
@@ -581,14 +608,15 @@ public sealed class MainWindow : Window
         earningsVisibilityIcon.Foreground = statsForeground;
         earningsEye.Content = earningsVisibilityIcon;
         earningsEye.Foreground = statsForeground;
-        earningsEye.Background = eyeBackground;
+        earningsEye.Background = eyeGlass;
         earningsEye.CornerRadius = new CornerRadius(100);
-        earningsEye.Resources["ButtonBackgroundPointerOver"] = eyeHoverBackground;
-        earningsEye.Resources["ButtonBackgroundPressed"] = eyePressedBackground;
+        earningsEye.Resources["ButtonBackgroundPointerOver"] = eyeHoverGlass;
+        earningsEye.Resources["ButtonBackgroundPressed"] = eyePressedGlass;
         earningsEye.Resources["ButtonForegroundPointerOver"] = statsForeground;
         earningsEye.Resources["ButtonForegroundPressed"] = statsForeground;
         earningsEye.Click += async (_, __) =>
         {
+            PopEyeButton();
             earningsEye.IsEnabled = false;
             try { if (settings.HideAmount) await RevealSalary(surface.XamlRoot); else HideSalary(); }
             catch (Exception ex) { App.RecordFailure(ex); HideSalary(); }
@@ -704,11 +732,29 @@ public sealed class MainWindow : Window
     void UpdateStatsPager()
     {
         if (statsCorePages.Count == 0) return;
-        var wishes = ValidWishes();
+        var allWishes = ValidWishes();
+        decimal wishPool = Logic.WishPool(DateTime.Now, settings);
+        var wishProgress = Logic.AllocateWishProgress(allWishes, settings.WishAllocation, wishPool);
+        UpdateWishCompletion(allWishes, wishProgress);
+        // Fully funded wishes leave the card; their target stays consumed so the
+        // remaining pool is not reused. Settings keeps them as 已达成.
+        var wishes = new System.Collections.Generic.List<WishEntry>();
+        decimal visiblePool = wishPool;
+        for (int i = 0; i < allWishes.Count; i++)
+        {
+            var wish = allWishes[i];
+            if (wish.Target > 0 && wishProgress[i] >= wish.Target - .005m)
+            {
+                visiblePool -= Math.Min(wish.Target, wishProgress[i]);
+                continue;
+            }
+            wishes.Add(wish);
+        }
+        if (visiblePool < 0) visiblePool = 0;
         statsWishCount = Math.Min(wishes.Count, wishPagePanels.Count);
         bool wanted = settings.WishEnabled && statsWishCount > 0;
         bool busy = statsPageAnimating || statsDragging || statsDragSettling;
-        if (wanted && !busy) UpdateWishPageValues(wishes);
+        if (wanted && !busy) UpdateWishPageValues(wishes, visiblePool);
         if (wanted != statsWishMode)
         {
             if (wanted) EnterWishPager();
@@ -765,14 +811,9 @@ public sealed class MainWindow : Window
         SynchronizeStatsGeometry();
     }
 
-    void UpdateWishPageValues(System.Collections.Generic.List<WishEntry> wishes)
+    void UpdateWishPageValues(System.Collections.Generic.List<WishEntry> wishes, decimal pool)
     {
-        decimal pool = Logic.EarnedSinceLastPayday(DateTime.Now, settings);
-        for (int i = 0; i < statsWishCount && i < wishes.Count; i++)
-            pool += Math.Max(0, wishes[i].Saved);
-        bool split = settings.WishAllocation == "split";
-        decimal remaining = pool;
-        decimal share = split && statsWishCount > 0 ? pool / statsWishCount : 0;
+        var progressByWish = Logic.AllocateWishProgress(wishes, settings.WishAllocation, pool);
         for (int i = 0; i < statsWishCount && i < wishes.Count; i++)
         {
             var wish = wishes[i];
@@ -782,9 +823,7 @@ public sealed class MainWindow : Window
             string tip = fullName.Length > 5 ? fullName : null;
             if (!Equals(ToolTipService.GetToolTip(wishPageNames[i]), tip)) ToolTipService.SetToolTip(wishPageNames[i], tip);
             decimal target = Math.Max(0, wish.Target);
-            decimal available = split ? share : remaining;
-            decimal progress = target > 0 ? Math.Min(target, available) : 0;
-            if (!split) remaining = Math.Max(0, remaining - progress);
+            decimal progress = i < progressByWish.Length ? progressByWish[i] : 0;
             int percent = target > 0 ? (int)Math.Floor(progress / target * 100) : 0;
             string text = percent.ToString(CultureInfo.InvariantCulture) + "%";
             if (wishPagePercents[i].Text != text) wishPagePercents[i].Text = text;
@@ -1807,7 +1846,26 @@ public sealed class MainWindow : Window
         int due = reminders.Tick(now, elapsed.Elapsed, settings);
         if (due != 0) QueueReminders(due);
         UpdateNap(now);
-        if (!smoke && settings.UseChinaHolidays && holidayDay != now.Date) { holidayDay = now.Date; _ = calendar.RefreshAsync(now.Year, false); }
+        if (!smoke && holidayDay != now.Date)
+        {
+            holidayDay = now.Date;
+            // A manual make-up day only applies to its own date; drop it once
+            // that date has passed, even when the app stays open overnight.
+            string todayKey = now.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            if (settings.DateAdjustments != null &&
+                settings.DateAdjustments.RemoveAll(a => a == null || string.CompareOrdinal(a.Date, todayKey) < 0) > 0)
+            {
+                settingsWindow?.PruneExpiredAdjustments();
+                Save();
+            }
+            if (settings.UseChinaHolidays)
+            {
+                // Upcoming years can be published early; keep two years ahead warm.
+                _ = calendar.RefreshAsync(now.Year, false);
+                _ = calendar.RefreshAsync(now.Year + 1, false);
+                _ = calendar.RefreshAsync(now.Year + 2, false);
+            }
+        }
     }
 
     System.Collections.Generic.List<WishEntry> ValidWishes()
@@ -1818,6 +1876,24 @@ public sealed class MainWindow : Window
                 if (wish != null && !string.IsNullOrWhiteSpace(wish.Name) && wish.Target > 0 && wish.Saved >= 0)
                     wishes.Add(wish);
         return wishes;
+    }
+
+    void UpdateWishCompletion(System.Collections.Generic.List<WishEntry> wishes, decimal[] progress)
+    {
+        var completed = new System.Collections.Generic.HashSet<string>();
+        for (int i = 0; i < wishes.Count && i < progress.Length; i++)
+        {
+            var wish = wishes[i];
+            decimal target = Math.Max(0, wish.Target);
+            if (target <= 0 || progress[i] < target - .005m) continue;
+            string key = wish.Name + "|" + wish.Target.ToString(CultureInfo.InvariantCulture);
+            completed.Add(key);
+            if (wishCompletionPrimed && settings.WishEnabled && !completedWishKeys.Contains(key))
+                CelebrateWishCompleted(wish.Name);
+        }
+        completedWishKeys.Clear();
+        foreach (var key in completed) completedWishKeys.Add(key);
+        wishCompletionPrimed = true;
     }
 
     void UpdateNap(DateTime now)
@@ -2373,8 +2449,8 @@ public sealed class MainWindow : Window
             glassTarget = settings.NightMode ? 1.0 : 0.0;
             if (desktopSource.IsReady)
             {
-                // Both manual materials are fixed, but the ink follows the text
-                // area so it stays readable on dark or light wallpapers.
+                // Both manual materials stay fixed, but the outer heading
+                // follows the background so it stays readable on any wallpaper.
                 double textLight = desktopSource.TextRegionLuminance ?? desktopSource.TextLuminance;
                 textTarget = textLight < .43 ? 1 : textLight > .53 ? 0 : textAppearanceInitialized ? textTargetTone : textLight < .48 ? 1 : 0;
             }
@@ -2394,10 +2470,14 @@ public sealed class MainWindow : Window
         }
         UpdateTextTransition();
 
-        // The inner stats/wish card follows the background in every mode, so its
-        // ink stays readable inside the fixed day/night outer material.
-        if (desktopSource.IsReady && desktopSource.StatsDark is bool dark) statsDark = dark;
-        else if (!desktopSource.IsReady && !statsAppearanceInitialized) statsDark = textTarget > .5;
+        // The inner stats/wish card keeps the day/night material; only the text
+        // ink follows the background.
+        if (settings.AutomaticAppearance)
+        {
+            if (desktopSource.IsReady && desktopSource.StatsDark is bool dark) statsDark = dark;
+            else if (!desktopSource.IsReady && !statsAppearanceInitialized) statsDark = textTarget > .5;
+        }
+        else statsDark = settings.NightMode;
         double targetTone = statsDark ? 1 : 0;
         if (!statsAppearanceInitialized)
         {
@@ -2513,21 +2593,57 @@ public sealed class MainWindow : Window
         statsTone = statsFromTone + (statsTargetTone - statsFromTone) * eased;
         if (progress >= 1) statsAppearanceClock.Stop();
         byte Mix(double light, double dark) => (byte)Math.Round(light + (dark - light) * statsTone);
-        var ink = Windows.UI.Color.FromArgb(255, Mix(24, 255), Mix(26, 255), Mix(30, 255));
+        // Card tint stays fixed by mode; its ink uses the same adaptive tone as
+        // the outer heading.
+        byte inkTone = (byte)Math.Round(20 + 235 * lightness);
+        var ink = Windows.UI.Color.FromArgb(255, inkTone, inkTone, inkTone);
         if (statsForeground.Color != ink) statsForeground.Color = ink;
-        byte eyeTone = Mix(0, 255);
-        var eyeColor = Windows.UI.Color.FromArgb(16, eyeTone, eyeTone, eyeTone);
-        if (eyeBackground.Color != eyeColor) eyeBackground.Color = eyeColor;
-        var hoverColor = Windows.UI.Color.FromArgb(36, eyeTone, eyeTone, eyeTone);
-        if (eyeHoverBackground.Color != hoverColor) eyeHoverBackground.Color = hoverColor;
-        var pressedColor = Windows.UI.Color.FromArgb(52, eyeTone, eyeTone, eyeTone);
-        if (eyePressedBackground.Color != pressedColor) eyePressedBackground.Color = pressedColor;
+        // The eye sits on the stats card, so derive its chip tone from the card
+        // (light card -> dark chip, black card -> light chip), not the outer ink.
+        byte eyeTone = (byte)Math.Round(20 + 235 * statsTone);
+        if (eyeGlass.GradientStops.Count == 0)
+        {
+            foreach (var brush in new[] { eyeGlass, eyeHoverGlass, eyePressedGlass })
+            {
+                brush.Center = new Windows.Foundation.Point(.5, .5);
+                brush.GradientOrigin = new Windows.Foundation.Point(.5, .5);
+                brush.RadiusX = .5;
+                brush.RadiusY = .5;
+                foreach (double offset in new[] { 0d, .45, .7, .88, 1d })
+                    brush.GradientStops.Add(new GradientStop { Offset = offset });
+            }
+        }
+        // Long feathered fade with no rim, matching the settings arrows.
+        void SetEyeChip(RadialGradientBrush brush, byte a0, byte a1, byte a2, byte a3)
+        {
+            brush.GradientStops[0].Color = Windows.UI.Color.FromArgb(a0, eyeTone, eyeTone, eyeTone);
+            brush.GradientStops[1].Color = Windows.UI.Color.FromArgb(a1, eyeTone, eyeTone, eyeTone);
+            brush.GradientStops[2].Color = Windows.UI.Color.FromArgb(a2, eyeTone, eyeTone, eyeTone);
+            brush.GradientStops[3].Color = Windows.UI.Color.FromArgb(a3, eyeTone, eyeTone, eyeTone);
+            brush.GradientStops[4].Color = Windows.UI.Color.FromArgb(0, eyeTone, eyeTone, eyeTone);
+        }
+        SetEyeChip(eyeGlass, 20, 18, 13, 6);
+        SetEyeChip(eyeHoverGlass, 34, 30, 21, 10);
+        SetEyeChip(eyePressedGlass, 46, 41, 29, 14);
         var tint = Windows.UI.Color.FromArgb(210, Mix(245, 40), Mix(245, 40), Mix(248, 44));
         if (statsBackground.Color != tint) statsBackground.Color = tint;
         if (statsGlass.FallbackColor != tint) statsGlass.FallbackColor = tint;
         if (Math.Abs(statsGlass.TintR - tint.R) > .5) { statsGlass.TintR = tint.R; statsGlass.TintG = tint.G; statsGlass.TintB = tint.B; }
         double alpha = .42 - .06 * statsTone;
         if (Math.Abs(statsGlass.TintA - alpha) > .001) statsGlass.TintA = alpha;
+    }
+
+    void PopEyeButton()
+    {
+        if (disposed || !uiSettings.AnimationsEnabled) return;
+        var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(earningsEye);
+        visual.CenterPoint = new System.Numerics.Vector3((float)earningsEye.ActualWidth / 2, (float)earningsEye.ActualHeight / 2, 0);
+        var spring = visual.Compositor.CreateSpringVector3Animation();
+        spring.DampingRatio = .32f;
+        spring.Period = TimeSpan.FromMilliseconds(220);
+        spring.InitialValue = new System.Numerics.Vector3(1.18f, 1.18f, 1);
+        spring.FinalValue = new System.Numerics.Vector3(1, 1, 1);
+        visual.StartAnimation("Scale", spring);
     }
 
     async Task<bool> RevealSalary(XamlRoot root)
@@ -3503,6 +3619,86 @@ public sealed class MainWindow : Window
         };
         coinStories.Add(story); story.Begin();
         GlassProfile.Event("coin-milestone " + count);
+    }
+
+    void CelebrateWishCompleted(string name)
+    {
+        if (!uiSettings.AnimationsEnabled) return;
+        if (!trackingCoins)
+        {
+            coinPopup.XamlRoot = surface.XamlRoot;
+            PositionCoinLayer();
+            coinPopup.IsOpen = true;
+            trackingCoins = true;
+            CompositionTarget.Rendering += TrackCoinLayer;
+        }
+        var story = new Storyboard();
+        var visuals = new System.Collections.Generic.List<UIElement>();
+        void Add(UIElement visual, double left, double top)
+        {
+            Canvas.SetLeft(visual, left); Canvas.SetTop(visual, top);
+            visuals.Add(visual); coins.Children.Add(visual);
+        }
+        void Animate(DependencyObject target, string property, double from, double to, int start, int duration, bool ease = true)
+        {
+            var animation = new DoubleAnimation
+            {
+                From = from, To = to, BeginTime = TimeSpan.FromMilliseconds(start),
+                Duration = new Duration(TimeSpan.FromMilliseconds(duration)),
+                EasingFunction = ease ? new CubicEase { EasingMode = EasingMode.EaseOut } : null
+            };
+            Storyboard.SetTarget(animation, target); Storyboard.SetTargetProperty(animation, property);
+            story.Children.Add(animation);
+        }
+        bool paleBackground = textAppearanceInitialized && lightness < .5;
+        var gold = new SolidColorBrush(paleBackground ? Windows.UI.Color.FromArgb(255, 111, 79, 30) : Windows.UI.Color.FromArgb(255, 255, 232, 174));
+        var palette = new[] { Windows.UI.Color.FromArgb(255, 255, 214, 120), Windows.UI.Color.FromArgb(255, 255, 170, 200), Windows.UI.Color.FromArgb(255, 150, 200, 255) };
+        string display = string.IsNullOrWhiteSpace(name) ? "小心愿" : name.Trim();
+        double width = Math.Min(212, Math.Max(120, coins.Width - 32));
+        var label = new Border
+        {
+            Width = width, IsHitTestVisible = false,
+            Child = new TextBlock
+            {
+                Text = "心愿达成 · " + display, FontSize = 15, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = gold, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.NoWrap,
+                TextTrimming = TextTrimming.CharacterEllipsis, IsTextScaleFactorEnabled = false
+            }
+        };
+        double centerX = coins.Width / 2;
+        double centerY = CoinHeadroom + Math.Max(24, (coins.Height - CoinHeadroom) * .6);
+        Add(label, centerX - width / 2, centerY - 14);
+        var labelMove = new TranslateTransform { Y = 8 }; label.RenderTransform = labelMove;
+        Animate(labelMove, "Y", 8, 0, 0, 260);
+        Animate(label, "Opacity", 1, 0, 2600, 400, false);
+        int sparks = 12;
+        for (int i = 0; i < sparks; i++)
+        {
+            double angle = Math.PI * 2 * i / sparks;
+            double distance = 26 + (i % 4) * 6;
+            var spark = new TextBlock
+            {
+                Text = i % 3 == 0 ? "✦" : "•", FontSize = i % 3 == 0 ? 13 : 10,
+                Foreground = new SolidColorBrush(palette[i % palette.Length]),
+                IsTextScaleFactorEnabled = false, RenderTransformOrigin = new Point(.5, .5)
+            };
+            Add(spark, centerX - 6, centerY - 6);
+            var movement = new CompositeTransform(); spark.RenderTransform = movement;
+            double endX = Math.Clamp(centerX + Math.Cos(angle) * distance, 8, coins.Width - 16) - centerX;
+            double endY = Math.Clamp(centerY + Math.Sin(angle) * distance * .7, CoinHeadroom + 8, coins.Height - 16) - centerY;
+            int duration = 900 + (i % 4) * 90;
+            Animate(movement, "TranslateX", 0, endX, 0, duration);
+            Animate(movement, "TranslateY", 0, endY, 0, duration);
+            Animate(spark, "Opacity", 1, 0, 180, duration, false);
+        }
+        story.Completed += (_, __) =>
+        {
+            coinStories.Remove(story);
+            foreach (var visual in visuals) coins.Children.Remove(visual);
+            if (coins.Children.Count == 0) CloseCoinLayer();
+        };
+        coinStories.Add(story); story.Begin();
+        GlassProfile.Event("wish-completed");
     }
 
     bool isDragging, endingDrag, dragMoved, dragUsesMouse, dragReleasePending;
@@ -4661,6 +4857,8 @@ public sealed class MainWindow : Window
             ShowSalaryLayout = s.ShowSalaryLayout,
             WishEnabled = s.WishEnabled,
             Wishes = s.Wishes != null ? s.Wishes.ConvertAll(w => new WishEntry { Name = w.Name, Target = w.Target, Saved = w.Saved }) : new System.Collections.Generic.List<WishEntry>(),
+            WishAllocation = s.WishAllocation,
+            WishStartDate = s.WishStartDate,
             WishName = s.WishName,
             WishTarget = s.WishTarget,
             WishSaved = s.WishSaved,

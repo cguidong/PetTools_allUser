@@ -5,7 +5,10 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.70"
+  #define AppVersion "1.0.94"
+#endif
+#ifndef MinWindowsVersion
+  #define MinWindowsVersion "10.0.19041"
 #endif
 #ifdef InstallerQATest
   #define ProductId "{{C2D1CD23-3649-437D-B077-0B40C4B13FA0}"
@@ -14,7 +17,11 @@
   #define ShortcutName "有盼安装测试"
 #else
   #define ProductId "{{B312EA3B-93C3-481D-AF00-5F60D9B84B35}"
-  #define OutputName "有盼-Setup-" + AppVersion + "-x64"
+  #ifndef CustomOutputName
+    #define OutputName "有盼-Setup-" + AppVersion + "-x64"
+  #else
+    #define OutputName CustomOutputName
+  #endif
   #define InstallLeaf "YouPan"
   #define ShortcutName "有盼"
 #endif
@@ -33,7 +40,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
-MinVersion=10.0.19041
+MinVersion={#MinWindowsVersion}
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputName}
 SetupIconFile={#PayloadDir}\assets\app-icon.ico
@@ -183,7 +190,7 @@ begin
   Heading := TNewStaticText.Create(WizardForm);
   Heading.Parent := InstallPage.Surface;
   Heading.SetBounds(0, ScaleY(28), InstallPage.SurfaceWidth, ScaleY(42));
-  Heading.Caption := '把下班，设成期待';
+  Heading.Caption := '有盼';
   Heading.Font.Name := 'Microsoft YaHei UI';
   Heading.Font.Size := 20;
   Heading.Font.Style := [fsBold];
@@ -193,7 +200,7 @@ begin
   Detail.SetBounds(0, ScaleY(88), InstallPage.SurfaceWidth, ScaleY(40));
   Detail.AutoSize := False;
   Detail.WordWrap := True;
-  Detail.Caption := '倒计时、休息安排与贴心提醒，安静陪伴每个工作日。';
+  Detail.Caption := '把下班，设成期待。倒计时、休息安排与贴心提醒，安静陪伴每个工作日。';
   Detail.Font.Name := 'Microsoft YaHei UI';
   Detail.Font.Size := 10;
   Detail.Font.Color := $00807870;
@@ -377,20 +384,20 @@ begin
     Dialog.Caption := '有盼 卸载';
     Dialog.BorderStyle := bsDialog;
     Dialog.Color := clWhite;
-    Dialog.ClientWidth := ScaleX(700);
-    Dialog.ClientHeight := ScaleY(470);
+    Dialog.ClientWidth := ScaleX(584);
+    Dialog.ClientHeight := ScaleY(384);
     Dialog.Position := poScreenCenter;
     Dialog.Font.Name := 'Microsoft YaHei UI';
     Dialog.Font.Size := 10;
     Heading := TNewStaticText.Create(Dialog);
     Heading.Parent := Dialog;
-    Heading.SetBounds(ScaleX(28), ScaleY(24), ScaleX(644), ScaleY(36));
+    Heading.SetBounds(ScaleX(20), ScaleY(16), ScaleX(544), ScaleY(36));
     Heading.Caption := '卸载有盼';
     Heading.Font.Size := 18;
     Heading.Font.Style := [fsBold];
     Subheading := TNewStaticText.Create(Dialog);
     Subheading.Parent := Dialog;
-    Subheading.SetBounds(ScaleX(28), ScaleY(66), ScaleX(644), ScaleY(22));
+    Subheading.SetBounds(ScaleX(20), ScaleY(54), ScaleX(544), ScaleY(22));
     Subheading.Caption := '卸载选项';
     Subheading.Font.Size := 11;
     Subheading.Font.Color := clGray;
@@ -398,21 +405,21 @@ begin
     Divider.Parent := Dialog;
     Divider.BevelOuter := bvNone;
     Divider.Color := clSilver;
-    Divider.SetBounds(ScaleX(28), ScaleY(102), ScaleX(644), ScaleY(1));
+    Divider.SetBounds(ScaleX(20), ScaleY(84), ScaleX(544), ScaleY(1));
     Description := TNewStaticText.Create(Dialog);
     Description.Parent := Dialog;
-    Description.SetBounds(ScaleX(28), ScaleY(126), ScaleX(644), ScaleY(56));
+    Description.SetBounds(ScaleX(20), ScaleY(104), ScaleX(544), ScaleY(48));
     Description.AutoSize := False;
     Description.WordWrap := True;
     Description.Caption := '将移除有盼的程序文件。本机设置、心愿和金额密码默认保留，重新安装后可以继续使用。';
     RemoveCheck := TNewCheckBox.Create(Dialog);
     RemoveCheck.Parent := Dialog;
-    RemoveCheck.SetBounds(ScaleX(28), ScaleY(202), ScaleX(644), ScaleY(26));
+    RemoveCheck.SetBounds(ScaleX(20), ScaleY(166), ScaleX(544), ScaleY(26));
     RemoveCheck.Caption := '同时删除本机设置、心愿和金额密码';
     RemoveCheck.Checked := False;
     Warning := TNewStaticText.Create(Dialog);
     Warning.Parent := Dialog;
-    Warning.SetBounds(ScaleX(28), ScaleY(238), ScaleX(644), ScaleY(44));
+    Warning.SetBounds(ScaleX(20), ScaleY(198), ScaleX(544), ScaleY(40));
     Warning.AutoSize := False;
     Warning.WordWrap := True;
     Warning.Font.Size := 9;
@@ -420,13 +427,13 @@ begin
     Warning.Caption := '勾选后，卸载会同时删除这些本机数据，且无法恢复。';
     ContinueButton := TNewButton.Create(Dialog);
     ContinueButton.Parent := Dialog;
-    ContinueButton.SetBounds(ScaleX(460), ScaleY(410), ScaleX(110), ScaleY(32));
+    ContinueButton.SetBounds(ScaleX(364), ScaleY(336), ScaleX(100), ScaleY(30));
     ContinueButton.Caption := '继续卸载';
     ContinueButton.ModalResult := mrOk;
     ContinueButton.Default := True;
     CancelButton := TNewButton.Create(Dialog);
     CancelButton.Parent := Dialog;
-    CancelButton.SetBounds(ScaleX(582), ScaleY(410), ScaleX(90), ScaleY(32));
+    CancelButton.SetBounds(ScaleX(474), ScaleY(336), ScaleX(90), ScaleY(30));
     CancelButton.Caption := '取消';
     CancelButton.ModalResult := mrCancel;
     CancelButton.Cancel := True;

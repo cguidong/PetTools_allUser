@@ -1,4 +1,4 @@
-﻿param([string]$CompilerPath,[string]$PayloadDir,[string]$OutputDir,[switch]$SkipPublish,[switch]$InstallerQATest)
+﻿param([string]$CompilerPath,[string]$PayloadDir,[string]$OutputDir,[switch]$SkipPublish,[switch]$InstallerQATest,[string]$MinWindowsVersion,[string]$OutputName)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 if (!$OutputDir) { $OutputDir = Join-Path (Split-Path $root -Parent) '有盼-安装包' }
@@ -38,12 +38,14 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 $arguments = @("/DPayloadDir=$PayloadDir", "/DOutputDir=$OutputDir", "/DAppVersion=$version")
 if ($InstallerQATest) { $arguments += '/DInstallerQATest' }
+if ($MinWindowsVersion) { $arguments += "/DMinWindowsVersion=$MinWindowsVersion" }
+if ($OutputName) { $arguments += "/DCustomOutputName=$OutputName" }
 & $CompilerPath @arguments (Join-Path $PSScriptRoot 'OffWorkWidget.iss')
 if ($LASTEXITCODE -ne 0) { throw '安装包编译失败。' }
 if (!$InstallerQATest) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-Path $OutputDir 'README.md') -Force
 }
-$name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } else { "有盼-Setup-$version-x64.exe" }
+$name = if ($InstallerQATest) { 'OffWorkWidget-Installer-QA.exe' } elseif ($OutputName) { "$OutputName.exe" } else { "有盼-Setup-$version-x64.exe" }
 $artifact = Join-Path $OutputDir $name
 $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
 [IO.File]::WriteAllText("$artifact.sha256", "$($hash.Hash)  $name`r`n", [Text.UTF8Encoding]::new($true))

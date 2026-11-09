@@ -25,6 +25,17 @@ internal static class StartupRegistration
         return command;
     }
 
+    internal static void RepairPathIfNeeded()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKey, true);
+        if (key?.GetValue(ValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) is not string command) return;
+        // Only heal our own value; leave unrelated startup entries untouched.
+        if (command.IndexOf("OffWorkWidget.WinUI.exe", StringComparison.OrdinalIgnoreCase) < 0) return;
+        string expected = Command();
+        if (!string.Equals(command, expected, StringComparison.OrdinalIgnoreCase))
+            key.SetValue(ValueName, expected, RegistryValueKind.String);
+    }
+
     internal static void SetEnabled(bool enabled)
     {
         if (enabled)

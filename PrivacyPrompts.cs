@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Collections.Generic;
@@ -18,9 +19,17 @@ namespace OffWorkWidget.WinUI
         enum Mode { Unlock, Create, Change, Reset }
         static readonly HashSet<XamlRoot> activeRoots = new HashSet<XamlRoot>();
 
-        public static Task<bool> UnlockAsync(XamlRoot root, PrivacyStore store, ElementTheme? theme = null)
+        const int MaxUnlockAttempts = 5;
+        public static async Task<bool> UnlockAsync(XamlRoot root, PrivacyStore store, ElementTheme? theme = null)
         {
-            return BeginAsync(root, store, store.HasPassword ? Mode.Unlock : Mode.Create, theme);
+            if (!store.HasPassword) return await BeginAsync(root, store, Mode.Create, theme);
+            // Five failed tries force the reset flow (new password, salary zeroed).
+            if (store.UnlockFailures >= MaxUnlockAttempts)
+            {
+                await BeginAsync(root, store, Mode.Reset, theme);
+                return false;
+            }
+            return await BeginAsync(root, store, Mode.Unlock, theme);
         }
 
         public static Task<bool> ChangeAsync(XamlRoot root, PrivacyStore store, ElementTheme? theme = null)
@@ -133,7 +142,20 @@ namespace OffWorkWidget.WinUI
                 {
                     if (mode == Mode.Unlock)
                     {
-                        if (!await store.VerifyAsync(current.Password, cancellation.Token)) throw new ArgumentException("密码不正确，请重新输入。");
+                        if (!await store.VerifyAsync(current.Password, cancellation.Token))
+                        {
+                            int failures = store.UnlockFailures;
+                            if (failures >= MaxUnlockAttempts)
+                            {
+                                // Five failures lock the amount and wipe the stored
+                                // salary; only a password reset can re-enable it.
+                                try { store.SaveSalary(0); } catch (IOException) { }
+                                resetRequested = true;
+                                dialog.Hide();
+                                return;
+                            }
+                            throw new ArgumentException($"密码不正确，还可尝试 {MaxUnlockAttempts - failures} 次；连续失败 {MaxUnlockAttempts} 次将要求重置密码并清零薪资。");
+                        }
                     }
                     else
                     {

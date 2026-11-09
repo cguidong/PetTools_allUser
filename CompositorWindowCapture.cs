@@ -318,7 +318,14 @@ internal static class CompositorWindowCapture
                 // One retained frame for recropping, one being read, and one pending producer frame.
                 newPool = Direct3D11CaptureFramePool.CreateFreeThreaded(newDevice, DirectXPixelFormat.B8G8R8A8UIntNormalized, 3, newItem.Size);
                 newSession = newPool.CreateCaptureSession(newItem);
-                newSession.IsCursorCaptureEnabled = false;
+                // The cursor flag only exists from Windows 10 2004 onward.
+                if (Windows.Foundation.Metadata.ApiInformation.IsPropertyPresent(
+                    "Windows.Graphics.Capture.GraphicsCaptureSession", "IsCursorCaptureEnabled"))
+                {
+#pragma warning disable CA1416
+                    newSession.IsCursorCaptureEnabled = false;
+#pragma warning restore CA1416
+                }
                 LimitCaptureRate(newSession);
                 // Windows 10 19041/19045 supports WGC but not this newer border property.
                 // Retain its system-default capture border; never request permission here.

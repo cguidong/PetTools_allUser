@@ -37,9 +37,9 @@ namespace OffWorkWidget
         public static string DisplayName(string? value)
         {
             string normalized = Normalize(value);
-            return normalized == Aurora ? "液态极光"
-                : normalized == Orbit ? "轨道光点"
-                : "柔光呼吸";
+            return normalized == Aurora ? "极光"
+                : normalized == Orbit ? "轨道"
+                : "柔光";
         }
     }
     public class WishEntry
@@ -62,8 +62,8 @@ namespace OffWorkWidget
         public int PayDay = 10;
         public bool Topmost = true;
         public bool MouseClickThrough = false;
-        public int HoverDragSeconds = 3;
-        public string HoverEffect = HoverEffects.Halo;
+        public int HoverDragSeconds = 1;
+        public string HoverEffect = HoverEffects.Orbit;
         public bool NightMode = false;
         public bool AutomaticAppearance = true;
         public string PetId = "polar-bear";
@@ -78,6 +78,7 @@ namespace OffWorkWidget
         public bool WishEnabled = false;
         public System.Collections.Generic.List<WishEntry> Wishes = new System.Collections.Generic.List<WishEntry>();
         public string WishAllocation = "sequential";
+        public string WishStartDate = "";
         // Legacy single-wish fields, kept only to migrate existing settings files.
         public string WishName = "";
         public decimal WishTarget = 0;
@@ -316,15 +317,72 @@ namespace OffWorkWidget
             double ratio = duration > 0 ? Math.Max(0, Math.Min(1, elapsed / duration)) : 0;
             return s.Salary / s.WorkDays * (decimal)ratio;
         }
-        public static decimal EarnedSinceLastPayday(DateTime now, Settings s)
+        public static decimal EarnedSinceLastPayday(DateTime now, Settings s) =>
+            EarnedSince(CurrentPayCycleStart(now, s), now, s);
+        public static DateTime CurrentPayCycleStart(DateTime now, Settings s)
         {
             DateTime currentPay = PayDate(now.Year, now.Month, s.PayDay);
             DateTime previous = now.AddMonths(-1);
-            DateTime start = now.Date >= currentPay ? currentPay : PayDate(previous.Year, previous.Month, s.PayDay);
+            return now.Date >= currentPay ? currentPay : PayDate(previous.Year, previous.Month, s.PayDay);
+        }
+        public static decimal EarnedSince(DateTime startDate, DateTime now, Settings s)
+        {
             decimal total = 0;
-            for (DateTime day = start; day < now.Date; day = day.AddDays(1))
+            for (DateTime day = startDate.Date; day < now.Date; day = day.AddDays(1))
                 if (WorkingDay(day, s)) total += s.Salary / s.WorkDays;
             return total + Earned(now, s);
+        }
+        // Wish progress uses a fixed anchor so it never drops back at payday.
+        public static decimal WishEarned(DateTime now, Settings s)
+        {
+            if (DateTime.TryParseExact(s.WishStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime start) && start <= now.Date)
+                return EarnedSince(start, now, s);
+            return EarnedSinceLastPayday(now, s);
+        }
+        public static decimal WishPool(DateTime now, Settings s)
+        {
+            decimal pool = WishEarned(now, s);
+            if (s.Wishes != null) foreach (var wish in s.Wishes)
+                if (wish != null && !string.IsNullOrWhiteSpace(wish.Name) && wish.Target > 0 && wish.Saved >= 0)
+                    pool += Math.Max(0, wish.Saved);
+            return pool;
+        }
+        public static decimal[] AllocateWishProgress(System.Collections.Generic.IReadOnlyList<WishEntry> wishes, string allocation, decimal pool)
+        {
+            int count = wishes?.Count ?? 0;
+            var result = new decimal[count];
+            if (count == 0) return result;
+            if (allocation != "split")
+            {
+                decimal remaining = pool;
+                for (int i = 0; i < count; i++)
+                {
+                    decimal target = Math.Max(0, wishes[i].Target);
+                    decimal progress = target > 0 ? Math.Min(target, remaining) : 0;
+                    result[i] = progress;
+                    remaining = Math.Max(0, remaining - progress);
+                }
+                return result;
+            }
+            var unmet = new System.Collections.Generic.List<int>();
+            for (int i = 0; i < count; i++) if (wishes[i].Target > 0) unmet.Add(i);
+            decimal unassigned = pool;
+            while (unassigned > .005m && unmet.Count > 0)
+            {
+                decimal share = unassigned / unmet.Count;
+                decimal assigned = 0;
+                for (int k = unmet.Count - 1; k >= 0; k--)
+                {
+                    int index = unmet[k];
+                    decimal need = Math.Max(0, wishes[index].Target - result[index]);
+                    decimal add = Math.Min(need, share);
+                    result[index] += add; assigned += add;
+                    if (result[index] >= wishes[index].Target - .005m) unmet.RemoveAt(k);
+                }
+                if (assigned <= .005m) break;
+                unassigned -= assigned;
+            }
+            return result;
         }
         static DateTime PayDate(int year, int month, int day) =>
             new DateTime(year, month, Math.Min(day, DateTime.DaysInMonth(year, month)));
@@ -333,6 +391,71 @@ namespace OffWorkWidget
             DateTime pay = new DateTime(now.Year, now.Month, Math.Min(day, DateTime.DaysInMonth(now.Year, now.Month)));
             if (pay < now.Date) { DateTime next = now.AddMonths(1); pay = new DateTime(next.Year, next.Month, Math.Min(day, DateTime.DaysInMonth(next.Year, next.Month))); }
             return (pay - now.Date).Days;
+        }
+        // Repair individual fields so one bad value cannot discard every setting.
+        public static void Repair(Settings s)
+        {
+            if (s == null) return;
+            static bool ValidTime(string? value, out TimeSpan time)
+            {
+                try { time = Time(value ?? ""); return true; }
+                catch (FormatException) { time = default; return false; }
+            }
+            if (!ValidTime(s.Start, out TimeSpan start) || !ValidTime(s.End, out TimeSpan end) || end <= start)
+            { s.Start = "09:00"; s.End = "18:00"; }
+            if (!ValidTime(s.LunchStart, out TimeSpan lunchStart) || !ValidTime(s.LunchEnd, out TimeSpan lunchEnd) || lunchEnd <= lunchStart)
+            { s.LunchStart = "12:00"; s.LunchEnd = "13:00"; }
+            if (s.WorkScheduleMode != "" && s.WorkScheduleMode != "double" && s.WorkScheduleMode != "single" && s.WorkScheduleMode != "alternating" && s.WorkScheduleMode != "custom")
+                s.WorkScheduleMode = "";
+            if (s.WorkSchedules != null)
+            {
+                var seenModes = new System.Collections.Generic.HashSet<string>();
+                s.WorkSchedules.RemoveAll(p => p == null || (p.Mode != "double" && p.Mode != "single" && p.Mode != "alternating" && p.Mode != "custom") || !seenModes.Add(p.Mode));
+                foreach (var profile in s.WorkSchedules)
+                {
+                    if (!ValidTime(profile.Start, out TimeSpan ps) || !ValidTime(profile.End, out TimeSpan pe) || pe <= ps)
+                    { profile.Start = "09:00"; profile.End = "18:00"; }
+                    if (profile.DayTimes != null)
+                    {
+                        var seenDays = new System.Collections.Generic.HashSet<int>();
+                        profile.DayTimes.RemoveAll(d => d == null || d.Day < 0 || d.Day > 6 || !seenDays.Add(d.Day) ||
+                            (d.Enabled && (!ValidTime(d.Start, out TimeSpan ds) || !ValidTime(d.End, out TimeSpan de) || de <= ds)));
+                    }
+                    if (profile.SaturdayEnabled &&
+                        (!ValidTime(profile.SaturdayStart, out TimeSpan ss) || !ValidTime(profile.SaturdayEnd, out TimeSpan se) || se <= ss))
+                        profile.SaturdayEnabled = false;
+                }
+            }
+            if (s.Salary < 0 || s.Salary > 100000000) s.Salary = Math.Clamp(s.Salary, 0, 100000000);
+            if (s.WorkDays <= 0 || s.WorkDays > 31) s.WorkDays = 21.75m;
+            if (s.PayDay < 1 || s.PayDay > 31) s.PayDay = 10;
+            if (s.WaterMinutes < 1 || s.WaterMinutes > 720) s.WaterMinutes = 60;
+            if (s.WalkMinutes < 1 || s.WalkMinutes > 720) s.WalkMinutes = 90;
+            if (s.HoverDragSeconds < 1 || s.HoverDragSeconds > 3) s.HoverDragSeconds = 1;
+            if (s.AmountVisibleSeconds < 0 || s.AmountVisibleSeconds > 86400) s.AmountVisibleSeconds = 0;
+            if (s.ReminderPosition != "custom" && s.ReminderPosition != "center" && s.ReminderPosition != "top-left" && s.ReminderPosition != "top-center" && s.ReminderPosition != "top-right" &&
+                s.ReminderPosition != "center-left" && s.ReminderPosition != "center-right" && s.ReminderPosition != "bottom-left" &&
+                s.ReminderPosition != "bottom-center" && s.ReminderPosition != "bottom-right")
+                s.ReminderPosition = "bottom-right";
+            if (double.IsNaN(s.ReminderWidth) || double.IsInfinity(s.ReminderWidth) || s.ReminderWidth < 280 || s.ReminderWidth > 800) s.ReminderWidth = 360;
+            if (double.IsNaN(s.ReminderHeight) || double.IsInfinity(s.ReminderHeight) || s.ReminderHeight < 190 || s.ReminderHeight > 600) s.ReminderHeight = 205;
+            if (s.RestDays < 0 || s.RestDays > 127) s.RestDays = 65;
+            if (s.SingleRestDays < 0 || s.SingleRestDays > 127 || RestDayCount(s.SingleRestDays) != 1) s.SingleRestDays = 1;
+            if (s.DoubleRestDays < 0 || s.DoubleRestDays > 127 || RestDayCount(s.DoubleRestDays) != 2) s.DoubleRestDays = 65;
+            if (s.AlternatingWeekends &&
+                (!DateTime.TryParseExact(s.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime anchor) || anchor.DayOfWeek != DayOfWeek.Monday))
+                s.DoubleRestWeekStart = WeekStart(DateTime.Today).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            if (s.DateAdjustments != null)
+            {
+                var seenDates = new System.Collections.Generic.HashSet<string>();
+                s.DateAdjustments.RemoveAll(a => a == null ||
+                    !DateTime.TryParseExact(a.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _) || !seenDates.Add(a.Date));
+            }
+            if (double.IsNaN(s.Scale) || double.IsInfinity(s.Scale) || s.Scale < .5 || s.Scale > 1.5) s.Scale = 1;
+            if (s.WishAllocation != "sequential" && s.WishAllocation != "split") s.WishAllocation = "sequential";
+            NormalizeWishes(s);
+            s.Wishes.RemoveAll(w => w == null || string.IsNullOrWhiteSpace(w.Name) || w.Target <= 0 || w.Target > 100000000 || w.Saved < 0 || w.Saved > 100000000);
+            if (s.Wishes.Count > MaxWishes) s.Wishes.RemoveRange(MaxWishes, s.Wishes.Count - MaxWishes);
         }
         public static void Validate(Settings s)
         {

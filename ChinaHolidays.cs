@@ -26,11 +26,14 @@ namespace OffWorkWidget
         internal ChinaHolidayCalendar(string cacheFolder)
         {
             this.cacheFolder = Path.GetFullPath(cacheFolder);
+            // Past-year arrangements can never apply again; ignore them so the
+            // loaded calendar only carries the current and future years.
+            int currentYear = DateTime.Now.Year;
             Assembly assembly = Assembly.GetExecutingAssembly();
             foreach(string name in assembly.GetManifestResourceNames())
             {
                 int year;
-                if(!TryFileYear(name, out year)) continue;
+                if(!TryFileYear(name, out year) || year < currentYear) continue;
                 try
                 {
                     using(Stream stream = assembly.GetManifestResourceStream(name))
@@ -46,6 +49,12 @@ namespace OffWorkWidget
                 {
                     int year;
                     if(!TryFileYear(Path.GetFileName(path), out year)) continue;
+                    if(year < currentYear)
+                    {
+                        // Past-year caches can never apply again; remove them too.
+                        try { File.Delete(path); } catch(IOException) { } catch(UnauthorizedAccessException) { }
+                        continue;
+                    }
                     try
                     {
                         if(new FileInfo(path).Length > MaximumBytes) continue;

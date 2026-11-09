@@ -24,6 +24,7 @@ namespace OffWorkWidget
                 Check(Native.sqlite3_busy_timeout(db, 3000));
                 Execute("PRAGMA secure_delete=ON");
                 Execute("CREATE TABLE IF NOT EXISTS privacy (id INTEGER PRIMARY KEY CHECK(id=1), salt TEXT NOT NULL, hash TEXT NOT NULL, rounds TEXT NOT NULL, salary TEXT NOT NULL)");
+                Execute("CREATE TABLE IF NOT EXISTS privacy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
                 if (Read() == null) Execute("INSERT INTO privacy(id,salt,hash,rounds,salary) VALUES(1,'','','',?)", Seal(initialSalary));
                 LoadSalary(); // A damaged database must not fall back to an unlocked default.
             }
@@ -60,12 +61,15 @@ namespace OffWorkWidget
             finally { Array.Clear(actual,0,actual.Length); Array.Clear(expected,0,expected.Length); }
         }
         // Only PBKDF2 runs on the pool; database access resumes on the calling UI context.
+        public int UnlockFailures => ReadMetaInt("unlock_failures");
         public async Task<bool> VerifyAsync(string password, CancellationToken cancellationToken = default)
         {
             var row = ReadRequired();
             cancellationToken.ThrowIfCancellationRequested();
             bool verified = await Task.Run(() => VerifyRow(password, row), cancellationToken);
             EnsurePasswordState(row, cancellationToken);
+            if (verified) WriteMetaInt("unlock_failures", 0);
+            else WriteMetaInt("unlock_failures", Math.Min(999, UnlockFailures + 1));
             return verified;
         }
         public async Task SetInitialPasswordAsync(string password, CancellationToken cancellationToken = default)
@@ -98,6 +102,7 @@ namespace OffWorkWidget
                 hash = await Task.Run(() => Derive(password, salt, Rounds), cancellationToken);
                 EnsurePasswordState(original, cancellationToken);
                 CommitPassword(salt, hash, resetSalary);
+                WriteMetaInt("unlock_failures", 0);
             }
             finally
             {
@@ -132,7 +137,7 @@ namespace OffWorkWidget
             ValidatePassword(password);
             byte[] salt = new byte[32]; using(var random = RandomNumberGenerator.Create()) random.GetBytes(salt);
             byte[] hash = Derive(password,salt,Rounds);
-            try { CommitPassword(salt, hash, resetSalary); }
+            try { CommitPassword(salt, hash, resetSalary); WriteMetaInt("unlock_failures", 0); }
             finally { Array.Clear(hash,0,hash.Length); }
         }
         void CommitPassword(byte[] salt, byte[] hash, bool resetSalary)
@@ -183,6 +188,29 @@ namespace OffWorkWidget
                 int result = Native.sqlite3_step(stmt); if(result != 101 && result != 100) Check(result);
             }
             finally { Native.sqlite3_finalize(stmt); }
+        }
+        int ReadMetaInt(string key)
+        {
+            IntPtr stmt = Prepare("SELECT value FROM privacy_meta WHERE key=?");
+            try
+            {
+                byte[] text = Utf8(key);
+                Check(Native.sqlite3_bind_text(stmt, 1, text, text.Length - 1, new IntPtr(-1)));
+                int result = Native.sqlite3_step(stmt);
+                if (result == 101) return 0;
+                if (result != 100) Check(result);
+                int length = Native.sqlite3_column_bytes(stmt, 0);
+                byte[] bytes = new byte[length];
+                Marshal.Copy(Native.sqlite3_column_text(stmt, 0), bytes, 0, length);
+                return int.TryParse(Encoding.UTF8.GetString(bytes), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value)
+                    ? Math.Max(0, value) : 0;
+            }
+            finally { Native.sqlite3_finalize(stmt); }
+        }
+        void WriteMetaInt(string key, int value)
+        {
+            Execute("INSERT OR REPLACE INTO privacy_meta(key,value) VALUES(?,?)",
+                key, value.ToString(CultureInfo.InvariantCulture));
         }
         static byte[] Utf8(string text) { return Encoding.UTF8.GetBytes(text + "\0"); }
         static void Check(int result) { if(result != 0) throw new IOException("隐私数据库操作失败，错误码：" + result); }

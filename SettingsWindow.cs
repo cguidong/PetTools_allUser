@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Diagnostics;
@@ -31,7 +31,7 @@ namespace OffWorkWidget.WinUI
         readonly Grid windowSurface = new Grid();
         readonly SystemBackdropElement frostedBackground = new SystemBackdropElement { CornerRadius = new CornerRadius(WindowCornerRadius), IsHitTestVisible = false };
         Border? glassRim;
-        readonly SolidColorBrush glassRimBrush = new SolidColorBrush();
+        readonly LinearGradientBrush glassRimBrush = new LinearGradientBrush { StartPoint = new Windows.Foundation.Point(0, 0), EndPoint = new Windows.Foundation.Point(0, 1) };
         readonly Border glassTint = new Border { CornerRadius = new CornerRadius(WindowCornerRadius), IsHitTestVisible = false };
         readonly SolidColorBrush glassTintBrush = new SolidColorBrush();
         readonly Border glassSheen = new Border { CornerRadius = new CornerRadius(WindowCornerRadius - 1), IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Top, Height = 220 };
@@ -96,12 +96,16 @@ namespace OffWorkWidget.WinUI
         TextBlock wishCount = null!;
         ComboBox wishAllocation = null!;
         readonly List<WishRowEditor> wishRows = new();
+        readonly HashSet<string> achievedWishKeys = new();
         sealed class WishRowEditor
         {
             internal FrameworkElement Card = null!;
             internal TextBox Name = null!, Target = null!, Saved = null!;
             internal Button Delete = null!;
+            internal TextBlock? Status;
         }
+        static string WishKey(OffWorkWidget.WishEntry wish) =>
+            wish.Name + "|" + wish.Target.ToString(CultureInfo.InvariantCulture);
         int waterMinutes, walkMinutes;
         ComboBox reminderDisplay = null!;
         string reminderPosition = "center";
@@ -132,6 +136,7 @@ namespace OffWorkWidget.WinUI
         ToggleSwitch startup = null!, mouseClickThrough = null!;
         ComboBox hoverDragSeconds = null!;
         Grid hoverDragRow = null!;
+        Action<bool>? hoverOptionsRevealAction;
         bool startupInitiallyEnabled;
         TextBlock holidayStatus, passwordStatus, scaleLabel;
         Action? refreshAdjustmentReveal;
@@ -148,6 +153,9 @@ namespace OffWorkWidget.WinUI
         long titleSpringLastTick;
         Border toolbar = null!;
         Button autoAppearanceButton = null!, dayAppearanceButton = null!, nightAppearanceButton = null!, backToTop = null!, footerCancel = null!;
+        Button? lastSelectedAppearanceButton;
+        bool appearanceSelectionReady;
+        long appearancePopGuardUntil;
         readonly ScaleTransform footerArrowScale = new ScaleTransform { ScaleX = 0, ScaleY = 0 };
         readonly Stopwatch footerChromeClock = new Stopwatch();
         bool animatingFooterChrome;
@@ -202,6 +210,10 @@ namespace OffWorkWidget.WinUI
         readonly SolidColorBrush cardBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush inputBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush selectionBackgroundBrush = new SolidColorBrush();
+        readonly RadialGradientBrush appearanceSelectionBrush = new RadialGradientBrush();
+        readonly SolidColorBrush appearanceSelectionRimBrush = new SolidColorBrush();
+        readonly RadialGradientBrush eyeGlassBrush = new RadialGradientBrush();
+        readonly RadialGradientBrush chipHoverBrush = new RadialGradientBrush();
         readonly SolidColorBrush restPresetSelectionBrush = new SolidColorBrush();
         readonly SolidColorBrush restPresetBorderBrush = new SolidColorBrush();
         readonly SolidColorBrush timeHoverBrush = new SolidColorBrush();
@@ -222,7 +234,9 @@ namespace OffWorkWidget.WinUI
             alternatingWeekends = current.AlternatingWeekends;
             doubleRestWeekStart = DateTime.TryParseExact(current.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime anchor)
                 ? OffWorkWidget.Logic.WeekStart(anchor) : OffWorkWidget.Logic.WeekStart(DateTime.Today);
+            string todayKey = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             adjustments = (current.DateAdjustments ?? new List<OffWorkWidget.DateAdjustment>())
+                .Where(a => a != null && string.CompareOrdinal(a.Date, todayKey) >= 0)
                 .Select(a => new OffWorkWidget.DateAdjustment { Date = a.Date, IsWorkday = a.IsWorkday }).ToList();
 
             startTime = OffWorkWidget.Logic.Time(current.Start);
@@ -589,11 +603,70 @@ namespace OffWorkWidget.WinUI
             headerBackgroundBrush.TintLuminosityOpacity = dark ? .40 : .85;
             headerBackgroundBrush.FallbackColor = dark ? Windows.UI.Color.FromArgb(255, 28, 28, 30) : Windows.UI.Color.FromArgb(255, 242, 242, 247);
             UpdateHeaderTransition();
+            if (eyeGlassBrush.GradientStops.Count == 0)
+            {
+                eyeGlassBrush.Center = new Windows.Foundation.Point(.5, .5);
+                eyeGlassBrush.GradientOrigin = new Windows.Foundation.Point(.5, .5);
+                eyeGlassBrush.RadiusX = .5;
+                eyeGlassBrush.RadiusY = .5;
+                foreach (double offset in new[] { 0, .45, .7, .88, 1 })
+                    eyeGlassBrush.GradientStops.Add(new GradientStop { Offset = offset });
+            }
+            // Neutral ink-toned fill with a long fade and no rim, so the chip
+            // has no visible edge against the card.
+            byte chipTone = dark ? (byte)242 : (byte)28;
+            eyeGlassBrush.GradientStops[0].Color = Windows.UI.Color.FromArgb(dark ? (byte)18 : (byte)10, chipTone, chipTone, chipTone);
+            eyeGlassBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(dark ? (byte)16 : (byte)9, chipTone, chipTone, chipTone);
+            eyeGlassBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(dark ? (byte)12 : (byte)7, chipTone, chipTone, chipTone);
+            eyeGlassBrush.GradientStops[3].Color = Windows.UI.Color.FromArgb(dark ? (byte)5 : (byte)3, chipTone, chipTone, chipTone);
+            eyeGlassBrush.GradientStops[4].Color = Windows.UI.Color.FromArgb(0, chipTone, chipTone, chipTone);
+            if (chipHoverBrush.GradientStops.Count == 0)
+            {
+                chipHoverBrush.Center = new Windows.Foundation.Point(.5, .5);
+                chipHoverBrush.GradientOrigin = new Windows.Foundation.Point(.5, .5);
+                chipHoverBrush.RadiusX = .5;
+                chipHoverBrush.RadiusY = .5;
+                foreach (double offset in new[] { 0, .7, .88, 1 })
+                    chipHoverBrush.GradientStops.Add(new GradientStop { Offset = offset });
+            }
+            chipHoverBrush.GradientStops[0].Color = Windows.UI.Color.FromArgb(dark ? (byte)42 : (byte)26, chipTone, chipTone, chipTone);
+            chipHoverBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(dark ? (byte)36 : (byte)22, chipTone, chipTone, chipTone);
+            chipHoverBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(dark ? (byte)18 : (byte)11, chipTone, chipTone, chipTone);
+            chipHoverBrush.GradientStops[3].Color = Windows.UI.Color.FromArgb(0, chipTone, chipTone, chipTone);
             if (autoAppearanceButton != null)
             {
-                autoAppearanceButton.Background = automatic ? selectionBackgroundBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-                dayAppearanceButton.Background = !automatic && !dark ? selectionBackgroundBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-                nightAppearanceButton.Background = !automatic && dark ? selectionBackgroundBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+                if (appearanceSelectionBrush.GradientStops.Count == 0)
+                {
+                    appearanceSelectionBrush.Center = new Windows.Foundation.Point(.5, .5);
+                    appearanceSelectionBrush.GradientOrigin = new Windows.Foundation.Point(.5, .5);
+                    appearanceSelectionBrush.RadiusX = .5;
+                    appearanceSelectionBrush.RadiusY = .5;
+                    foreach (double offset in new[] { 0, .7, .88, 1 })
+                        appearanceSelectionBrush.GradientStops.Add(new GradientStop { Offset = offset });
+                }
+                // Light keeps the soft white highlight; dark uses a neutral ink
+                // chip because white glowed too brightly on the smoked header.
+                byte selR = dark ? chipTone : (byte)255, selG = dark ? chipTone : (byte)255, selB = dark ? chipTone : (byte)255;
+                appearanceSelectionBrush.GradientStops[0].Color = Windows.UI.Color.FromArgb(dark ? (byte)54 : (byte)152, selR, selG, selB);
+                appearanceSelectionBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(dark ? (byte)46 : (byte)144, selR, selG, selB);
+                appearanceSelectionBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(dark ? (byte)22 : (byte)82, selR, selG, selB);
+                appearanceSelectionBrush.GradientStops[3].Color = Windows.UI.Color.FromArgb(0, selR, selG, selB);
+                appearanceSelectionRimBrush.Color = Windows.UI.Color.FromArgb(dark ? (byte)28 : (byte)115, selR, selG, selB);
+                void StyleAppearance(Button button, bool selected)
+                {
+                    button.Background = selected ? appearanceSelectionBrush : new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+                    button.BorderBrush = selected ? appearanceSelectionRimBrush : null;
+                    button.BorderThickness = selected ? new Thickness(1) : new Thickness(0);
+                }
+                StyleAppearance(autoAppearanceButton, automatic);
+                StyleAppearance(dayAppearanceButton, !automatic && !dark);
+                StyleAppearance(nightAppearanceButton, !automatic && dark);
+                var selected = automatic ? autoAppearanceButton : dark ? nightAppearanceButton : dayAppearanceButton;
+                if (appearanceSelectionReady && selected != lastSelectedAppearanceButton &&
+                    Environment.TickCount64 >= appearancePopGuardUntil)
+                    PopSpringElement(selected);
+                lastSelectedAppearanceButton = selected;
+                appearanceSelectionReady = true;
             }
             inkBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 242, 242, 247) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
             subInkBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 174, 174, 182) : Windows.UI.Color.FromArgb(255, 107, 107, 116);
@@ -632,9 +705,16 @@ namespace OffWorkWidget.WinUI
                 glassSheenBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(mid, 255, 255, 255);
                 glassSheenBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(0, 255, 255, 255);
             }
-            glassRimBrush.Color = dark
-                ? Windows.UI.Color.FromArgb(22, 255, 255, 255)
-                : Windows.UI.Color.FromArgb(55, 255, 255, 255);
+            if (glassRimBrush.GradientStops.Count == 0)
+            {
+                foreach (double offset in new[] { 0d, .55, 1d })
+                    glassRimBrush.GradientStops.Add(new GradientStop { Offset = offset });
+            }
+            // Light falls from above: bright top edge fading to almost nothing
+            // at the bottom, so the outline no longer reads as a hard ring.
+            glassRimBrush.GradientStops[0].Color = Windows.UI.Color.FromArgb(dark ? (byte)24 : (byte)58, 255, 255, 255);
+            glassRimBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(dark ? (byte)10 : (byte)24, 255, 255, 255);
+            glassRimBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(dark ? (byte)2 : (byte)6, 255, 255, 255);
             if (glassRim != null) glassRim.Visibility = Visibility.Visible;
 
             foreach (var card in cardBorders)
@@ -644,9 +724,28 @@ namespace OffWorkWidget.WinUI
         }
 
 
-        void UpdatePetWheelFade()
+        static Brush MenuFrost(bool dark)
         {
-            if (petWheelFade.GradientStops.Count != 3) return;
+            var brush = new LinearGradientBrush
+            {
+                StartPoint = new Windows.Foundation.Point(0, 0),
+                EndPoint = new Windows.Foundation.Point(0, 1)
+            };
+            brush.GradientStops.Add(new GradientStop
+            {
+                Offset = 0,
+                Color = dark ? Windows.UI.Color.FromArgb(255, 46, 46, 49) : Windows.UI.Color.FromArgb(255, 252, 252, 255)
+            });
+            brush.GradientStops.Add(new GradientStop
+            {
+                Offset = 1,
+                Color = dark ? Windows.UI.Color.FromArgb(255, 34, 34, 37) : Windows.UI.Color.FromArgb(255, 246, 248, 252)
+            });
+            return brush;
+        }
+
+        void UpdatePetWheelFade()
+        {            if (petWheelFade.GradientStops.Count != 3) return;
             var c = petWheelSurfaceBrush.Color;
             var clear = Windows.UI.Color.FromArgb(0, c.R, c.G, c.B);
             petWheelFade.GradientStops[0].Color = c;
@@ -797,9 +896,17 @@ namespace OffWorkWidget.WinUI
             titleVisual.Properties.InsertVector3("Translation", new System.Numerics.Vector3(0, 40, 0));
             compactTitle.SizeChanged += (_, __) => titleVisual.CenterPoint = new System.Numerics.Vector3(0, (float)compactTitle.ActualHeight / 2, 0);
             var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
-            autoAppearanceButton = CreateHeaderIconButton("\uE7F4", "自适应：跟随系统日间/夜间", () => ChangeAppearance(AppearanceMode.Automatic));
-            dayAppearanceButton = CreateHeaderIconButton("\uE706", "日间模式", () => ChangeAppearance(AppearanceMode.Day));
-            nightAppearanceButton = CreateHeaderIconButton("\uE708", "夜间模式", () => ChangeAppearance(AppearanceMode.Night));
+            void ChooseAppearance(Button button, AppearanceMode mode)
+            {
+                // The click plays the pop right away; the selection-change pop
+                // below covers switches applied later (fade or pending mode).
+                appearancePopGuardUntil = Environment.TickCount64 + 260;
+                PopSpringElement(button);
+                ChangeAppearance(mode);
+            }
+            autoAppearanceButton = CreateHeaderIconButton("\uE7F4", "自适应：跟随系统日间/夜间", () => ChooseAppearance(autoAppearanceButton, AppearanceMode.Automatic));
+            dayAppearanceButton = CreateHeaderIconButton("\uE706", "日间模式", () => ChooseAppearance(dayAppearanceButton, AppearanceMode.Day));
+            nightAppearanceButton = CreateHeaderIconButton("\uE708", "夜间模式", () => ChooseAppearance(nightAppearanceButton, AppearanceMode.Night));
             var closeBtn = CreateHeaderIconButton("\uE711", "关闭设置", () => CloseSettings());
             right.Children.Add(autoAppearanceButton); right.Children.Add(dayAppearanceButton); right.Children.Add(nightAppearanceButton); right.Children.Add(closeBtn);
             header.Children.Add(right);
@@ -852,7 +959,7 @@ namespace OffWorkWidget.WinUI
                 if (!petCommitted) initialPetId = petId;
             }
             int count = ids.Length, repeats = 7, visibleRows = 3;
-            double rowHeight = 72, viewportHeight = rowHeight * visibleRows;
+            double rowHeight = 66, viewportHeight = rowHeight * visibleRows;
             double padding = (viewportHeight - rowHeight) / 2;
             double IconShift(string id) => id == "polar-bear" ? -3 : 0;
 
@@ -878,7 +985,7 @@ namespace OffWorkWidget.WinUI
             petStack.Children.Add(petThumb); petStack.Children.Add(petArrow);
             petBtn.Content = petStack;
 
-            const double petIconRestScale = 1, petIconSelectedScale = 1.35;
+            const double petIconRestScale = 1, petIconSelectedScale = 1.32;
             var petImages = new Dictionary<string, BitmapImage>();
             foreach (string id in ids) petImages[id] = PetImage(id);
 
@@ -915,10 +1022,10 @@ namespace OffWorkWidget.WinUI
                 };
                 // The outer grid carries the Q弹 pop so it never fights the
                 // proximity scale used while the wheel is scrolling.
-                var popHost = new Grid { Width = 64, Height = 64, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                var popHost = new Grid { Width = 60, Height = 60, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
                 popHost.Children.Add(new Image
                 {
-                    Source = petImages[id], Width = 40, Height = 46,
+                    Source = petImages[id], Width = 38, Height = 44,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
                     RenderTransform = iconScale,
@@ -1074,11 +1181,11 @@ namespace OffWorkWidget.WinUI
                 if (wheelIndex < 0 || wheelIndex >= rowPops.Count || !animationSettings.AnimationsEnabled) return;
                 if (GlassProfile.Enabled) GlassProfile.Event($"pet-pop {wheelIndex}");
                 var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(rowPops[wheelIndex]);
-                visual.CenterPoint = new System.Numerics.Vector3(32, 32, 0);
+                visual.CenterPoint = new System.Numerics.Vector3(30, 30, 0);
                 var spring = visual.Compositor.CreateSpringVector3Animation();
                 spring.DampingRatio = .3f;
                 spring.Period = TimeSpan.FromMilliseconds(190);
-                spring.InitialValue = new System.Numerics.Vector3(1.12f, 1.12f, 1);
+                spring.InitialValue = new System.Numerics.Vector3(1.10f, 1.10f, 1);
                 spring.FinalValue = new System.Numerics.Vector3(1, 1, 1);
                 visual.StartAnimation("Scale", spring);
             }
@@ -1140,7 +1247,7 @@ namespace OffWorkWidget.WinUI
                 args.Handled = true;
             };
 
-            var panel = new StackPanel { Width = 118 };
+            var panel = new StackPanel { Width = 108 };
             panel.Children.Add(wheelHost);
             var focusSink = new Button
             {
@@ -1158,7 +1265,7 @@ namespace OffWorkWidget.WinUI
             var petMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left };
             var menuSurface = new Border
             {
-                CornerRadius = new CornerRadius(16), Padding = new Thickness(6),
+                CornerRadius = new CornerRadius(16), Padding = new Thickness(5),
                 Child = flyoutRoot
             };
             petMenu.Content = menuSurface;
@@ -1180,9 +1287,12 @@ namespace OffWorkWidget.WinUI
                 wheelOpen = false;
                 petKeyboardOpen = petBtn.FocusState == FocusState.Keyboard;
                 panel.RequestedTheme = root.ActualTheme;
-                menuSurface.Background = new SolidColorBrush(root.ActualTheme == ElementTheme.Dark
-                    ? Windows.UI.Color.FromArgb(255, 44, 44, 46)
-                    : Microsoft.UI.Colors.White);
+                bool dark = root.ActualTheme == ElementTheme.Dark;
+                menuSurface.Background = MenuFrost(dark);
+                menuSurface.BorderThickness = new Thickness(1);
+                menuSurface.BorderBrush = new SolidColorBrush(dark
+                    ? Windows.UI.Color.FromArgb(30, 255, 255, 255)
+                    : Windows.UI.Color.FromArgb(90, 255, 255, 255));
                 selection.Background = new SolidColorBrush(root.ActualTheme == ElementTheme.Dark
                     ? Windows.UI.Color.FromArgb(255, 58, 58, 60)
                     : Windows.UI.Color.FromArgb(255, 239, 240, 244));
@@ -1428,6 +1538,19 @@ namespace OffWorkWidget.WinUI
             ToolTipService.SetToolTip(btn, tooltip);
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(btn, tooltip);
             return btn;
+        }
+
+        void PopSpringElement(FrameworkElement? element)
+        {
+            if (element == null || windowClosed || !animationSettings.AnimationsEnabled) return;
+            var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(element);
+            visual.CenterPoint = new System.Numerics.Vector3((float)element.ActualWidth / 2, (float)element.ActualHeight / 2, 0);
+            var spring = visual.Compositor.CreateSpringVector3Animation();
+            spring.DampingRatio = .32f;
+            spring.Period = TimeSpan.FromMilliseconds(220);
+            spring.InitialValue = new System.Numerics.Vector3(1.18f, 1.18f, 1);
+            spring.FinalValue = new System.Numerics.Vector3(1, 1, 1);
+            visual.StartAnimation("Scale", spring);
         }
 
         void BuildWorkingHoursContent()
@@ -2166,6 +2289,8 @@ namespace OffWorkWidget.WinUI
             var rows = new StackPanel();
             rows.Children.Add(new Border { Height = padding });
             var labels = new List<TextBlock>();
+            var labelScales = new List<CompositeTransform>();
+            var labelPops = new List<Grid>();
             var viewer = new ScrollViewer
             {
                 Height = viewportHeight, Content = rows,
@@ -2178,25 +2303,50 @@ namespace OffWorkWidget.WinUI
                 IsTabStop = true
             };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(viewer, name);
+            const double labelRestScale = 1, labelSelectedScale = 1.22;
             for (int index = 0; index < count * repeats; index++)
             {
                 int selected = index;
+                var labelScale = new CompositeTransform { ScaleX = 1, ScaleY = 1 };
                 var text = new TextBlock
                 {
                     Text = (index % count).ToString("00", CultureInfo.InvariantCulture),
                     FontSize = visibleRows == 3 ? 20 : 23, Foreground = new SolidColorBrush(foreground),
                     VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
-                    FontFamily = new FontFamily("Segoe UI Variable Display")
+                    FontFamily = new FontFamily("Segoe UI Variable Display"),
+                    RenderTransform = labelScale, RenderTransformOrigin = new Windows.Foundation.Point(.5, .5)
                 };
                 text.Opacity = .2;
                 labels.Add(text);
-                var row = new Border { Height = rowHeight, Child = text, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+                // The pop host carries the Q弹 spring so it never fights the
+                // proximity scale applied while the wheel is scrolling.
+                var popHost = new Grid
+                {
+                    Height = rowHeight, HorizontalAlignment = HorizontalAlignment.Stretch,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                popHost.Children.Add(text);
+                var row = new Border { Height = rowHeight, Child = popHost, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
                 row.Tapped += (_, __) => viewer.ChangeView(null, selected * rowHeight, null, false);
+                labelScales.Add(labelScale); labelPops.Add(popHost);
                 rows.Children.Add(row);
             }
             rows.Children.Add(new Border { Height = padding });
             bool initialized = false;
-            int previousFirst = 0, previousLast = -1;
+            int previousFirst = 0, previousLast = -1, previousCenter = -1;
+            void PopLabel(int wheelIndex)
+            {
+                if (wheelIndex < 0 || wheelIndex >= labelPops.Count || !animationSettings.AnimationsEnabled) return;
+                var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(labelPops[wheelIndex]);
+                var size = visual.Size;
+                visual.CenterPoint = new System.Numerics.Vector3(size.X * .5f, size.Y * .5f, 0);
+                var spring = visual.Compositor.CreateSpringVector3Animation();
+                spring.DampingRatio = .3f;
+                spring.Period = TimeSpan.FromMilliseconds(190);
+                spring.InitialValue = new System.Numerics.Vector3(1.10f, 1.10f, 1);
+                spring.FinalValue = new System.Numerics.Vector3(1, 1, 1);
+                visual.StartAnimation("Scale", spring);
+            }
             void UpdateSelection(bool notify = true)
             {
                 double position = viewer.VerticalOffset / rowHeight;
@@ -2204,11 +2354,26 @@ namespace OffWorkWidget.WinUI
                 if (notify) changed(index % count);
                 // Rows more than three steps away all have the same opacity.
                 // Reset the previous neighborhood, then update only the new one.
-                for (int i = previousFirst; i <= previousLast; i++) labels[i].Opacity = .2;
+                for (int i = previousFirst; i <= previousLast; i++)
+                {
+                    labels[i].Opacity = .2;
+                    labelScales[i].ScaleX = labelScales[i].ScaleY = 1;
+                }
                 int first = Math.Max(0, (int)Math.Floor(position) - 3);
                 int last = Math.Min(labels.Count - 1, (int)Math.Ceiling(position) + 3);
                 for (int i = first; i <= last; i++)
-                    labels[i].Opacity = Math.Max(.2, 1 - Math.Abs(i - position) * .3);
+                {
+                    double distance = Math.Abs(i - position);
+                    labels[i].Opacity = Math.Max(.2, 1 - distance * .3);
+                    double proximity = Math.Max(0, 1 - distance);
+                    double eased = proximity * proximity * (3 - 2 * proximity);
+                    labelScales[i].ScaleX = labelScales[i].ScaleY =
+                        labelRestScale + (labelSelectedScale - labelRestScale) * eased;
+                }
+                // Only a single-row crossing is the selection moving on; larger
+                // jumps are recentering or programmatic value sync.
+                if (notify && previousCenter >= 0 && Math.Abs(index - previousCenter) == 1) PopLabel(previousCenter);
+                previousCenter = index;
                 previousFirst = first; previousLast = last;
             }
             EventHandler<object>? initialize = null;
@@ -2303,7 +2468,7 @@ namespace OffWorkWidget.WinUI
             wishDetailsProgress = current.WishEnabled ? 1 : 0;
             wishDetailsHost = new Border { Child = details, Visibility = current.WishEnabled ? Visibility.Visible : Visibility.Collapsed };
             wishEnabled.Toggled += (_, __) => ToggleWishDetails(wishEnabled.IsOn);
-            details.Children.Add(new TextBlock { Text = "进度 = 已攒 + 上次发薪后工资", FontSize = 13, Foreground = subInkBrush });
+            details.Children.Add(new TextBlock { Text = "进度 = 已攒 + 心愿开始后累计工资", FontSize = 13, Foreground = subInkBrush });
             var allocationRow = new Grid { ColumnSpacing = 8 };
             allocationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             allocationRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -2367,6 +2532,17 @@ namespace OffWorkWidget.WinUI
             card.Child = panel;
 
             OffWorkWidget.Logic.NormalizeWishes(current);
+            achievedWishKeys.Clear();
+            if (current.Wishes.Count > 0)
+            {
+                decimal pool = OffWorkWidget.Logic.WishPool(DateTime.Now, current);
+                var progress = OffWorkWidget.Logic.AllocateWishProgress(current.Wishes, current.WishAllocation, pool);
+                for (int i = 0; i < current.Wishes.Count && i < progress.Length; i++)
+                {
+                    var wish = current.Wishes[i];
+                    if (wish.Target > 0 && progress[i] >= wish.Target - .005m) achievedWishKeys.Add(WishKey(wish));
+                }
+            }
             foreach (var wish in current.Wishes) AddWishRow(wish);
             UpdateWishAddState();
             return card;
@@ -2383,7 +2559,6 @@ namespace OffWorkWidget.WinUI
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
             var editor = new WishRowEditor
             {
-                Card = grid,
                 Name = CreateInputBox(blank ? "" : row.Name),
                 Target = CreateInputBox(blank ? "" : row.Target.ToString(CultureInfo.InvariantCulture)),
                 Saved = CreateInputBox(blank ? "" : row.Saved.ToString(CultureInfo.InvariantCulture))
@@ -2421,12 +2596,40 @@ namespace OffWorkWidget.WinUI
             {
                 wishRows.Remove(editor);
                 wishRowsHost.Children.Remove(editor.Card);
+                RenumberWishRows();
                 UpdateWishAddState();
             };
             Grid.SetColumn(editor.Delete, 3); grid.Children.Add(editor.Delete);
+            var rowContainer = new StackPanel { Spacing = 3 };
+            rowContainer.Children.Add(grid);
+            if (!blank && achievedWishKeys.Contains(WishKey(wish)))
+            {
+                editor.Status = new TextBlock
+                {
+                    Text = "已达成", FontSize = 11.5, Foreground = accentBlue,
+                    Margin = new Thickness(9, 0, 0, 0), IsTextScaleFactorEnabled = false
+                };
+                rowContainer.Children.Add(editor.Status);
+            }
+            editor.Card = rowContainer;
             wishRows.Add(editor);
-            wishRowsHost.Children.Add(grid);
+            wishRowsHost.Children.Add(editor.Card);
+            RenumberWishRows();
             UpdateWishAddState();
+        }
+
+        void RenumberWishRows()
+        {
+            for (int index = 0; index < wishRows.Count; index++)
+            {
+                var row = wishRows[index];
+                int number = index + 1;
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(row.Name, "心愿名称 " + number);
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(row.Target, "目标金额 " + number + "，元");
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(row.Saved, "已攒金额 " + number + "，元");
+                if (row.Delete != null)
+                    Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(row.Delete, "删除心愿 " + number);
+            }
         }
 
         void UpdateWishAddState()
@@ -2441,10 +2644,14 @@ namespace OffWorkWidget.WinUI
 
         Border CreateChevronSurface(Button owner, Grid icon)
         {
-            var clear = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
-            var surface = new Border { Width = 24, Height = 24, CornerRadius = new CornerRadius(12), Background = clear, Child = icon };
-            owner.PointerEntered += (_, __) => surface.Background = timeHoverBrush;
-            owner.PointerExited += (_, __) => surface.Background = clear;
+            var surface = new Border
+            {
+                Width = 24, Height = 24, CornerRadius = new CornerRadius(12),
+                Background = eyeGlassBrush, Child = icon
+            };
+            owner.PointerEntered += (_, __) => surface.Background = chipHoverBrush;
+            owner.PointerExited += (_, __) => surface.Background = eyeGlassBrush;
+            owner.Click += (_, __) => PopSpringElement(surface);
             return surface;
         }
 
@@ -2480,9 +2687,7 @@ namespace OffWorkWidget.WinUI
 
             var title = new TextBlock { Text = titleText, FontSize = 14, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
             chevron = CreateChevron();
-            var chevronSurface = new Border { Width = 24, Height = 24, CornerRadius = new CornerRadius(12), Background = transparent, Child = chevron };
-            btn.PointerEntered += (_, __) => chevronSurface.Background = timeHoverBrush;
-            btn.PointerExited += (_, __) => chevronSurface.Background = transparent;
+            var chevronSurface = CreateChevronSurface(btn, chevron);
 
             var labels = new StackPanel { Spacing = 2 };
             labels.Children.Add(title);
@@ -2832,8 +3037,9 @@ namespace OffWorkWidget.WinUI
             var eyeBtn = new Button
             {
                 Width = 24, Height = 24, MinWidth = 0, MinHeight = 0, Padding = new Thickness(0),
-                Background = inputBackgroundBrush, Foreground = subInkBrush,
-                BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(12),
+                Background = eyeGlassBrush, Foreground = subInkBrush,
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(12),
                 VerticalAlignment = VerticalAlignment.Center
             };
             salaryVisibilityIcon = new FontIcon
@@ -2842,12 +3048,13 @@ namespace OffWorkWidget.WinUI
                 Glyph = salaryAuthorized ? "\uE890" : "\uED1A", Foreground = subInkBrush
             };
             eyeBtn.Content = salaryVisibilityIcon;
-            eyeBtn.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
-            eyeBtn.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            eyeBtn.Resources["ButtonBackgroundPointerOver"] = chipHoverBrush;
+            eyeBtn.Resources["ButtonBackgroundPressed"] = chipHoverBrush;
             eyeBtn.Resources["ButtonForegroundPointerOver"] = inkBrush;
             eyeBtn.Resources["ButtonForegroundPressed"] = inkBrush;
             eyeBtn.Click += async (_, __) =>
             {
+                PopSpringElement(eyeBtn);
                 if (salaryAuthorized)
                 {
                     salaryDraft = salary.Text;
@@ -3267,7 +3474,8 @@ namespace OffWorkWidget.WinUI
             var holidayStatusRow = new Grid();
             holidayStatusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             holidayStatusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            holidayStatus = new TextBlock { Text = current.Calendar == null ? "节假日数据未加载" : current.Calendar.Status(DateTime.Now.Year), FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+            int calendarYear = DateTime.Now.Year;
+            holidayStatus = new TextBlock { Text = current.Calendar == null ? "节假日数据未加载" : current.Calendar.Status(calendarYear), FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
             var updateBtn = new Button { Content = "更新", Height = 32, MinWidth = 64, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 13 };
             updateBtn.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
             updateBtn.Resources["ButtonBackgroundPressed"] = timePressedBrush;
@@ -3275,7 +3483,16 @@ namespace OffWorkWidget.WinUI
             {
                 if (current.Calendar == null) return;
                 updateBtn.IsEnabled = false; holidayStatus.Text = "正在更新节假日…";
-                try { await current.Calendar.RefreshAsync(DateTime.Now.Year, true); holidayStatus.Text = current.Calendar.Status(DateTime.Now.Year); }
+                try
+                {
+                    // Next year's schedule is often published late in the current
+                    // year, so refresh both instead of only the calendar year.
+                    await Task.WhenAll(
+                        current.Calendar.RefreshAsync(calendarYear, true),
+                        current.Calendar.RefreshAsync(calendarYear + 1, true),
+                        current.Calendar.RefreshAsync(calendarYear + 2, true));
+                    holidayStatus.Text = current.Calendar.Status(calendarYear);
+                }
                 catch { holidayStatus.Text = "更新失败，继续使用本地安排。"; }
                 finally { updateBtn.IsEnabled = true; }
             };
@@ -3425,6 +3642,9 @@ namespace OffWorkWidget.WinUI
                 if (!from.Date.HasValue || !to.Date.HasValue) { adjErr.Text = "请选择开始和结束日期。"; adjErr.Visibility = Visibility.Visible; return; }
                 DateTime a = from.Date.Value.Date, b = to.Date.Value.Date;
                 if (b < a || (b - a).Days >= 366) { adjErr.Text = "结束日期不能早于开始日期，最多 366 天。"; adjErr.Visibility = Visibility.Visible; return; }
+                if (b < DateTime.Today) { adjErr.Text = "请选择今天或之后的日期。"; adjErr.Visibility = Visibility.Visible; return; }
+                // Ranges touching the past start today; earlier days were auto-cleaned.
+                if (a < DateTime.Today) a = DateTime.Today;
                 for (DateTime d = a; d <= b; d = d.AddDays(1))
                 {
                     string key = d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
@@ -3586,8 +3806,17 @@ namespace OffWorkWidget.WinUI
             restWeekHint.Opacity = 1;
         }
 
+        internal void PruneExpiredAdjustments()
+        {
+            RenderAdjustments();
+        }
+
         void RenderAdjustments()
         {
+            // Past make-up days have already taken effect; remove them instead
+            // of leaving stale rows for the user to clean up by hand.
+            string todayKey = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            adjustments.RemoveAll(a => string.CompareOrdinal(a.Date, todayKey) < 0);
             adjustmentRows.Children.Clear();
             adjustmentSummary.Text = adjustments.Count == 0 ? "按需设置" : $"{adjustments.Count} 天已调整";
             var ordered = adjustments.OrderBy(a => a.Date, StringComparer.Ordinal).ToList();
@@ -3998,8 +4227,7 @@ namespace OffWorkWidget.WinUI
         {
             bool enabled = mouseClickThrough?.IsOn == true;
             if (hoverDragRow is null) return;
-            hoverDragRow.Opacity = enabled ? 1 : .55;
-            if (hoverDragSeconds != null) hoverDragSeconds.IsEnabled = enabled;
+            hoverOptionsRevealAction?.Invoke(enabled);
         }
 
         void BuildWindowOptionsCard()
@@ -4017,16 +4245,14 @@ namespace OffWorkWidget.WinUI
             var throughRow = new Grid { ColumnSpacing = 12 };
             throughRow.ColumnDefinitions.Add(new ColumnDefinition());
             throughRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var throughLabels = new StackPanel { Spacing = 4 };
-            throughLabels.Children.Add(new TextBlock { Text = "鼠标穿透", FontSize = 14, Foreground = inkBrush });
-            throughLabels.Children.Add(new TextBlock
-            {
-                Text = "开启后点击会穿透到桌面；悬停可临时拖动挂件",
-                FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap
-            });
+            var throughLabels = new StackPanel { Spacing = 2 };
+            throughLabels.Children.Add(new TextBlock { Text = "鼠标穿透", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
+            throughLabels.Children.Add(new TextBlock { Text = "点击可穿透下一层", FontSize = 12, Foreground = subInkBrush, Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
             mouseClickThrough = CreateGreenSwitch(current.MouseClickThrough);
             mouseClickThrough.VerticalAlignment = VerticalAlignment.Center;
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(mouseClickThrough, "鼠标穿透");
+            ToolTipService.SetToolTip(mouseClickThrough, "开启后点击穿透到桌面；悬停可临时拖动挂件");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(mouseClickThrough, "开启后点击穿透到桌面；悬停可临时拖动挂件");
             throughRow.Children.Add(throughLabels);
             Grid.SetColumn(mouseClickThrough, 1); throughRow.Children.Add(mouseClickThrough);
             behavior.Children.Add(throughRow);
@@ -4034,26 +4260,82 @@ namespace OffWorkWidget.WinUI
             hoverDragRow = new Grid { ColumnSpacing = 12 };
             hoverDragRow.ColumnDefinitions.Add(new ColumnDefinition());
             hoverDragRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var hoverLabels = new StackPanel { Spacing = 4 };
-            hoverLabels.Children.Add(new TextBlock { Text = "悬停拖动", FontSize = 14, Foreground = inkBrush });
-            hoverLabels.Children.Add(new TextBlock
-            {
-                Text = "开启穿透时，鼠标悬停该时长即可临时拖动挂件",
-                FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap
-            });
+            var hoverLabels = new StackPanel { Spacing = 2 };
+            hoverLabels.Children.Add(new TextBlock { Text = "悬停拖动", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
+            int initialDragSeconds = Math.Clamp(current.HoverDragSeconds, 1, 3);
+            var hoverDragHint = new TextBlock { Text = $"悬停 {initialDragSeconds} 秒后可拖动", FontSize = 12, Foreground = subInkBrush, Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center };
+            hoverLabels.Children.Add(hoverDragHint);
             hoverDragSeconds = new ComboBox
             {
-                Height = 34, MinWidth = 92, FontSize = 13, Background = inputBackgroundBrush,
+                Height = 34, Width = 92, MinWidth = 0, FontSize = 13, Background = inputBackgroundBrush,
                 Foreground = inkBrush, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8),
                 HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center
             };
             for (int seconds = 1; seconds <= 3; seconds++) hoverDragSeconds.Items.Add(seconds + " 秒");
-            hoverDragSeconds.SelectedIndex = Math.Clamp(current.HoverDragSeconds, 1, 3) - 1;
+            hoverDragSeconds.SelectedIndex = initialDragSeconds - 1;
+            hoverDragSeconds.SelectionChanged += (_, __) =>
+            {
+                int seconds = hoverDragSeconds.SelectedIndex + 1;
+                if (seconds >= 1) hoverDragHint.Text = $"悬停 {seconds} 秒后可拖动";
+            };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(hoverDragSeconds, "鼠标穿透悬停拖动时长");
+            ToolTipService.SetToolTip(hoverDragSeconds, "鼠标穿透时，悬停该时长即可临时拖动挂件");
             hoverDragRow.Children.Add(hoverLabels);
             Grid.SetColumn(hoverDragSeconds, 1); hoverDragRow.Children.Add(hoverDragSeconds);
-            behavior.Children.Add(hoverDragRow);
-            behavior.Children.Add(BuildHoverEffectSelector());
+
+            var hoverOptions = new StackPanel { Spacing = 14 };
+            hoverOptions.Children.Add(hoverDragRow);
+            hoverOptions.Children.Add(BuildHoverEffectSelector());
+
+            // These two rows only exist while click-through is on; they reveal
+            // with an eased height/opacity transition.
+            var hoverReveal = new Border { Child = hoverOptions, Visibility = Visibility.Collapsed };
+            var hoverClip = new RectangleGeometry();
+            var hoverClock = new Stopwatch();
+            bool hoverShown = !current.MouseClickThrough, hoverAnimating = false;
+            double hoverHeight = 0, hoverFrom = 0, hoverTarget = 0, hoverOpacityFrom = 0;
+            void FinishHoverReveal()
+            {
+                CompositionTarget.Rendering -= AnimateHoverReveal;
+                hoverClock.Stop(); hoverAnimating = false; hoverHeight = hoverTarget;
+                hoverReveal.Height = double.NaN; hoverOptions.Height = double.NaN;
+                hoverReveal.Clip = null;
+                hoverReveal.Visibility = hoverShown ? Visibility.Visible : Visibility.Collapsed;
+                hoverReveal.Opacity = hoverShown ? 1 : 0;
+                hoverReveal.IsHitTestVisible = hoverShown;
+            }
+            void AnimateHoverReveal(object? sender, object args)
+            {
+                double progress = animationSettings.AnimationsEnabled ? Math.Clamp(hoverClock.Elapsed.TotalMilliseconds / 220, 0, 1) : 1;
+                double eased = progress * progress * (3 - 2 * progress);
+                hoverHeight = hoverFrom + (hoverTarget - hoverFrom) * eased;
+                hoverReveal.Height = hoverHeight;
+                hoverReveal.Opacity = hoverOpacityFrom + ((hoverShown ? 1 : 0) - hoverOpacityFrom) * eased;
+                hoverClip.Rect = new Windows.Foundation.Rect(0, 0, Math.Max(1, behavior.ActualWidth), Math.Max(0, hoverHeight));
+                hoverReveal.Clip = hoverClip;
+                if (progress >= 1) FinishHoverReveal();
+            }
+            void SetHoverOptionsVisible(bool show)
+            {
+                if (hoverShown == show && !hoverAnimating) return;
+                hoverShown = show;
+                hoverFrom = hoverAnimating ? hoverHeight : hoverReveal.Visibility == Visibility.Collapsed ? 0 : hoverReveal.ActualHeight;
+                hoverOptions.Height = double.NaN;
+                hoverOptions.Measure(new Windows.Foundation.Size(Math.Max(1, behavior.ActualWidth), double.PositiveInfinity));
+                double natural = hoverOptions.DesiredSize.Height;
+                hoverTarget = show ? natural : 0;
+                hoverOpacityFrom = hoverReveal.Visibility == Visibility.Collapsed ? 0 : hoverReveal.Opacity;
+                hoverReveal.IsHitTestVisible = show;
+                if (!root.IsLoaded || !animationSettings.AnimationsEnabled) { FinishHoverReveal(); return; }
+                hoverOptions.Height = natural;
+                hoverReveal.Visibility = Visibility.Visible;
+                hoverClock.Restart();
+                if (!hoverAnimating) { hoverAnimating = true; CompositionTarget.Rendering += AnimateHoverReveal; }
+                AnimateHoverReveal(null, null!);
+            }
+            hoverOptionsRevealAction = SetHoverOptionsVisible;
+            behavior.Children.Add(hoverReveal);
+            Closed += (_, __) => { CompositionTarget.Rendering -= AnimateHoverReveal; hoverClock.Stop(); };
             mouseClickThrough.Toggled += (_, __) => UpdateHoverDragAvailability();
             UpdateHoverDragAvailability();
             behavior.Children.Add(new Border { Height = 1, Background = dividerBrush });
@@ -4135,8 +4417,8 @@ namespace OffWorkWidget.WinUI
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var labels = new StackPanel { Spacing = 4 };
-            labels.Children.Add(new TextBlock { Text = "开机启动", FontSize = 14, Foreground = inkBrush });
-            var hint = new TextBlock { Text = "登录后自动显示挂件", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
+            labels.Children.Add(new TextBlock { Text = "开机启动", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false });
+            var hint = new TextBlock { Text = "登录后自动显示挂件", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, MinHeight = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false };
             labels.Children.Add(hint);
             bool canRead = true;
             try { startupInitiallyEnabled = StartupRegistration.IsEnabled(); }
@@ -4154,7 +4436,7 @@ namespace OffWorkWidget.WinUI
         {
             string[] ids = { OffWorkWidget.HoverEffects.Halo, OffWorkWidget.HoverEffects.Aurora, OffWorkWidget.HoverEffects.Orbit };
             int count = ids.Length, repeats = 7, visibleRows = 3;
-            double rowHeight = 50, viewportHeight = rowHeight * visibleRows;
+            double rowHeight = 42, viewportHeight = rowHeight * visibleRows;
             double padding = (viewportHeight - rowHeight) / 2;
 
             FrameworkElement Icon(string id, double size)
@@ -4230,12 +4512,13 @@ namespace OffWorkWidget.WinUI
             var selector = new Button
             {
                 Content = selectorContent,
-                MinWidth = 118,
-                Padding = new Thickness(8, 4, 6, 4),
-                CornerRadius = new CornerRadius(10),
+                Width = 92, MinWidth = 0, Height = 34,
+                Padding = new Thickness(6, 0, 6, 0),
+                CornerRadius = new CornerRadius(8),
                 Background = inputBackgroundBrush,
                 BorderThickness = new Thickness(0),
                 HorizontalAlignment = HorizontalAlignment.Right,
+                HorizontalContentAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             };
             selector.Resources["ButtonBackgroundPointerOver"] = inputBackgroundBrush;
@@ -4247,6 +4530,8 @@ namespace OffWorkWidget.WinUI
             var wheelRows = new StackPanel();
             wheelRows.Children.Add(new Border { Height = padding });
             var rowBorders = new List<Border>();
+            var rowScales = new List<CompositeTransform>();
+            var rowPops = new List<Grid>();
             var wheelViewer = new ScrollViewer
             {
                 Height = viewportHeight, Content = wheelRows,
@@ -4262,12 +4547,21 @@ namespace OffWorkWidget.WinUI
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(wheelViewer, "HoverEffectWheel");
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(wheelViewer, "上下滚动选择悬停特效，点击或关闭完成选择");
             Action<int>? finishRow = null;
+            const double hoverIconRestScale = 1, hoverIconSelectedScale = 1.32;
             for (int index = 0; index < count * repeats; index++)
             {
                 int wheelIndex = index;
                 string id = ids[index % count];
+                var rowScale = new CompositeTransform { ScaleX = 1, ScaleY = 1 };
+                var icon = Icon(id, 26);
+                icon.RenderTransform = rowScale;
+                icon.RenderTransformOrigin = new Windows.Foundation.Point(.5, .5);
+                // The pop host carries the Q弹 spring so it never fights the
+                // proximity scale used while the wheel is scrolling.
+                var popHost = new Grid { Width = 26, Height = 26, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                popHost.Children.Add(icon);
                 var content = new StackPanel { Spacing = 1, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-                content.Children.Add(Icon(id, 26));
+                content.Children.Add(popHost);
                 content.Children.Add(new TextBlock { Text = OffWorkWidget.HoverEffects.DisplayName(id), FontSize = 12, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Center, IsTextScaleFactorEnabled = false });
                 var row = new Border { Height = rowHeight, Child = content, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0 };
                 row.Tapped += (_, __) =>
@@ -4275,25 +4569,18 @@ namespace OffWorkWidget.WinUI
                     wheelViewer.ChangeView(null, wheelIndex * rowHeight, null, false);
                     finishRow?.Invoke(wheelIndex);
                 };
-                rowBorders.Add(row); wheelRows.Children.Add(row);
+                rowBorders.Add(row); rowPops.Add(popHost); rowScales.Add(rowScale); wheelRows.Children.Add(row);
             }
             wheelRows.Children.Add(new Border { Height = padding });
 
             var wheelHost = new Grid { Height = viewportHeight, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
             wheelHost.Children.Add(wheelViewer);
-            wheelHost.AddHandler(UIElement.PointerWheelChangedEvent, new PointerEventHandler((_, args) =>
-            {
-                int delta = args.GetCurrentPoint(wheelViewer).Properties.MouseWheelDelta;
-                if (delta == 0) return;
-                int current = (int)Math.Round(wheelViewer.VerticalOffset / rowHeight);
-                int direction = delta > 0 ? -1 : 1;
-                int target = Math.Clamp(current + direction, 0, count * repeats - 1);
-                wheelViewer.ChangeView(null, target * rowHeight, null, false);
-                args.Handled = true;
-            }), true);
 
             bool initialized = false, wheelOpen = false;
             double? positioningOffset = null;
+            bool wheelSpringing = false;
+            double wheelSpringPos = 0, wheelSpringVel = 0, wheelSpringGoal = 0;
+            long wheelSpringLast = 0;
             int previousFirst = 0, previousLast = -1;
             void ApplyEffect(string id)
             {
@@ -4308,13 +4595,96 @@ namespace OffWorkWidget.WinUI
                 double position = wheelViewer.VerticalOffset / rowHeight;
                 int index = Math.Clamp((int)Math.Round(position), 0, count * repeats - 1);
                 if (wheelOpen && positioningOffset == null) ApplyEffect(ids[index % count]);
-                for (int i = previousFirst; i <= previousLast; i++) rowBorders[i].Opacity = 0;
+                for (int i = previousFirst; i <= previousLast; i++)
+                {
+                    rowBorders[i].Opacity = 0;
+                    rowScales[i].ScaleX = rowScales[i].ScaleY = 1;
+                }
                 int first = Math.Max(0, (int)Math.Floor(position) - 3);
                 int last = Math.Min(rowBorders.Count - 1, (int)Math.Ceiling(position) + 3);
                 for (int i = first; i <= last; i++)
-                    rowBorders[i].Opacity = Math.Max(0, 1 - Math.Abs(i - position) * .7);
+                {
+                    double distance = Math.Abs(i - position);
+                    rowBorders[i].Opacity = Math.Max(0, 1 - distance * .42);
+                    double proximity = Math.Max(0, 1 - distance);
+                    double eased = proximity * proximity * (3 - 2 * proximity);
+                    rowScales[i].ScaleX = rowScales[i].ScaleY =
+                        hoverIconRestScale + (hoverIconSelectedScale - hoverIconRestScale) * eased;
+                }
                 previousFirst = first; previousLast = last;
             }
+            void StepWheel(int direction)
+            {
+                int center = (int)Math.Round(wheelViewer.VerticalOffset / rowHeight);
+                if (wheelOpen && center >= 0 && center < rowBorders.Count) PopHoverIcon(center);
+                positioningOffset = null;
+                if (!wheelSpringing)
+                {
+                    wheelSpringing = true;
+                    wheelSpringPos = wheelViewer.VerticalOffset / rowHeight;
+                    wheelSpringVel = 0;
+                    wheelSpringGoal = wheelSpringPos;
+                    wheelSpringLast = Stopwatch.GetTimestamp();
+                    CompositionTarget.Rendering += AnimateWheelSpring;
+                }
+                wheelSpringGoal = Math.Clamp(wheelSpringGoal + direction, 0, count * repeats - 1);
+            }
+            void AnimateWheelSpring(object? sender, object e)
+            {
+                if (!wheelSpringing) return;
+                if (windowClosed || !wheelOpen)
+                {
+                    wheelSpringing = false;
+                    CompositionTarget.Rendering -= AnimateWheelSpring;
+                    return;
+                }
+                long now = Stopwatch.GetTimestamp();
+                double dt = Math.Min(.032, (now - wheelSpringLast) / (double)Stopwatch.Frequency);
+                wheelSpringLast = now;
+                // Critically damped spring keeps the wheel gliding between rows
+                // instead of restarting the ScrollViewer's stepped animation.
+                const double omega = 14;
+                for (double left = dt; left > 0;)
+                {
+                    double step = Math.Min(left, .004);
+                    double accel = omega * omega * (wheelSpringGoal - wheelSpringPos) - 2 * omega * wheelSpringVel;
+                    wheelSpringVel += accel * step;
+                    wheelSpringPos += wheelSpringVel * step;
+                    left -= step;
+                }
+                if (Math.Abs(wheelSpringGoal - wheelSpringPos) < .0008 && Math.Abs(wheelSpringVel) < .02)
+                {
+                    wheelSpringPos = wheelSpringGoal; wheelSpringVel = 0; wheelSpringing = false;
+                    CompositionTarget.Rendering -= AnimateWheelSpring;
+                    wheelViewer.ChangeView(null, wheelSpringPos * rowHeight, null, true);
+                    UpdateWheelSelection();
+                    int settled = (int)Math.Round(wheelViewer.VerticalOffset / rowHeight);
+                    if (settled < count || settled >= count * (repeats - 1))
+                        PositionWheel(count * 3 + settled % count);
+                    return;
+                }
+                wheelViewer.ChangeView(null, wheelSpringPos * rowHeight, null, true);
+                UpdateWheelSelection();
+            }
+            void PopHoverIcon(int wheelIndex)
+            {
+                if (wheelIndex < 0 || wheelIndex >= rowPops.Count || !animationSettings.AnimationsEnabled) return;
+                var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(rowPops[wheelIndex]);
+                visual.CenterPoint = new System.Numerics.Vector3(13, 13, 0);
+                var spring = visual.Compositor.CreateSpringVector3Animation();
+                spring.DampingRatio = .3f;
+                spring.Period = TimeSpan.FromMilliseconds(190);
+                spring.InitialValue = new System.Numerics.Vector3(1.10f, 1.10f, 1);
+                spring.FinalValue = new System.Numerics.Vector3(1, 1, 1);
+                visual.StartAnimation("Scale", spring);
+            }
+            wheelHost.AddHandler(UIElement.PointerWheelChangedEvent, new PointerEventHandler((_, args) =>
+            {
+                int delta = args.GetCurrentPoint(wheelViewer).Properties.MouseWheelDelta;
+                if (delta == 0) return;
+                StepWheel(delta > 0 ? -1 : 1);
+                args.Handled = true;
+            }), true);
             void PositionWheel(int index)
             {
                 double target = index * rowHeight;
@@ -4335,6 +4705,7 @@ namespace OffWorkWidget.WinUI
             wheelViewer.ViewChanged += (_, args) =>
             {
                 if (!initialized || !wheelOpen) return;
+                if (wheelSpringing) return;
                 if (positioningOffset is double target)
                 {
                     if (Math.Abs(wheelViewer.VerticalOffset - target) > .1) return;
@@ -4357,11 +4728,11 @@ namespace OffWorkWidget.WinUI
             {
                 int step = args.Key == Windows.System.VirtualKey.Up ? -1 : args.Key == Windows.System.VirtualKey.Down ? 1 : 0;
                 if (step == 0) return;
-                wheelViewer.ChangeView(null, wheelViewer.VerticalOffset + step * rowHeight, null, false);
+                StepWheel(step);
                 args.Handled = true;
             };
 
-            var panel = new StackPanel { Width = 132 };
+            var panel = new StackPanel { Width = 104 };
             panel.Children.Add(wheelHost);
             var focusSink = new Button
             {
@@ -4379,8 +4750,8 @@ namespace OffWorkWidget.WinUI
             var effectMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left };
             var menuSurface = new Border
             {
-                CornerRadius = new CornerRadius(16), Padding = new Thickness(8),
-                Background = petWheelFade, Child = flyoutRoot
+                CornerRadius = new CornerRadius(16), Padding = new Thickness(6),
+                BorderThickness = new Thickness(1), Child = flyoutRoot
             };
             effectMenu.Content = menuSurface;
             var menuStyle = new Style(typeof(FlyoutPresenter));
@@ -4401,8 +4772,21 @@ namespace OffWorkWidget.WinUI
                 wheelOpen = false;
                 keyboardOpen = selector.FocusState == FocusState.Keyboard;
                 panel.RequestedTheme = root.ActualTheme;
+                bool dark = root.ActualTheme == ElementTheme.Dark;
+                menuSurface.Background = MenuFrost(dark);
+                menuSurface.BorderBrush = new SolidColorBrush(dark
+                    ? Windows.UI.Color.FromArgb(30, 255, 255, 255)
+                    : Windows.UI.Color.FromArgb(90, 255, 255, 255));
             };
-            effectMenu.Closing += (_, __) => { wheelOpen = false; positioningOffset = null; };
+            effectMenu.Closing += (_, __) =>
+            {
+                wheelOpen = false; positioningOffset = null;
+                if (wheelSpringing)
+                {
+                    wheelSpringing = false;
+                    CompositionTarget.Rendering -= AnimateWheelSpring;
+                }
+            };
             effectMenu.Opened += (_, __) =>
             {
                 wheelOpen = true;
@@ -4420,7 +4804,7 @@ namespace OffWorkWidget.WinUI
                     : args.Key == Windows.System.VirtualKey.Down ? 1 : 0;
                 if (step != 0)
                 {
-                    wheelViewer.ChangeView(null, wheelViewer.VerticalOffset + step * rowHeight, null, false);
+                    StepWheel(step);
                     args.Handled = true;
                 }
                 else if (args.Key == Windows.System.VirtualKey.Escape)
@@ -4432,22 +4816,9 @@ namespace OffWorkWidget.WinUI
 
             void ShowEffectMenu()
             {
-                const double popupHeight = 172;
-                double anchorCenter = 0, footerTop = root.ActualHeight;
-                try
-                {
-                    var origin = selector.TransformToVisual(root).TransformPoint(default);
-                    anchorCenter = origin.Y + selector.ActualHeight / 2;
-                    if (footerBar != null)
-                        footerTop = footerBar.TransformToVisual(root).TransformPoint(default).Y;
-                }
-                catch (ArgumentException)
-                {
-                }
-                bool centeredFits = anchorCenter + popupHeight / 2 <= footerTop - 4;
-                effectMenu.Placement = centeredFits
-                    ? Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left
-                    : Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.LeftEdgeAlignedBottom;
+                // Always open beside the selector; the footer-aware fallback made
+                // the wheel cover the rows at 2K/high-DPI layouts.
+                effectMenu.Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left;
                 effectMenu.ShowAt(selector);
             }
             selector.Click += (_, __) => { if (effectMenu.IsOpen) effectMenu.Hide(); else ShowEffectMenu(); };
@@ -4457,10 +4828,12 @@ namespace OffWorkWidget.WinUI
             selectorRow.ColumnDefinitions.Add(new ColumnDefinition());
             selectorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var labels = new StackPanel { Spacing = 4 };
-            labels.Children.Add(new TextBlock { Text = "悬停特效", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            labels.Children.Add(new TextBlock { Text = "悬停特效", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false });
             labels.Children.Add(new TextBlock
             {
-                Text = "穿透悬停到点时的光标提示", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap
+                Text = "悬停光标样式", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap,
+                Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight,
+                Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false
             });
             selectorRow.Children.Add(labels);
             Grid.SetColumn(selector, 1); selectorRow.Children.Add(selector);
@@ -4737,6 +5110,9 @@ namespace OffWorkWidget.WinUI
             double popupHeight = double.IsFinite(current.ReminderHeight) ? Math.Clamp(current.ReminderHeight, 190, 600) : 205;
 
             RememberSchedule();
+            string wishStartDate = current.WishStartDate;
+            if (wishEnabled.IsOn && string.IsNullOrWhiteSpace(wishStartDate))
+                wishStartDate = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             var next = new OffWorkWidget.Settings
             {
                 Start = startTime.ToString(@"hh\:mm", CultureInfo.InvariantCulture),
@@ -4768,6 +5144,7 @@ namespace OffWorkWidget.WinUI
                 WishEnabled = wishEnabled.IsOn,
                 Wishes = wishItems,
                 WishAllocation = (wishAllocation.SelectedItem as ComboBoxItem)?.Tag as string ?? "sequential",
+                WishStartDate = wishStartDate,
                 WishName = wishItems.Count > 0 ? wishItems[0].Name : "",
                 WishTarget = wishItems.Count > 0 ? wishItems[0].Target : 0,
                 WishSaved = wishItems.Count > 0 ? wishItems[0].Saved : 0,
