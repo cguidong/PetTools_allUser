@@ -369,8 +369,11 @@ internal static class WindowBackdropCapture
         EnumWindows((window, _) =>
         {
             if (!passedSelf) { if (window == excludedHandle) passedSelf = true; return true; }
-            if (IsDesktopWindow(window) || !IsWindowVisible(window) || IsIconic(window) || IsCloaked(window) ||
-                !GetWindowVisualBounds(window, out Rect bounds) || !Intersect(target, bounds, out Rect overlap)) return true;
+            if (IsDesktopWindow(window) || !IsWindowVisible(window) || IsIconic(window)) return true;
+            // Reject off-target windows with the cheap screen rect before asking DWM;
+            // the extended-frame query is a synchronous cross-process call.
+            if (!GetWindowRect(window, out Rect native) || !Intersect(target, native, out Rect _)) return true;
+            if (IsCloaked(window) || !GetWindowVisualBounds(window, out Rect bounds) || !Intersect(target, bounds, out Rect overlap)) return true;
             Mix(window.ToInt64());
             Mix(bounds.Left); Mix(bounds.Top); Mix(bounds.Right); Mix(bounds.Bottom);
             return true;
@@ -406,9 +409,12 @@ internal static class WindowBackdropCapture
     internal static bool AvoidBrowserPrintFallback(string className, bool windows11OrNewer) =>
         !windows11OrNewer && className.StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal);
 
+    // Diagnostic: the window/reason that kept the last frame incomplete.
+    internal static string? LastPendingReason;
+
     internal static Frame CaptureAt(IntPtr excludedHandle, int targetX, int targetY, int width, int height,
         byte[]? reusableOutput = null, byte[]? sliceBuffer = null, bool preservePendingScene = true,
-        bool avoidBlockingSources = false)
+        bool avoidBlockingSources = false, bool allowPendingFill = false)
     {
         // Capture underlying windows individually so the widget can remain visible
         // to remote desktop and screenshots without sampling itself.
@@ -437,6 +443,14 @@ internal static class WindowBackdropCapture
             if (ReferenceEquals(output, reusableOutput)) Array.Clear(output);
             if (ReferenceEquals(output, sliceBuffer)) sliceBuffer = null;
             bool passedSelf = false, hasTransparency = false, pendingRegion = false;
+            LastPendingReason = null;
+            void MarkPending(string reason, IntPtr source)
+            {
+                var text = new StringBuilder(64);
+                if (GetClassName(source, text, text.Capacity) <= 0) text.Append("?");
+                LastPendingReason = reason + ":" + text;
+                pendingRegion = true;
+            }
 
             EnumWindows((window, _) =>
             {
@@ -456,6 +470,9 @@ internal static class WindowBackdropCapture
                 if (window == excludedHandle) return true;
                 if (IsDesktopWindow(window)) return true;
                 if (!IsWindowAvailable(window)) return true;
+                // Cheap native rect rejects most windows; only on-target ones pay
+                // the DWM extended-frame round trip.
+                if (!GetWindowRect(window, out Rect nativeHit) || !Intersect(target, nativeHit, out Rect _)) return true;
                 if (!GetWindowVisualBounds(window, out Rect bounds)) return true;
 
                 // Check if bounds intersects any piece in uncovered
@@ -484,7 +501,8 @@ internal static class WindowBackdropCapture
                     if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds))
                     {
                         CompositorWindowCapture.RequestRefresh(window);
-                        pendingRegion = true;
+                        MarkPending("bounds", window);
+                        if (allowPendingFill) return true;
                         return !preservePendingScene;
                     }
                     if (!IsWindowAvailable(window)) return true;
@@ -496,7 +514,8 @@ internal static class WindowBackdropCapture
                         needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom))
                     {
                         CompositorWindowCapture.RequestRefresh(window);
-                        pendingRegion = true;
+                        MarkPending("crop", window);
+                        if (allowPendingFill) return true;
                         return !preservePendingScene;
                     }
                     if (!GetWindowRect(window, out Rect nativeBounds)) return true;
@@ -519,14 +538,16 @@ internal static class WindowBackdropCapture
                 // can synchronously stall the source app's UI (notably Qt windows).
                 if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.IsStarting(window))
                 {
-                    pendingRegion = true;
+                    MarkPending("starting", window);
+                    if (allowPendingFill) return true;
                     return !preservePendingScene;
                 }
                 // PrintWindow sends paint requests into the source browser. On Windows 10
                 // keep the last valid glass scene instead of repeatedly repainting Chromium.
                 if (AvoidBrowserPrintFallback(windowClass.ToString(), OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)))
                 {
-                    pendingRegion = true;
+                    MarkPending("browser", window);
+                    if (allowPendingFill) return true;
                     return !preservePendingScene;
                 }
 
@@ -535,7 +556,8 @@ internal static class WindowBackdropCapture
                 if (requiresAlpha)
                 {
                     // An unavailable GPU source is not uncovered desktop wallpaper.
-                    pendingRegion = true;
+                    MarkPending("alpha", window);
+                    if (allowPendingFill) return true;
                     return !preservePendingScene;
                 }
 
@@ -554,7 +576,8 @@ internal static class WindowBackdropCapture
                     // complete scene instead of repainting a moving source.
                     if (avoidBlockingSources)
                     {
-                        pendingRegion = true;
+                        MarkPending("blocking", window);
+                        if (allowPendingFill) return true;
                         return !preservePendingScene;
                     }
                     byte[]? slice = CaptureWindowSlice(window, bounds, target, sliceBuffer, trayCoverage, windowCoverage);
@@ -608,7 +631,9 @@ internal static class WindowBackdropCapture
             // A window under the widget that is still warming up is not uncovered
             // desktop wallpaper. Publish a pending frame and let the glass hold the
             // last complete layer instead of flashing a lower layer during fast drags.
-            if (pendingRegion)
+            // After a short grace period the caller asks for lower layers so the glass
+            // cannot freeze for seconds behind an uncapturable overlay window.
+            if (pendingRegion && !allowPendingFill)
                 return new Frame { Error = "等待背景裁剪更新。", PendingRegion = true };
 
             // Fill any uncovered regions with the actual desktop wallpaper and icons

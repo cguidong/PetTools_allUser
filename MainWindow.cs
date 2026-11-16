@@ -61,6 +61,10 @@ public sealed class MainWindow : Window
     Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? surfaceGeometry;
     readonly Border card = new Border { CornerRadius = new CornerRadius(36), Margin = new Thickness(0) };
     readonly Border backdropCard = new Border();
+    readonly LinearGradientBrush rimBrush = new LinearGradientBrush
+    {
+        StartPoint = new Point(0, 0), EndPoint = new Point(0, 1)
+    };
     readonly Canvas foregroundLayer = new Canvas();
     readonly ScaleTransform contentScale = new ScaleTransform();
     readonly Canvas coins = new Canvas { IsHitTestVisible = false };
@@ -243,6 +247,7 @@ public sealed class MainWindow : Window
     DateTime revealedUntil = DateTime.MaxValue, reminderUntil;
     DateTime holidayDay;
     bool exiting;
+    string exitReason = "unspecified";
     double lightness = 1, textFromTone = 1, textTargetTone = 1;
     bool textAppearanceInitialized;
     readonly Stopwatch textAppearanceClock = new Stopwatch();
@@ -261,6 +266,7 @@ public sealed class MainWindow : Window
         Directory.CreateDirectory(dataFolder);
         GlassProfile.Configure(dataFolder);
         Title = "有盼";
+        Diag("start pid=" + Environment.ProcessId);
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         // Resize/presenter setup can expose native backing before XAML is ready.
         SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
@@ -282,7 +288,7 @@ public sealed class MainWindow : Window
             activation = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\OffWorkWidget-Activate-" + instanceKey);
             activationWait = ThreadPool.RegisterWaitForSingleObject(activation, (_, __) => DispatcherQueue.TryEnqueue(ShowWidget), null, Timeout.Infinite, false);
             installerExit = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\OffWorkWidget-InstallerExit-" + instanceKey);
-            installerExitWait = ThreadPool.RegisterWaitForSingleObject(installerExit, (_, __) => DispatcherQueue.TryEnqueue(Exit), null, Timeout.Infinite, false);
+            installerExitWait = ThreadPool.RegisterWaitForSingleObject(installerExit, (_, __) => DispatcherQueue.TryEnqueue(() => { exitReason = "installer"; Exit(); }), null, Timeout.Infinite, false);
         }
         string config = Path.Combine(dataFolder, "settings.xml");
         if (File.Exists(config))
@@ -377,6 +383,13 @@ public sealed class MainWindow : Window
         hostSurface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Children.Add(backdropCard);
+        // The clear glass mirrors the wallpaper, so on dark wallpapers the card
+        // silhouette needs a faint adaptive hairline to stay readable as a frame.
+        for (int i = 0; i < 3; i++) rimBrush.GradientStops.Add(new GradientStop());
+        rimBrush.GradientStops[1].Offset = .45;
+        rimBrush.GradientStops[2].Offset = 1;
+        backdropCard.BorderBrush = rimBrush;
+        backdropCard.BorderThickness = new Thickness(1);
         surface.Children.Add(foregroundLayer);
         foregroundLayer.Children.Add(card);
         card.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
@@ -467,8 +480,8 @@ public sealed class MainWindow : Window
             }
             OpenSettings();
         };
-        native.Closing += (_, e) => { if (!exiting) { EndDrag(null); e.Cancel = true; HideWidget(); } };
-        Closed += (_, __) => DisposeResources();
+        native.Closing += (_, e) => { if (!exiting) { EndDrag(null); Diag("closing -> hide"); e.Cancel = true; HideWidget(); } };
+        Closed += (_, __) => { Diag("closed"); DisposeResources(); };
         sessionMonitor = new WinUIEx.Messaging.WindowMessageMonitor(this);
         sessionMonitor.WindowMessageReceived += OnSessionChanged;
         sessionMonitor.WindowMessageReceived += OnLayoutHitTest;
@@ -499,8 +512,13 @@ public sealed class MainWindow : Window
                 previewFrozen = true;
                 File.WriteAllText(Path.Combine(dataFolder, "preview-source.txt"), "Frames=" + desktopSource.FrameCount + "; Luminance=" + desktopSource.Luminance + "; TextLuminance=" + desktopSource.TextLuminance + "; LastError=" + desktopSource.LastError);
             }
-            Refresh();
-            UpdateAppearance();
+            // Freeze text/appearance churn while the HWND is being dragged; the
+            // next tick after release catches up. This keeps fast drags smooth.
+            if (!isDragging)
+            {
+                Refresh();
+                UpdateAppearance();
+            }
             KeepCoinCursor();
             if (emittedCoins > 0) coinScoreBadge.Visibility = elapsed.ElapsedMilliseconds - coinScoreLastAt < 10000 ? Visibility.Visible : Visibility.Collapsed;
         };
@@ -576,7 +594,7 @@ public sealed class MainWindow : Window
             {
                 case 1: OpenSettings(); break;
                 case 2: HideWidget(); break;
-                case 3: Exit(); break;
+                case 3: exitReason = "widget-menu"; Exit(); break;
             }
         }, () => widgetMenuOpen = false);
         return widgetMenu;
@@ -2560,6 +2578,22 @@ public sealed class MainWindow : Window
         glassTint = glassFromTint + (glassTargetTint - glassFromTint) * eased;
         if (progress >= 1) glassAppearanceClock.Stop();
         glass.SetTone(glassTone);
+        // A dark wallpaper leaves the clear card edge nearly invisible; the rim
+        // fades in with the dark tone and stays absent on light backgrounds.
+        byte rimTop = (byte)Math.Round(44 * glassTone);
+        byte rimMid = (byte)Math.Round(20 * glassTone);
+        byte rimLow = (byte)Math.Round(8 * glassTone);
+        var rimStops = rimBrush.GradientStops;
+        if (rimStops.Count == 3)
+        {
+            SetStop(rimStops[0], Windows.UI.Color.FromArgb(rimTop, 255, 255, 255));
+            SetStop(rimStops[1], Windows.UI.Color.FromArgb(rimMid, 255, 255, 255));
+            SetStop(rimStops[2], Windows.UI.Color.FromArgb(rimLow, 255, 255, 255));
+        }
+        static void SetStop(GradientStop stop, Windows.UI.Color color)
+        {
+            if (stop.Color != color) stop.Color = color;
+        }
         double tintRGB = 255 * (1 - glassTone);
         if (Math.Abs(glass.Brush.TintR - tintRGB) > .5) glass.Brush.TintR = glass.Brush.TintG = glass.Brush.TintB = tintRGB;
         if (Math.Abs(glass.Brush.TintA - glassTint) > .001) glass.Brush.TintA = glassTint;
@@ -2908,9 +2942,14 @@ public sealed class MainWindow : Window
 
     void OnSessionChanged(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
     {
-        if (args.Message.MessageId == 0x02B1 && unchecked((long)args.Message.WParam) == 7)
+        if (args.Message.MessageId != 0x02B1) return;
+        long change = unchecked((long)args.Message.WParam);
+        Diag("session-change " + change);
+        if (change == 7)
             DispatcherQueue.TryEnqueue(() => { EndDrag(null); HideSalary(); });
     }
+
+    void Diag(string note) => App.RecordEvent("widget " + note);
 
     void OnKeyMessage(object? sender, WinUIEx.Messaging.WindowMessageEventArgs args)
     {
@@ -3972,6 +4011,7 @@ public sealed class MainWindow : Window
             dragReleasePending = false;
             dragStartedOnPet = false;
             endingDrag = false;
+            if (!disposed && !exiting) Refresh();
             if (hoverDragArmed && settings.MouseClickThrough)
                 DispatcherQueue.TryEnqueue(() =>
                 {
@@ -4230,6 +4270,7 @@ public sealed class MainWindow : Window
 
     void HideWidget()
     {
+        Diag("hide");
         CancelPolarCoinAction(true);
         hoverDragArmed = false;
         hoverDragSinceTick = 0;
@@ -4808,6 +4849,7 @@ public sealed class MainWindow : Window
     void ShowWidget()
     {
         if (exiting || disposed) return;
+        Diag("show");
         native.Show();
         ApplyMouseClickThrough();
         UpdateHoverDragMonitor();
@@ -4822,7 +4864,7 @@ public sealed class MainWindow : Window
 
     void CreateTray(string path)
     {
-        tray = new NativeTrayIcon(hwnd, path, ShowWidget, OpenSettings, Exit,
+        tray = new NativeTrayIcon(hwnd, path, ShowWidget, OpenSettings, () => { exitReason = "tray-menu"; Exit(); },
             ToggleMouseClickThrough, () => settings.MouseClickThrough);
     }
 
@@ -4920,10 +4962,12 @@ public sealed class MainWindow : Window
     void Exit()
     {
         if (exiting) return; exiting = true;
+        Diag("exit reason=" + exitReason);
         // XAML/capture teardown must never leave a ghost process behind.
         var watchdog = new Thread(() =>
         {
             Thread.Sleep(3000);
+            Diag("watchdog force-exit");
             Environment.Exit(0);
         }) { IsBackground = true, Name = "ExitWatchdog" };
         watchdog.Start();

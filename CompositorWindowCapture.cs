@@ -61,7 +61,10 @@ internal static class CompositorWindowCapture
     // Diagnostic IDs are process-local and do not expose native window handles.
     static readonly Dictionary<IntPtr, long> diagnosticWindows = new Dictionary<IntPtr, long>();
     static long nextDiagnosticWindow, nextDiagnosticSource;
-    const int FrameIntervalMilliseconds = 100, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000;
+    // The compositor only delivers frames when content changes, so an uncapped
+    // source costs nothing while static and delivers the first change on the next
+    // display frame instead of waiting for a throttle window.
+    const int FrameIntervalMilliseconds = 0, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
     static string? lastError;

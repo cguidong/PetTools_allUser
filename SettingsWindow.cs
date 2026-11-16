@@ -85,6 +85,17 @@ namespace OffWorkWidget.WinUI
         double dayTimeRevealHeight, dayTimeRevealStartHeight, dayTimeRevealTargetHeight;
         double dayTimeRevealStartOpacity, dayTimeRevealTargetOpacity, dayTimeArrowStart, dayTimeArrowTarget;
         double dayTimeEditorStartOpacity, dayTimeEditorTargetOpacity;
+        Border popupOptionsReveal = null!;
+        StackPanel popupOptionsPanel = null!;
+        readonly RectangleGeometry popupOptionsClip = new RectangleGeometry();
+        readonly Stopwatch popupOptionsClock = new Stopwatch();
+        bool animatingPopupOptions;
+        double popupOptionsHeight, popupOptionsStartHeight, popupOptionsTargetHeight;
+        // Hiding runs longer than revealing: the reminder-mode flyout is still
+        // fading over the card for the first ~170ms of the collapse.
+        double popupOptionsDuration = 260;
+        double popupOptionsElapsed, popupOptionsLastTick;
+        double popupOptionsStartOpacity, popupOptionsTargetOpacity;
         ComboBox dayTimeDay = null!;
         TextBlock dayTimeSummary = null!, dayTimeStartLabel = null!, dayTimeEndLabel = null!;
         Grid dayTimeChevron = null!;
@@ -337,6 +348,7 @@ namespace OffWorkWidget.WinUI
                 CancelScaleGesture(); scaleInput?.ReleasePointerCaptures();
                 CompositionTarget.Rendering -= AnimateAccordion; animatingAccordion = false;
                 CompositionTarget.Rendering -= AnimateDayTimeReveal; animatingDayTimeReveal = false; dayTimeRevealClock.Stop();
+                CompositionTarget.Rendering -= AnimatePopupOptionsReveal; animatingPopupOptions = false; popupOptionsClock.Stop();
                 CompositionTarget.Rendering -= AnimateAlternatingWeekReveal; animatingRestRow = false; restRowClock.Stop();
                 CompositionTarget.Rendering -= AnimateTitleSpring; titleSpringRunning = false;
                 renderFrameMonitor?.Dispose(); frameMonitor.Dispose();
@@ -3958,9 +3970,89 @@ namespace OffWorkWidget.WinUI
                 Padding = new Thickness(16, 12, 16, 12), Child = positionCard
             });
             popupOptions.Visibility = reminderDisplay.SelectedIndex == 1 ? Visibility.Visible : Visibility.Collapsed;
-            reminderDisplay.SelectionChanged += (_, __) => popupOptions.Visibility = reminderDisplay.SelectedIndex == 1 ? Visibility.Visible : Visibility.Collapsed;
-            panel.Children.Add(popupOptions);
+            // A switch between 挂件内提醒 and 弹窗提醒 grows/collapses the position
+            // card instead of snapping the section height.
+            popupOptionsPanel = popupOptions;
+            popupOptionsReveal = new Border
+            {
+                Child = popupOptions,
+                Visibility = popupOptions.Visibility,
+                Opacity = popupOptions.Visibility == Visibility.Visible ? 1 : 0,
+                IsHitTestVisible = popupOptions.Visibility == Visibility.Visible
+            };
+            reminderDisplay.SelectionChanged += (_, __) => UpdatePopupOptionsReveal(reminderDisplay.SelectedIndex == 1);
+            panel.Children.Add(popupOptionsReveal);
             return panel;
+        }
+
+        void UpdatePopupOptionsReveal(bool visible)
+        {
+            if (popupOptionsReveal == null) return;
+            // A collapsed child measures to zero; keep it visible so the card can
+            // be measured and faded out instead of flashing an empty slot.
+            popupOptionsPanel.Visibility = Visibility.Visible;
+            double contentWidth = Math.Max(1, popupOptionsReveal.ActualWidth > 0 ? popupOptionsReveal.ActualWidth :
+                popupOptionsPanel.ActualWidth > 0 ? popupOptionsPanel.ActualWidth : form.ActualWidth - 32);
+            popupOptionsPanel.Measure(new Windows.Foundation.Size(contentWidth, double.PositiveInfinity));
+            double targetHeight = popupOptionsPanel.DesiredSize.Height;
+            double height = visible ? targetHeight : 0;
+            double currentHeight = animatingPopupOptions ? popupOptionsHeight :
+                popupOptionsReveal.Visibility == Visibility.Collapsed ? 0 : popupOptionsReveal.ActualHeight;
+            popupOptionsStartHeight = currentHeight; popupOptionsTargetHeight = height;
+            popupOptionsStartOpacity = popupOptionsReveal.Opacity; popupOptionsTargetOpacity = visible ? 1 : 0;
+            popupOptionsDuration = visible ? 260 : 300;
+            popupOptionsElapsed = 0;
+            popupOptionsLastTick = 0;
+            popupOptionsReveal.IsHitTestVisible = visible;
+            if (!root.IsLoaded || !animationSettings.AnimationsEnabled ||
+                (Math.Abs(height - currentHeight) < .5 && Math.Abs(popupOptionsTargetOpacity - popupOptionsReveal.Opacity) < .01))
+            { FinishPopupOptionsReveal(); return; }
+            popupOptionsReveal.Visibility = Visibility.Visible;
+            popupOptionsClock.Restart();
+            if (!animatingPopupOptions) { animatingPopupOptions = true; CompositionTarget.Rendering += AnimatePopupOptionsReveal; }
+            AnimatePopupOptionsReveal(null, null!);
+        }
+
+        void AnimatePopupOptionsReveal(object? sender, object args)
+        {
+            if (windowClosed) { CompositionTarget.Rendering -= AnimatePopupOptionsReveal; animatingPopupOptions = false; popupOptionsClock.Stop(); return; }
+            double now = popupOptionsClock.Elapsed.TotalMilliseconds;
+            // The reminder-mode flyout blocks rendering for ~150ms while it
+            // closes. Advancing by wall time made the card jump 38% when frames
+            // resumed; cap each tick so the collapse continues from where it was.
+            double delta = popupOptionsLastTick == 0 ? 0 : Math.Min(20, Math.Max(0, now - popupOptionsLastTick));
+            popupOptionsLastTick = now;
+            popupOptionsElapsed += delta;
+            double position = animationSettings.AnimationsEnabled ? Math.Clamp(popupOptionsElapsed / popupOptionsDuration, 0, 1) : 1;
+            double eased = position * position * (3 - 2 * position);
+            popupOptionsHeight = popupOptionsStartHeight + (popupOptionsTargetHeight - popupOptionsStartHeight) * eased;
+            double opacity = popupOptionsStartOpacity + (popupOptionsTargetOpacity - popupOptionsStartOpacity) * eased;
+            popupOptionsReveal.Height = popupOptionsHeight;
+            popupOptionsReveal.Opacity = opacity;
+            // The parent StackPanel reserves 12px of spacing as soon as the card
+            // becomes visible; cancel it while the card is still near zero height.
+            popupOptionsReveal.Margin = new Thickness(0, -12 * (1 - eased), 0, 0);
+            // Keep the caption gap proportional so the first millimetres of the
+            // reveal do not jump by the full top margin.
+            popupOptionsPanel.Margin = new Thickness(0, 6 * opacity, 0, 2 * opacity);
+            double width = Math.Max(1, popupOptionsReveal.ActualWidth > 0 ? popupOptionsReveal.ActualWidth : popupOptionsPanel.ActualWidth);
+            popupOptionsClip.Rect = new Windows.Foundation.Rect(0, 0, width, Math.Max(0, popupOptionsHeight));
+            popupOptionsReveal.Clip = popupOptionsClip;
+            if (position >= 1) FinishPopupOptionsReveal();
+        }
+
+        void FinishPopupOptionsReveal()
+        {
+            CompositionTarget.Rendering -= AnimatePopupOptionsReveal; animatingPopupOptions = false; popupOptionsClock.Stop();
+            bool show = popupOptionsTargetOpacity > 0;
+            popupOptionsReveal.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            popupOptionsPanel.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            popupOptionsReveal.Height = double.NaN;
+            popupOptionsReveal.Opacity = show ? 1 : 0;
+            popupOptionsReveal.Clip = null;
+            popupOptionsReveal.IsHitTestVisible = show;
+            popupOptionsReveal.Margin = new Thickness(0);
+            popupOptionsPanel.Margin = new Thickness(0, 6, 0, 2);
         }
 
         void ShowPositionPreview(Action onSaved)

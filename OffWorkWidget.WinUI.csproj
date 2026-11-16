@@ -1,13 +1,13 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <RootNamespace>OffWorkWidget.WinUI</RootNamespace>
     <AssemblyName>OffWorkWidget.WinUI</AssemblyName>
-    <Version>1.0.94</Version>
-    <AssemblyVersion>1.0.94.0</AssemblyVersion>
-    <FileVersion>1.0.94.0</FileVersion>
+    <Version>1.0.106</Version>
+    <AssemblyVersion>1.0.106.0</AssemblyVersion>
+    <FileVersion>1.0.106.0</FileVersion>
     <AssemblyTitle>有盼</AssemblyTitle>
     <Product>有盼</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>

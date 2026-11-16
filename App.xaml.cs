@@ -11,7 +11,35 @@ public partial class App : Application
     public App()
     {
         UnhandledException += (_, e) => RecordFailure(e.Exception);
+        // Threads outside the XAML dispatcher do not reach UnhandledException;
+        // record them instead of leaving an unexplained process exit.
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            RecordEvent("unhandled-appdomain " + (e.ExceptionObject as Exception)?.GetType().Name + " terminating=" + e.IsTerminating);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            string detail = e.Exception.InnerException?.ToString() ?? e.Exception.ToString();
+            if (detail.Length > 400) detail = detail.Substring(0, 400);
+            RecordEvent("unobserved-task " + detail.Replace('\r', ' ').Replace('\n', ' '));
+            e.SetObserved();
+        };
+        AppDomain.CurrentDomain.ProcessExit += (_, __) => RecordEvent("process-exit");
         InitializeComponent();
+    }
+    internal static void RecordEvent(string note)
+    {
+        try
+        {
+            string folder = Path.Combine(
+                Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") ??
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"),
+                "diagnostics");
+            Directory.CreateDirectory(folder);
+            string path = Path.Combine(folder, "lifecycle.log");
+            var info = new System.IO.FileInfo(path);
+            if (info.Exists && info.Length > 96 * 1024) System.IO.File.Delete(path);
+            File.AppendAllText(path, DateTime.Now.ToString("O") + " " + note + Environment.NewLine, new System.Text.UTF8Encoding(false));
+        }
+        catch { }
     }
     internal static void RecordFailure(Exception error)
     {
