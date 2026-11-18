@@ -2869,7 +2869,7 @@ public sealed class MainWindow : Window
         // Manual modes only dye the glass when the wallpaper fights the chosen
         // palette; on a matching background a flat dye washes out the glass.
         double tintTarget = 0;
-        // Manual night is a fixed smoked-black material; day stays clear frost.
+        // Manual night uses a charcoal tint; day stays clear frost.
         if (!settings.AutomaticAppearance && settings.NightMode) tintTarget = .5;
         // Manual day is a clear frost, manual night a smoked frost: both diffuse
         // the wallpaper instead of switching material with the background.
@@ -2929,7 +2929,8 @@ public sealed class MainWindow : Window
         glassTone = glassFromTone + (glassTargetTone - glassFromTone) * eased;
         glassTint = glassFromTint + (glassTargetTint - glassFromTint) * eased;
         if (progress >= 1) glassAppearanceClock.Stop();
-        double tintRGB = 255 * (1 - glassTone);
+        const double darkGlassTint = 24;
+        double tintRGB = 255 + (darkGlassTint - 255) * glassTone;
         if (Math.Abs(glass.Brush.TintR - tintRGB) > .5) glass.Brush.TintR = glass.Brush.TintG = glass.Brush.TintB = tintRGB;
         if (Math.Abs(glass.Brush.TintA - glassTint) > .001) glass.Brush.TintA = glassTint;
         var fallback = Windows.UI.Color.FromArgb(200, (byte)Math.Round(245 - 205 * glassTone), (byte)Math.Round(245 - 205 * glassTone), (byte)Math.Round(248 - 204 * glassTone));
