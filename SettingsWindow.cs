@@ -26,15 +26,17 @@ namespace OffWorkWidget.WinUI
         readonly Action hideSalary;
         readonly Action<OffWorkWidget.Settings> saveSettings;
         readonly Action<double>? previewScale;
+        readonly Action persistWishIds;
 
         const double WindowCornerRadius = 36;
         readonly Grid windowSurface = new Grid();
-        readonly SystemBackdropElement frostedBackground = new SystemBackdropElement { CornerRadius = new CornerRadius(WindowCornerRadius), IsHitTestVisible = false };
-        Border? glassRim;
+        readonly Grid windowContent = new Grid();
+        readonly SolidColorBrush cornerMaterial = new SolidColorBrush();
+        readonly SystemBackdropElement frostedBackground = new SystemBackdropElement { CornerRadius = new CornerRadius(WindowCornerRadius + 4), IsHitTestVisible = false };
         readonly LinearGradientBrush glassRimBrush = new LinearGradientBrush { StartPoint = new Windows.Foundation.Point(0, 0), EndPoint = new Windows.Foundation.Point(0, 1) };
-        readonly Border glassTint = new Border { CornerRadius = new CornerRadius(WindowCornerRadius), IsHitTestVisible = false };
+        readonly Border glassTint = new Border { IsHitTestVisible = false };
         readonly SolidColorBrush glassTintBrush = new SolidColorBrush();
-        readonly Border glassSheen = new Border { CornerRadius = new CornerRadius(WindowCornerRadius - 1), IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Top, Height = 220 };
+        readonly Border glassSheen = new Border { IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Top, Height = 220 };
         readonly LinearGradientBrush glassSheenBrush = new LinearGradientBrush { StartPoint = new Windows.Foundation.Point(0, 0), EndPoint = new Windows.Foundation.Point(0, 1) };
         Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? windowGeometry;
         readonly Grid root = new Grid();
@@ -63,6 +65,7 @@ namespace OffWorkWidget.WinUI
         Microsoft.UI.Dispatching.DispatcherQueueTimer? scrollRailTimer;
 
         bool windowClosed, petCommitted;
+        bool raisedForActivation;
         TimeSpan startTime, endTime;
         TimeSpan lunchStart, lunchEnd;
         TimeSpan dayTimeStart, dayTimeEnd;
@@ -110,6 +113,7 @@ namespace OffWorkWidget.WinUI
         readonly HashSet<string> achievedWishKeys = new();
         sealed class WishRowEditor
         {
+            internal string Id = "";
             internal FrameworkElement Card = null!;
             internal TextBox Name = null!, Target = null!, Saved = null!;
             internal Button Delete = null!;
@@ -144,13 +148,15 @@ namespace OffWorkWidget.WinUI
         double? scaleDragValue;
         bool settingScaleFromPointer;
         ToggleSwitch holidays, water, walk, topmost;
-        ToggleSwitch startup = null!, mouseClickThrough = null!;
+        ToggleSwitch startup = null!, mouseClickThrough = null!, showCoinJar = null!;
         ComboBox hoverDragSeconds = null!;
         Grid hoverDragRow = null!;
         Action<bool>? hoverOptionsRevealAction;
         bool startupInitiallyEnabled;
         TextBlock holidayStatus, passwordStatus, scaleLabel;
         Action? refreshAdjustmentReveal;
+        Action? refreshEffectShop;
+        Action? refreshDailyFortune;
         Image petThumb;
         Border incomeContent, restContent, careContent;
         Grid incomeChevron, restChevron, careChevron;
@@ -236,10 +242,11 @@ namespace OffWorkWidget.WinUI
 
         public SettingsWindow(OffWorkWidget.Settings current, OffWorkWidget.PrivacyStore privacy,
             Action toggleSalaryLayout, Action hideSalary,
-            Action<OffWorkWidget.Settings> saveSettings, Action<double>? previewScale = null)
+            Action<OffWorkWidget.Settings> saveSettings, Action<double>? previewScale = null, Action? persistWishIds = null)
         {
             this.current = current; this.privacy = privacy; this.toggleSalaryLayout = toggleSalaryLayout;
             this.hideSalary = hideSalary; this.saveSettings = saveSettings; this.previewScale = previewScale;
+            this.persistWishIds = persistWishIds ?? (() => { });
             automatic = current.AutomaticAppearance;
             night = current.NightMode; petId = current.PetId; initialPetId = petId; hoverEffect = OffWorkWidget.HoverEffects.Normalize(current.HoverEffect); observedSalary = current.Salary;
             alternatingWeekends = current.AlternatingWeekends;
@@ -267,6 +274,14 @@ namespace OffWorkWidget.WinUI
 
             Title = "把下班，设成期待";
             hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+            Activated += (_, args) =>
+            {
+                if (args.WindowActivationState == WindowActivationState.Deactivated && raisedForActivation)
+                {
+                    raisedForActivation = false;
+                    SetWindowPos(hwnd, new IntPtr(-2), 0, 0, 0, 0, 0x0013); // HWND_NOTOPMOST, no activation or resize
+                }
+            };
             var id = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
             native = AppWindow.GetFromWindowId(id);
             if (native.Presenter is OverlappedPresenter presenter)
@@ -305,10 +320,27 @@ namespace OffWorkWidget.WinUI
             glassSheenBrush.GradientStops.Add(new GradientStop { Offset = 0 });
             glassSheenBrush.GradientStops.Add(new GradientStop { Offset = .55 });
             glassSheenBrush.GradientStops.Add(new GradientStop { Offset = 1 });
-            windowSurface.Children.Add(frostedBackground); windowSurface.Children.Add(glassTint); windowSurface.Children.Add(glassSheen); windowSurface.Children.Add(root);
-            windowSurface.Children.Add(themeFadeLayer);
-            glassRim = new Border { CornerRadius = new CornerRadius(WindowCornerRadius), BorderThickness = new Thickness(1), BorderBrush = glassRimBrush, IsHitTestVisible = false };
-            windowSurface.Children.Add(glassRim);
+            windowSurface.Children.Add(frostedBackground);
+            // Only the curved sections need fractional pixel coverage. Leave the
+            // straight perimeter to the same acrylic and content as the interior.
+            for (int i = 0; i < 4; i++)
+            {
+                bool left = i % 2 == 0, top = i < 2;
+                const double r = WindowCornerRadius;
+                windowSurface.Children.Add(new Border
+                {
+                    Width = r, Height = r, IsHitTestVisible = false,
+                    HorizontalAlignment = left ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+                    VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom,
+                    CornerRadius = new CornerRadius(left && top ? r : 0, !left && top ? r : 0,
+                        !left && !top ? r : 0, left && !top ? r : 0),
+                    BorderThickness = new Thickness(left ? 2 : 0, top ? 2 : 0, left ? 0 : 2, top ? 0 : 2),
+                    BorderBrush = cornerMaterial
+                });
+            }
+            windowContent.Children.Add(glassTint); windowContent.Children.Add(glassSheen);
+            windowContent.Children.Add(root); windowContent.Children.Add(themeFadeLayer);
+            windowSurface.Children.Add(windowContent);
             windowSurface.SizeChanged += (_, __) => UpdateWindowContour();
             Content = windowSurface;
 
@@ -353,7 +385,7 @@ namespace OffWorkWidget.WinUI
                 CompositionTarget.Rendering -= AnimateTitleSpring; titleSpringRunning = false;
                 renderFrameMonitor?.Dispose(); frameMonitor.Dispose();
                 frostedBackground.SystemBackdrop = null; SystemBackdrop = null;
-                Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowSurface).Clip = null;
+                Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowContent).Clip = null;
                 windowGeometry?.Dispose();
             };
         }
@@ -400,9 +432,10 @@ namespace OffWorkWidget.WinUI
             }
             if (width > 0 && height > 0)
             {
-                var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowSurface);
+                var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowContent);
                 if (windowGeometry == null)
                 {
+                    // Keep the tinted content and footer inside the acrylic outline.
                     windowGeometry = visual.Compositor.CreateRoundedRectangleGeometry();
                     visual.Clip = visual.Compositor.CreateGeometricClip(windowGeometry);
                 }
@@ -589,6 +622,7 @@ namespace OffWorkWidget.WinUI
         void ApplyThemeBrushes()
         {
             bool dark = root.ActualTheme == ElementTheme.Dark;
+            cornerMaterial.Color = dark ? Windows.UI.Color.FromArgb(233, 45, 45, 45) : Windows.UI.Color.FromArgb(226, 245, 245, 245);
             // All appearance modes share the same glass surface; the mode only
             // forces the light/dark palette, so manual day/night match automatic.
             pageBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb(0, 40, 40, 44) : Windows.UI.Color.FromArgb(0, 255, 255, 255);
@@ -727,7 +761,6 @@ namespace OffWorkWidget.WinUI
             glassRimBrush.GradientStops[0].Color = Windows.UI.Color.FromArgb(dark ? (byte)24 : (byte)58, 255, 255, 255);
             glassRimBrush.GradientStops[1].Color = Windows.UI.Color.FromArgb(dark ? (byte)10 : (byte)24, 255, 255, 255);
             glassRimBrush.GradientStops[2].Color = Windows.UI.Color.FromArgb(dark ? (byte)2 : (byte)6, 255, 255, 255);
-            if (glassRim != null) glassRim.Visibility = Visibility.Visible;
 
             foreach (var card in cardBorders)
             {
@@ -2459,6 +2492,107 @@ namespace OffWorkWidget.WinUI
             UpdateAccordionChrome();
             form.Children.Add(stack);
         }
+        FrameworkElement BuildEffectShop()
+        {
+            var details = new StackPanel { Spacing = 6 };
+            var coinJarRow = new Grid { Margin = new Thickness(0, 0, 0, 6) };
+            coinJarRow.ColumnDefinitions.Add(new ColumnDefinition());
+            coinJarRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            coinJarRow.Children.Add(new TextBlock { Text = "显示金币罐", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            showCoinJar = CreateGreenSwitch(current.ShowCoinJar);
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(showCoinJar, "显示金币罐");
+            Grid.SetColumn(showCoinJar, 1); coinJarRow.Children.Add(showCoinJar);
+            details.Children.Add(coinJarRow);
+            var balance = new TextBlock { FontSize = 12, Foreground = subInkBrush };
+            var notice = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, Text = "解锁后永久使用，选择立即生效。" };
+            var buttons = new List<Button>();
+            var effects = new[] { (Id: 0, Name: "默认"), (Id: 1, Name: "星星闪烁"), (Id: 2, Name: "暖光漂浮"), (Id: 3, Name: "雪花飘落"), (Id: 5, Name: "落叶飘飘") };
+            details.Children.Add(balance);
+            for (int i = 0; i < effects.Length; i++)
+            {
+                int effect = effects[i].Id;
+                string effectName = effects[i].Name;
+                var row = new Grid { MinHeight = 38 };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.Children.Add(new TextBlock { Text = effectName, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center, FontSize = 13 });
+                var button = new Button { Height = 32, MinWidth = 96, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Right, FontSize = 13 };
+                button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+                button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+                buttons.Add(button); Grid.SetColumn(button, 1); row.Children.Add(button); details.Children.Add(row);
+                button.Click += (_, __) =>
+                {
+                    try
+                    {
+                        if (!privacy.EffectUnlocked(effect))
+                        {
+                            if (!privacy.UnlockEffect(effect)) { notice.Text = "金币不足，继续收集金币吧。"; return; }
+                            notice.Text = effectName + "已解锁，可以随时使用。";
+                        }
+                        else { privacy.SelectEffect(effect); notice.Text = "已切换为" + effectName + "。"; }
+                        Refresh();
+                    }
+                    catch (IOException) { notice.Text = "保存失败，请稍后重试。"; }
+                };
+            }
+            void Refresh()
+            {
+                balance.Text = "可用金币：" + privacy.CoinBalance.ToString("N0", CultureInfo.InvariantCulture);
+                int selected = privacy.SelectedEffect;
+                for (int i = 0; i < buttons.Count; i++)
+                    buttons[i].Content = selected == effects[i].Id ? "使用中" : privacy.EffectUnlocked(effects[i].Id) ? "使用" : OffWorkWidget.PrivacyStore.EffectPrice(effects[i].Id) + " 金币解锁";
+            }
+            refreshEffectShop = () => { Refresh(); refreshDailyFortune?.Invoke(); };
+            details.Children.Add(notice);
+            details.Children.Add(BuildDailyFortune());
+            return details;
+        }
+
+        FrameworkElement BuildDailyFortune()
+        {
+            var messages = new[] {
+                "今天也在认真生活，给自己一个微笑。", "慢一点也没关系，你正在向前。",
+                "忙碌之余，记得喝口水、伸个懒腰。", "今天的小进步，值得被看见。",
+                "好运正在路上，先好好照顾自己。", "工作有期限，快乐也要安排上。",
+                "摸一会儿鱼，再精神满满地出发。", "今天适合给自己一点小奖励。",
+                "下班倒计时已经开始，期待好时光。", "辛苦啦，今天也离下班更近一步。",
+                "不必事事完美，尽力就很棒。", "愿你今天的烦恼早早下班。"
+            };
+            var panel = new StackPanel { Spacing = 8, Margin = new Thickness(0, 10, 0, 0) };
+            panel.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            var row = new Grid { MinHeight = 38 };
+            row.ColumnDefinitions.Add(new ColumnDefinition());
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.Children.Add(new TextBlock { Text = "每日抽签", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            var button = new Button { Height = 32, MinWidth = 96, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 13 };
+            button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+            button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            Grid.SetColumn(button, 1); row.Children.Add(button); panel.Children.Add(row);
+            var result = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
+            panel.Children.Add(result);
+            DateTime displayedDay = DateTime.Today;
+            void Refresh()
+            {
+                displayedDay = DateTime.Today;
+                int value = privacy.TodayFortune(displayedDay);
+                button.Content = value > 0 ? "查看今日签" : "10 金币抽签";
+                result.Text = value > 0 && value <= messages.Length ? "今日签：" + messages[value - 1] : "每天可抽一次，当天免费查看。";
+            }
+            button.Click += (_, __) =>
+            {
+                try
+                {
+                    if (displayedDay != DateTime.Today) { Refresh(); return; }
+                    if (!privacy.DrawDailyFortune(DateTime.Now, out int drawResult)) { result.Text = "金币不足，需要 10 金币。"; return; }
+                    Refresh();
+                    refreshEffectShop?.Invoke();
+                }
+                catch (IOException) { result.Text = "保存失败，请稍后重试。"; }
+            };
+            refreshDailyFortune = Refresh;
+            Refresh();
+            return panel;
+        }
         Border BuildWishCard()
         {
             var card = CreateCardBorder(new Thickness(16));
@@ -2540,6 +2674,7 @@ namespace OffWorkWidget.WinUI
             details.Children.Add(labels);
             wishRowsHost = new StackPanel { Spacing = 12 };
             details.Children.Add(wishRowsHost);
+            details.Children.Add(new TextBlock { Text = "投入金币立即生效；删除心愿不会返还金币。", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
             panel.Children.Add(wishDetailsHost);
             card.Child = panel;
 
@@ -2563,7 +2698,7 @@ namespace OffWorkWidget.WinUI
         void AddWishRow(OffWorkWidget.WishEntry wish, bool blank = false)
         {
             if (wishRows.Count >= OffWorkWidget.Logic.MaxWishes) return;
-            var row = new OffWorkWidget.WishEntry { Name = wish.Name ?? "", Target = wish.Target, Saved = wish.Saved };
+            var row = new OffWorkWidget.WishEntry { Id = wish.Id, Name = wish.Name ?? "", Target = wish.Target, Saved = wish.Saved };
             var grid = new Grid { ColumnSpacing = 6 };
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2.2, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.3, GridUnitType.Star) });
@@ -2571,6 +2706,7 @@ namespace OffWorkWidget.WinUI
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
             var editor = new WishRowEditor
             {
+                Id = row.Id,
                 Name = CreateInputBox(blank ? "" : row.Name),
                 Target = CreateInputBox(blank ? "" : row.Target.ToString(CultureInfo.InvariantCulture)),
                 Saved = CreateInputBox(blank ? "" : row.Saved.ToString(CultureInfo.InvariantCulture))
@@ -2614,6 +2750,35 @@ namespace OffWorkWidget.WinUI
             Grid.SetColumn(editor.Delete, 3); grid.Children.Add(editor.Delete);
             var rowContainer = new StackPanel { Spacing = 3 };
             rowContainer.Children.Add(grid);
+            if (!blank)
+            {
+                var coinRow = new Grid { Margin = new Thickness(8, 1, 0, 0), MinHeight = 30 };
+                coinRow.ColumnDefinitions.Add(new ColumnDefinition());
+                coinRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                var stars = new TextBlock { Foreground = subInkBrush, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+                var deposit = new Button { Content = "投入 100 金币", Height = 30, MinWidth = 96, Padding = new Thickness(8, 3, 8, 3), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 12 };
+                deposit.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+                deposit.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+                void RefreshWishStars() => stars.Text = "心愿星星 ★ × " + privacy.WishStars(editor.Id).ToString("N0", CultureInfo.InvariantCulture);
+                RefreshWishStars();
+                deposit.Click += (_, __) =>
+                {
+                    try
+                    {
+                        // Persist legacy wish IDs before the database transaction can spend coins.
+                        persistWishIds();
+                        if (!privacy.DepositWishStar(editor.Id)) { stars.Text = "金币不足，投入需要 100 金币"; return; }
+                        RefreshWishStars();
+                        refreshEffectShop?.Invoke();
+                    }
+                    catch (IOException) { stars.Text = "保存失败，请稍后重试"; }
+                };
+                coinRow.Children.Add(stars);
+                Grid.SetColumn(deposit, 1); coinRow.Children.Add(deposit);
+                rowContainer.Children.Add(coinRow);
+            }
+            else
+                rowContainer.Children.Add(new TextBlock { Text = "保存心愿后可投入金币点亮星星", Foreground = subInkBrush, FontSize = 12, Margin = new Thickness(8, 1, 0, 0) });
             if (!blank && achievedWishKeys.Contains(WishKey(wish)))
             {
                 editor.Status = new TextBlock
@@ -2843,6 +3008,8 @@ namespace OffWorkWidget.WinUI
             appearanceBody.Children.Add(petRow);
             appearanceBody.Children.Add(new Border { Height = 1, Background = dividerBrush });
             appearanceBody.Children.Add(CreateScaleRuler());
+            appearanceBody.Children.Add(new Border { Height = 1, Background = dividerBrush });
+            appearanceBody.Children.Add(CreateOptionsSection("金币商城", BuildEffectShop(), () => refreshEffectShop?.Invoke()));
             appearanceOptions.Children.Add(CreateOptionsSection("外观", appearanceBody));
             card.Child = appearanceOptions;
             form.Children.Add(card);
@@ -4436,7 +4603,7 @@ namespace OffWorkWidget.WinUI
             appearanceOptions.Children.Add(CreateOptionsSection("使用偏好", behavior));
         }
 
-        FrameworkElement CreateOptionsSection(string title, FrameworkElement content)
+        FrameworkElement CreateOptionsSection(string title, FrameworkElement content, Action? onOpen = null)
         {
             var section = new StackPanel();
             var header = new Button
@@ -4483,6 +4650,7 @@ namespace OffWorkWidget.WinUI
             header.Click += (_, __) =>
             {
                 open = !open;
+                if (open) onOpen?.Invoke();
                 from = animating ? height : reveal.Visibility == Visibility.Collapsed ? 0 : reveal.ActualHeight;
                 content.Height = double.NaN;
                 content.Measure(new Windows.Foundation.Size(Math.Max(1, section.ActualWidth), double.PositiveInfinity));
@@ -4939,7 +5107,7 @@ namespace OffWorkWidget.WinUI
                 Background = footerBackgroundBrush,
                 BorderBrush = dividerBrush,
                 BorderThickness = new Thickness(0),
-                Padding = new Thickness(16, 10, 16, 12)
+                Padding = new Thickness(16, 10, 16, 16)
             };
             footerBar = footer;
             var panel = new StackPanel { Spacing = 8 };
@@ -5169,7 +5337,7 @@ namespace OffWorkWidget.WinUI
                     error.Text = $"第 {i + 1} 个心愿的已攒金额须在 0 到 100000000 元之间。"; error.Visibility = Visibility.Visible;
                     return;
                 }
-                wishItems.Add(new OffWorkWidget.WishEntry { Name = rowName, Target = rowTarget, Saved = rowSaved });
+                wishItems.Add(new OffWorkWidget.WishEntry { Id = row.Id, Name = rowName, Target = rowTarget, Saved = rowSaved });
             }
 
             double size = scale.Value;
@@ -5224,6 +5392,9 @@ namespace OffWorkWidget.WinUI
                 PetId = petId,
                 HideAmount = current.HideAmount,
                 ShowSalaryLayout = current.ShowSalaryLayout,
+                ShowCoinJar = showCoinJar.IsOn,
+                CoinJarX = current.CoinJarX,
+                CoinJarY = current.CoinJarY,
                 AmountVisibleSeconds = seconds,
                 UseChinaHolidays = holidays.IsOn,
                 Calendar = current.Calendar,
@@ -5295,7 +5466,20 @@ namespace OffWorkWidget.WinUI
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
         [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hwnd, int index, int style);
+        internal void BringToFront()
+        {
+            if (windowClosed) return;
+            if (IsIconic(hwnd)) ShowWindow(hwnd, 9); // SW_RESTORE
+            Activate();
+            raisedForActivation = true;
+            SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0003); // HWND_TOPMOST, no resize or move
+            SetForegroundWindow(hwnd);
+        }
+
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int command);
         [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out ClientRect rect);
         [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr hwnd, IntPtr region, bool redraw);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? title);

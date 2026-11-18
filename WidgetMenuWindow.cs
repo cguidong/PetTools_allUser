@@ -56,14 +56,12 @@ internal sealed class WidgetMenuWindow : Window
         SetWindowLongW(hwnd, -16, (style & ~0x00CF0000) | unchecked((int)0x80000000));
         int extended = GetWindowLongW(hwnd, -20);
         SetWindowLongW(hwnd, -20, (extended & ~0x00040000) | 0x00000080);
-        int rendering = 2;
+        int rendering = 1; // Disable the native frame around the transparent XAML surface.
         DwmSetWindowAttribute(hwnd, 2, ref rendering, 4);
-        int corner = rounded ? 2 : 1;
+        int corner = 1;
         DwmSetWindowAttribute(hwnd, 33, ref corner, 4);
         int noBorder = unchecked((int)0xFFFFFFFE);
         DwmSetWindowAttribute(hwnd, 34, ref noBorder, 4);
-        var frameMargins = new Margins { Left = -1, Right = -1, Top = -1, Bottom = -1 };
-        DwmExtendFrameIntoClientArea(hwnd, ref frameMargins);
 
         panel = new StackPanel { Spacing = 0 };
         surface = new Border
@@ -217,7 +215,7 @@ internal sealed class WidgetMenuWindow : Window
             : dark ? Windows.UI.Color.FromArgb(255, 72, 72, 76) : Windows.UI.Color.FromArgb(255, 218, 219, 223);
         var foregroundBrush = new SolidColorBrush(foreground);
         surface.Background = new SolidColorBrush(background);
-        surface.BorderBrush = new SolidColorBrush(line);
+        surface.BorderBrush = highContrast ? new SolidColorBrush(line) : null;
         divider.Background = new SolidColorBrush(line);
         foreach (Button button in items)
         {
@@ -248,7 +246,5 @@ internal sealed class WidgetMenuWindow : Window
     [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int width, int height);
     [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr window, IntPtr region, bool redraw);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
-    [StructLayout(LayoutKind.Sequential)] struct Margins { internal int Left, Right, Top, Bottom; }
-    [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref Margins margins);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 }

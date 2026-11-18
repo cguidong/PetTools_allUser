@@ -12,7 +12,7 @@ using Windows.UI.ViewManagement;
 
 namespace OffWorkWidget.WinUI;
 
-// A reusable, opaque tray popup: DWM owns the outer contour rather than a hard window region.
+// The XAML surface draws the popup contour on a transparent host.
 // Windows 10 uses square corners; high contrast uses system window/highlight colors.
 internal sealed class TrayMenuWindow : Window
 {
@@ -55,10 +55,12 @@ internal sealed class TrayMenuWindow : Window
         SetWindowLongW(hwnd, -16, (style & ~0x00CF0000) | unchecked((int)0x80000000));
         int extended = GetWindowLongW(hwnd, -20);
         SetWindowLongW(hwnd, -20, (extended & ~0x00040000) | 0x00000080);
-        int rendering = 2;
+        int rendering = 1; // Disable the native frame around the transparent XAML surface.
         DwmSetWindowAttribute(hwnd, 2, ref rendering, 4);
-        int corner = rounded ? 2 : 1;
+        int corner = 1;
         DwmSetWindowAttribute(hwnd, 33, ref corner, 4);
+        int noBorder = -2;
+        DwmSetWindowAttribute(hwnd, 34, ref noBorder, 4);
 
         var panel = new StackPanel { Spacing = 0, Margin = new Thickness(4) };
         surface = new Border
@@ -218,7 +220,7 @@ internal sealed class TrayMenuWindow : Window
             : dark ? Windows.UI.Color.FromArgb(255, 72, 72, 76) : Windows.UI.Color.FromArgb(255, 218, 219, 223);
         var foregroundBrush = new SolidColorBrush(foreground);
         surface.Background = new SolidColorBrush(background);
-        surface.BorderBrush = new SolidColorBrush(line);
+        surface.BorderBrush = highContrast ? new SolidColorBrush(line) : null;
         divider.Background = new SolidColorBrush(line);
         foreach (Button button in items)
         {

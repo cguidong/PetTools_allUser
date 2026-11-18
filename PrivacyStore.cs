@@ -25,10 +25,124 @@ namespace OffWorkWidget
                 Execute("PRAGMA secure_delete=ON");
                 Execute("CREATE TABLE IF NOT EXISTS privacy (id INTEGER PRIMARY KEY CHECK(id=1), salt TEXT NOT NULL, hash TEXT NOT NULL, rounds TEXT NOT NULL, salary TEXT NOT NULL)");
                 Execute("CREATE TABLE IF NOT EXISTS privacy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+                // Existing cumulative coins become spendable once, only when the balance is first created.
+                Execute("INSERT OR IGNORE INTO privacy_meta(key,value) SELECT 'coins_balance',value FROM privacy_meta WHERE key='coins_total'");
+                Execute("INSERT OR IGNORE INTO privacy_meta(key,value) VALUES('coins_balance','0')");
                 if (Read() == null) Execute("INSERT INTO privacy(id,salt,hash,rounds,salary) VALUES(1,'','','',?)", Seal(initialSalary));
                 LoadSalary(); // A damaged database must not fall back to an unlocked default.
+                RefundRetiredEffects();
             }
             catch { Dispose(); throw; }
+        }
+        public int CoinCount => ReadMetaInt("coins_total");
+        public int CoinBalance => ReadMetaInt("coins_balance");
+        internal event Action? BalanceChanged;
+        public int SelectedEffect => ReadMetaInt("effect_selected");
+        public static int EffectPrice(int effect) => effect switch { 1 => 100, 2 => 150, 3 => 300, 5 => 300, _ => throw new ArgumentOutOfRangeException(nameof(effect)) };
+        public bool EffectUnlocked(int effect) => effect == 0 || ((effect == 1 || effect == 2 || effect == 3 || effect == 5) && ReadMetaInt("effect_unlocked_" + effect) == 1);
+        void RefundRetiredEffects()
+        {
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                int refund = (ReadMetaInt("effect_unlocked_4") == 1 ? 200 : 0) + (ReadMetaInt("effect_unlocked_6") == 1 ? 500 : 0);
+                if (refund > 0)
+                {
+                    WriteMetaInt("effect_unlocked_4", 0); WriteMetaInt("effect_unlocked_6", 0);
+                    int pending = ReadMetaInt("retired_effect_refund_pending");
+                    WriteMetaInt("retired_effect_refund_pending", checked(pending + refund));
+                }
+                int selected = ReadMetaInt("effect_selected");
+                if (selected == 4 || selected == 6) WriteMetaInt("effect_selected", 0);
+                ApplyPendingEffectRefund();
+                Execute("COMMIT");
+            }
+            catch { Execute("ROLLBACK"); throw; }
+        }
+        // Preserve any refund that cannot fit in the integer balance until coins are spent.
+        void ApplyPendingEffectRefund()
+        {
+            int pending = ReadMetaInt("retired_effect_refund_pending");
+            if (pending == 0) return;
+            int balance = CoinBalance, credit = Math.Min(pending, int.MaxValue - balance);
+            if (credit == 0) return;
+            WriteMetaInt("coins_balance", balance + credit);
+            WriteMetaInt("retired_effect_refund_pending", pending - credit);
+        }
+        public int AddCoin()
+        {
+            int count;
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                count = CoinCount;
+                int balance = CoinBalance;
+                if (count < int.MaxValue) WriteMetaInt("coins_total", ++count);
+                if (balance < int.MaxValue) WriteMetaInt("coins_balance", balance + 1);
+                Execute("COMMIT");
+            }
+            catch { Execute("ROLLBACK"); throw; }
+            BalanceChanged?.Invoke();
+            return count;
+        }
+        public bool UnlockEffect(int effect)
+        {
+            int price = EffectPrice(effect);
+            bool spent = false;
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                if (EffectUnlocked(effect)) { Execute("COMMIT"); return true; }
+                int balance = CoinBalance;
+                if (balance < price) { Execute("COMMIT"); return false; }
+                WriteMetaInt("coins_balance", balance - price);
+                WriteMetaInt("effect_unlocked_" + effect, 1);
+                ApplyPendingEffectRefund();
+                Execute("COMMIT");
+                spent = true;
+            }
+            catch { Execute("ROLLBACK"); throw; }
+            if (spent) BalanceChanged?.Invoke();
+            return true;
+        }
+        // Result and payment are committed together so reopening today never charges twice.
+        public bool DrawDailyFortune(DateTime localDate, out int result)
+        {
+            int day = localDate.Year * 10000 + localDate.Month * 100 + localDate.Day;
+            bool spent = false;
+            result = 0;
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                if (ReadMetaInt("fortune_day") == day && ReadMetaInt("fortune_result") > 0)
+                {
+                    result = ReadMetaInt("fortune_result");
+                    Execute("COMMIT");
+                    return true;
+                }
+                int balance = CoinBalance;
+                if (balance < 10) { Execute("COMMIT"); return false; }
+                result = RandomNumberGenerator.GetInt32(1, 13);
+                WriteMetaInt("coins_balance", balance - 10);
+                WriteMetaInt("fortune_result", result);
+                WriteMetaInt("fortune_day", day);
+                ApplyPendingEffectRefund();
+                Execute("COMMIT");
+                spent = true;
+            }
+            catch { Execute("ROLLBACK"); throw; }
+            if (spent) BalanceChanged?.Invoke();
+            return true;
+        }
+        public int TodayFortune(DateTime localDate)
+        {
+            int day = localDate.Year * 10000 + localDate.Month * 100 + localDate.Day;
+            return ReadMetaInt("fortune_day") == day ? ReadMetaInt("fortune_result") : 0;
+        }
+        public void SelectEffect(int effect)
+        {
+            if (!EffectUnlocked(effect)) throw new InvalidOperationException("请先解锁特效。");
+            WriteMetaInt("effect_selected", effect);
         }
         public bool HasPassword { get { return ReadRequired()[1].Length != 0; } }
         public decimal LoadSalary()
@@ -188,6 +302,29 @@ namespace OffWorkWidget
                 int result = Native.sqlite3_step(stmt); if(result != 101 && result != 100) Check(result);
             }
             finally { Native.sqlite3_finalize(stmt); }
+        }
+        public int WishStars(string wishId)
+        {
+            if (!Guid.TryParseExact(wishId, "N", out _)) throw new ArgumentException("无效的心愿标识。", nameof(wishId));
+            return ReadMetaInt("wish_stars_" + wishId.ToLowerInvariant());
+        }
+        public bool DepositWishStar(string wishId)
+        {
+            if (!Guid.TryParseExact(wishId, "N", out _)) throw new ArgumentException("无效的心愿标识。", nameof(wishId));
+            string key = "wish_stars_" + wishId.ToLowerInvariant();
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                int balance = CoinBalance, stars = ReadMetaInt(key);
+                if (balance < 100 || stars == int.MaxValue) { Execute("COMMIT"); return false; }
+                WriteMetaInt("coins_balance", balance - 100);
+                WriteMetaInt(key, stars + 1);
+                ApplyPendingEffectRefund();
+                Execute("COMMIT");
+            }
+            catch { Execute("ROLLBACK"); throw; }
+            BalanceChanged?.Invoke();
+            return true;
         }
         int ReadMetaInt(string key)
         {

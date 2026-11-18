@@ -129,6 +129,8 @@ internal sealed class PetAnimationPlayer : IDisposable
         GlassProfile.Event("pet-animation-fade-start");
     }
 
+    internal bool IsPlaying => playing;
+
     internal TimeSpan Duration => TimeSpan.FromSeconds((double)count / fps);
 
     internal byte[] CaptureFrame()

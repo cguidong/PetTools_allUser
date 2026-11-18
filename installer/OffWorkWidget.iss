@@ -5,7 +5,7 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.106"
+  #define AppVersion "1.0.107"
 #endif
 #ifndef MinWindowsVersion
   #define MinWindowsVersion "10.0.19041"
@@ -411,11 +411,11 @@ begin
     Description.SetBounds(ScaleX(20), ScaleY(104), ScaleX(544), ScaleY(48));
     Description.AutoSize := False;
     Description.WordWrap := True;
-    Description.Caption := '将移除有盼的程序文件。本机设置、心愿和金额密码默认保留，重新安装后可以继续使用。';
+    Description.Caption := '将移除有盼的程序文件。本机设置、心愿、金币和金额密码默认保留，重新安装后可以继续使用。';
     RemoveCheck := TNewCheckBox.Create(Dialog);
     RemoveCheck.Parent := Dialog;
     RemoveCheck.SetBounds(ScaleX(20), ScaleY(166), ScaleX(544), ScaleY(26));
-    RemoveCheck.Caption := '同时删除本机设置、心愿和金额密码';
+    RemoveCheck.Caption := '同时删除本机设置、心愿、金币和金额密码';
     RemoveCheck.Checked := False;
     Warning := TNewStaticText.Create(Dialog);
     Warning.Parent := Dialog;

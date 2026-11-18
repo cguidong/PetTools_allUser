@@ -64,7 +64,7 @@ internal static class CompositorWindowCapture
     // The compositor only delivers frames when content changes, so an uncapped
     // source costs nothing while static and delivers the first change on the next
     // display frame instead of waiting for a throttle window.
-    const int FrameIntervalMilliseconds = 0, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000;
+    const int FrameIntervalMilliseconds = 0, FastFrameIntervalMilliseconds = 0, FailureRetryMilliseconds = 5000, DisposedRetryMilliseconds = 250;
     static readonly Timer reaper = new Timer(_ => Reap(), null, 1000, 1000);
     static long cachedPixels;
     static string? lastError;
@@ -260,7 +260,7 @@ internal static class CompositorWindowCapture
                             if (entry.Value < expiry) { oldest = entry.Key; expiry = entry.Value; }
                         retryAfter.Remove(oldest);
                     }
-                    retryAfter[Handle] = Environment.TickCount64 + FailureRetryMilliseconds;
+                    retryAfter[Handle] = Environment.TickCount64 + (error is ObjectDisposedException ? DisposedRetryMilliseconds : FailureRetryMilliseconds);
                 }
             }
             Volatile.Write(ref closed, true);
@@ -357,7 +357,15 @@ internal static class CompositorWindowCapture
                 if (GlassProfile.Enabled) GlassProfile.Event("source-start " + ClassName(Handle));
             }
             catch (Exception ex) { Fail(ex); }
-            finally { newSession?.Dispose(); newPool?.Dispose(); newDevice?.Dispose(); if (newItem != null) ((IWinRTObject)newItem).NativeObject.Dispose(); }
+            finally
+            {
+                // A window can close while its capture session is being created.
+                // Each WinRT wrapper may already have been closed by that transition.
+                try { newSession?.Dispose(); } catch (ObjectDisposedException) { }
+                try { newPool?.Dispose(); } catch (ObjectDisposedException) { }
+                try { newDevice?.Dispose(); } catch (ObjectDisposedException) { }
+                try { if (newItem != null) ((IWinRTObject)newItem).NativeObject.Dispose(); } catch (ObjectDisposedException) { }
+            }
         }
 
         void ItemClosed(GraphicsCaptureItem sender, object args)

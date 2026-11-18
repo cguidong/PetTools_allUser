@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -61,13 +61,17 @@ public sealed class MainWindow : Window
     Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? surfaceGeometry;
     readonly Border card = new Border { CornerRadius = new CornerRadius(36), Margin = new Thickness(0) };
     readonly Border backdropCard = new Border();
-    readonly LinearGradientBrush rimBrush = new LinearGradientBrush
-    {
-        StartPoint = new Point(0, 0), EndPoint = new Point(0, 1)
-    };
     readonly Canvas foregroundLayer = new Canvas();
     readonly ScaleTransform contentScale = new ScaleTransform();
     readonly Canvas coins = new Canvas { IsHitTestVisible = false };
+    readonly Button coinBankButton = new Button { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom };
+    readonly TranslateTransform coinJarPosition = new TranslateTransform();
+    Point coinJarPressPoint, coinJarPressPosition;
+    bool coinJarPointerDown, coinJarMoved, suppressCoinJarClick;
+    readonly Border coinBankBalance = new Border { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Visibility = Visibility.Collapsed };
+    readonly TextBlock coinBankBalanceText = new TextBlock { IsTextScaleFactorEnabled = false };
+    Canvas? coinJarFillLayer;
+    DispatcherQueueTimer? coinBankTimer;
     readonly Canvas coinOverlay = new Canvas { IsHitTestVisible = false };
     readonly Canvas hoverEffectLayer = new Canvas { IsHitTestVisible = false, Visibility = Visibility.Collapsed };
     readonly Canvas hoverEffectRoot = new Canvas { Width = 120, Height = 120, RenderTransformOrigin = new Point(.5, .5), IsHitTestVisible = false };
@@ -124,9 +128,12 @@ public sealed class MainWindow : Window
     Storyboard? petClickAnimation;
     int emittedCoins;
     long coinScoreLastAt;
+    long nextAmbientEffectAt;
+    int ambientEffectKind = -1, ambientBatchSize, ambientParticleLimit, ambientParticlesActive;
+    bool coinScoreHasEvent;
     readonly TextBlock coinScore = new TextBlock { FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, VerticalAlignment = VerticalAlignment.Center };
     readonly TextBlock coinScoreTarget = new TextBlock { IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65, VerticalAlignment = VerticalAlignment.Center };
-    readonly TextBlock coinScoreHeading = new TextBlock { Text = "本次金币", IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65 };
+    readonly TextBlock coinScoreHeading = new TextBlock { Text = "累计金币", IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65 };
     readonly TextBlock coinScoreDivider = new TextBlock { Text = "/", IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .4, VerticalAlignment = VerticalAlignment.Center };
     readonly StackPanel coinScoreNumbers = new StackPanel { Orientation = Orientation.Horizontal };
     readonly StackPanel coinScoreWords = new StackPanel();
@@ -187,6 +194,9 @@ public sealed class MainWindow : Window
     readonly Image pet = new Image { Width = 132, Height = 150, Stretch = Stretch.Uniform, VerticalAlignment = VerticalAlignment.Bottom, IsHitTestVisible = false };
     readonly Image waterPetOverlay = new Image { Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false, Visibility = Visibility.Collapsed };
     PetAnimationPlayer? petAnimation;
+    PetAnimationPlayer? slackAnimation;
+    bool slackActive, slackLoading, slackMouseBlocked;
+    long nextSlackAt;
     PetAnimationPlayer? reminderAnimation;
     PetAnimationPlayer? coinPetAnimation;
     bool coinPetActive;
@@ -351,6 +361,7 @@ public sealed class MainWindow : Window
         settings.Calendar = calendar;
         privacy = new PrivacyStore(Path.Combine(dataFolder, "privacy.db"), settings.Salary);
         settings.Salary = privacy.LoadSalary(); settings.HideAmount = true;
+        emittedCoins = privacy.CoinCount;
         // Manual make-up work/rest entries only matter on their date; drop the
         // ones that have already passed so the list cleans itself up.
         string todayKey = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
@@ -383,13 +394,6 @@ public sealed class MainWindow : Window
         hostSurface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Children.Add(backdropCard);
-        // The clear glass mirrors the wallpaper, so on dark wallpapers the card
-        // silhouette needs a faint adaptive hairline to stay readable as a frame.
-        for (int i = 0; i < 3; i++) rimBrush.GradientStops.Add(new GradientStop());
-        rimBrush.GradientStops[1].Offset = .45;
-        rimBrush.GradientStops[2].Offset = 1;
-        backdropCard.BorderBrush = rimBrush;
-        backdropCard.BorderThickness = new Thickness(1);
         surface.Children.Add(foregroundLayer);
         foregroundLayer.Children.Add(card);
         card.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
@@ -415,6 +419,7 @@ public sealed class MainWindow : Window
         coinScoreBadge.Child = coinScoreContent;
         coinScoreBadge.SizeChanged += (_, __) => FitCaptionToColumn();
         surface.Children.Add(coinScoreBadge);
+        BuildCoinBank();
         BuildHoverEffect();
 
         if (native.Presenter is OverlappedPresenter presenter)
@@ -444,7 +449,7 @@ public sealed class MainWindow : Window
         catch { }
         string icon = Path.Combine(AppContext.BaseDirectory, "assets", "app-icon.ico");
         if (File.Exists(icon)) native.SetIcon(icon);
-        glass = GlassBackdrop.Apply(this, backdropCard, surface);
+        glass = GlassBackdrop.Apply(this, backdropCard);
         surface.Loaded += (_, __) => EnsureRenderEraseMonitor();
         desktopSource = new DesktopGlassSource(this, surface, backdropCard);
         desktopSource.FrameUpdated = UpdateAppearance;
@@ -477,6 +482,19 @@ public sealed class MainWindow : Window
             {
                 e.Handled = true;
                 return;
+            }
+            // A small pointer shift between the two taps can otherwise be
+            // interpreted as a drag before the double-tap is recognized.
+            if (restoreDoubleTapPosition)
+            {
+                EndDrag(null);
+                if (native.Position.X != doubleTapStartWindow.X || native.Position.Y != doubleTapStartWindow.Y)
+                {
+                    native.Move(doubleTapStartWindow);
+                    settings.X = doubleTapStartWindow.X; settings.Y = doubleTapStartWindow.Y;
+                    Save(); desktopSource.Capture();
+                }
+                restoreDoubleTapPosition = false;
             }
             OpenSettings();
         };
@@ -519,8 +537,13 @@ public sealed class MainWindow : Window
                 Refresh();
                 UpdateAppearance();
             }
+            if (elapsed.ElapsedMilliseconds >= nextAmbientEffectAt)
+            {
+                nextAmbientEffectAt = elapsed.ElapsedMilliseconds + Random.Shared.Next(2500, 4501);
+                ShowAmbientShopEffect();
+            }
             KeepCoinCursor();
-            if (emittedCoins > 0) coinScoreBadge.Visibility = elapsed.ElapsedMilliseconds - coinScoreLastAt < 10000 ? Visibility.Visible : Visibility.Collapsed;
+            if (coinScoreHasEvent) coinScoreBadge.Visibility = elapsed.ElapsedMilliseconds - coinScoreLastAt < 10000 ? Visibility.Visible : Visibility.Collapsed;
         };
         walkTimer = DispatcherQueue.CreateTimer();
         walkTimer.Interval = TimeSpan.FromMilliseconds(140);
@@ -735,6 +758,239 @@ public sealed class MainWindow : Window
         Storyboard.SetTarget(breathe, petTransform); Storyboard.SetTargetProperty(breathe, "TranslateY");
         petBreathing = new Storyboard(); petBreathing.Children.Add(breathe);
         pet.Loaded += (_, __) => { if (settings.PetId != "polar-bear" && settings.PetId != "panda" && settings.PetId != "cow-cat") petBreathing.Begin(); };
+    }
+
+    void BuildCoinBank()
+    {
+        var jarImage = new Image
+        {
+            Width = 32, Height = 36, Stretch = Stretch.Uniform,
+            Source = new BitmapImage(new Uri("ms-appx:///assets/coin-jar.png")),
+            IsHitTestVisible = false
+        };
+        var jarLift = new TranslateTransform();
+        var floatStory = new Storyboard();
+        var lift = new DoubleAnimation
+        {
+            From = 0, To = -3.2, Duration = new Duration(TimeSpan.FromSeconds(2.8)),
+            AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever,
+            EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+        };
+        Storyboard.SetTarget(lift, jarLift); Storyboard.SetTargetProperty(lift, "Y");
+        floatStory.Children.Add(lift);
+
+        coinJarFillLayer = new Canvas
+        {
+            Width = 32, Height = 36, IsHitTestVisible = false,
+            Clip = new RectangleGeometry { Rect = new Rect(9.5, 12.5, 14, 19) }
+        };
+        var jarFloat = new Grid { Width = 32, Height = 36 };
+        jarFloat.RenderTransform = jarLift;
+        jarFloat.Children.Add(jarImage);
+        jarFloat.Children.Add(coinJarFillLayer);
+
+        var jarHost = new Grid { Width = 32, Height = 36 };
+        jarHost.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 14, Height = 3, HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 0, 1),
+            Fill = new SolidColorBrush(Windows.UI.Color.FromArgb(48, 20, 12, 6))
+        });
+        jarHost.Children.Add(jarFloat);
+
+        coinBankButton.Content = new Viewbox { Width = 19, Height = 21, Stretch = Stretch.Uniform, Child = jarHost };
+        coinBankButton.Padding = new Thickness(0); coinBankButton.MinWidth = coinBankButton.MinHeight = 0;
+        coinBankButton.BorderThickness = new Thickness(0); coinBankButton.Background = new SolidColorBrush(Colors.Transparent);
+        coinBankButton.IsTabStop = false;
+        coinBankButton.UseSystemFocusVisuals = false;
+        coinBankButton.FocusVisualPrimaryThickness = new Thickness(0);
+        coinBankButton.FocusVisualSecondaryThickness = new Thickness(0);
+        coinBankButton.Resources["ButtonBackgroundPointerOver"] = new SolidColorBrush(Colors.Transparent);
+        coinBankButton.Resources["ButtonBackgroundPressed"] = new SolidColorBrush(Colors.Transparent);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(coinBankButton, "查看可用金币");
+        coinBankButton.DoubleTapped += (_, e) => e.Handled = true;
+        coinBankButton.RenderTransform = coinJarPosition;
+        coinBankButton.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(CoinJarPointerPressed), true);
+        coinBankButton.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler(CoinJarPointerMoved), true);
+        coinBankButton.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(CoinJarPointerReleased), true);
+        coinBankButton.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler(CoinJarPointerCaptureLost), true);
+        coinBankButton.Click += (_, __) => { if (!coinJarPointerDown && !suppressCoinJarClick) ShowCoinBankBalance(); };
+        surface.SizeChanged += (_, __) => ApplyCoinJarPosition();
+        coinBankButton.Loaded += (_, __) =>
+        {
+            if (uiSettings.AnimationsEnabled) floatStory.Begin();
+            else jarLift.Y = -1;
+        };
+        coinBankBalance.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(225, 35, 35, 40));
+        coinBankBalance.CornerRadius = new CornerRadius(10);
+        coinBankBalanceText.Foreground = new SolidColorBrush(Colors.White);
+        coinBankBalance.Child = coinBankBalanceText;
+        privacy.BalanceChanged += UpdateCoinJarFill;
+        UpdateCoinJarFill();
+        surface.Children.Add(coinBankBalance); surface.Children.Add(coinBankButton);
+    }
+
+    void ApplyCoinJarPosition()
+    {
+        if (surface.ActualWidth <= 0 || surface.ActualHeight <= 0)
+        { coinJarPosition.X = coinJarPosition.Y = 0; PositionCoinBankBalance(); return; }
+        double scale = PhysicalScale, inset = 12 * scale;
+        if (settings.CoinJarX < 0 || settings.CoinJarY < 0)
+        {
+            coinJarPosition.X = 0;
+            coinJarPosition.Y = Math.Min(34 * scale, Math.Max(0, surface.ActualHeight - coinBankButton.Height))
+                - (surface.ActualHeight - coinBankButton.Height - 10 * scale);
+            PositionCoinBankBalance(); return;
+        }
+        double maxX = Math.Max(inset, surface.ActualWidth - coinBankButton.Width - inset);
+        double maxY = Math.Max(inset, surface.ActualHeight - coinBankButton.Height - inset);
+        double x = inset + Math.Clamp(settings.CoinJarX, 0, 1) * (maxX - inset);
+        double y = inset + Math.Clamp(settings.CoinJarY, 0, 1) * (maxY - inset);
+        coinJarPosition.X = x - (surface.ActualWidth - coinBankButton.Width - 4 * scale);
+        coinJarPosition.Y = y - (surface.ActualHeight - coinBankButton.Height - 10 * scale);
+        PositionCoinBankBalance();
+    }
+
+    void CoinJarPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (!e.GetCurrentPoint(coinBankButton).Properties.IsLeftButtonPressed) return;
+        coinJarPointerDown = true; coinJarMoved = false; suppressCoinJarClick = true;
+        coinJarPressPoint = e.GetCurrentPoint(surface).Position;
+        coinJarPressPosition = new Point(coinJarPosition.X, coinJarPosition.Y);
+        coinBankButton.CapturePointer(e.Pointer);
+        e.Handled = true;
+    }
+
+    void CoinJarPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!coinJarPointerDown) return;
+        Point point = e.GetCurrentPoint(surface).Position;
+        double dx = point.X - coinJarPressPoint.X, dy = point.Y - coinJarPressPoint.Y;
+        if (!coinJarMoved && dx * dx + dy * dy < 16 * PhysicalScale * PhysicalScale) { e.Handled = true; return; }
+        coinJarMoved = true;
+        double inset = 12 * PhysicalScale;
+        double maxX = Math.Max(inset, surface.ActualWidth - coinBankButton.Width - inset);
+        double maxY = Math.Max(inset, surface.ActualHeight - coinBankButton.Height - inset);
+        double baseX = surface.ActualWidth - coinBankButton.Width - 4 * PhysicalScale;
+        double baseY = surface.ActualHeight - coinBankButton.Height - 10 * PhysicalScale;
+        double x = Math.Clamp(baseX + coinJarPressPosition.X + dx, inset, maxX);
+        double y = Math.Clamp(baseY + coinJarPressPosition.Y + dy, inset, maxY);
+        settings.CoinJarX = maxX > inset ? (x - inset) / (maxX - inset) : 0;
+        settings.CoinJarY = maxY > inset ? (y - inset) / (maxY - inset) : 0;
+        ApplyCoinJarPosition();
+        e.Handled = true;
+    }
+
+    void CoinJarPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!coinJarPointerDown) return;
+        bool moved = coinJarMoved;
+        coinJarPointerDown = false;
+        coinBankButton.ReleasePointerCapture(e.Pointer);
+        if (moved) Save(); else ShowCoinBankBalance();
+        DispatcherQueue.TryEnqueue(() => suppressCoinJarClick = false);
+        e.Handled = true;
+    }
+
+    void CoinJarPointerCaptureLost(object sender, PointerRoutedEventArgs e)
+    {
+        if (!coinJarPointerDown) return;
+        coinJarPointerDown = false;
+        if (coinJarMoved) Save();
+        DispatcherQueue.TryEnqueue(() => suppressCoinJarClick = false);
+    }
+
+    void UpdateCoinJarFill()
+    {
+        var layer = coinJarFillLayer;
+        if (layer == null) return;
+        int balance;
+        try { balance = privacy.CoinBalance; }
+        catch { return; }
+        layer.Children.Clear();
+        int level = balance <= 100 ? 1 : balance <= 500 ? 2 : balance < 1000 ? 3 : 4;
+        if (balance <= 0) return;
+        var fill = new LinearGradientBrush { StartPoint = new Point(.5, 0), EndPoint = new Point(.5, 1) };
+        fill.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 255, 230, 160), Offset = 0 });
+        fill.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 227, 166, 60), Offset = .6 });
+        fill.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(255, 193, 122, 34), Offset = 1 });
+        var face = new SolidColorBrush(Windows.UI.Color.FromArgb(140, 255, 217, 128));
+        var edge = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 158, 102, 24));
+        var glint = new SolidColorBrush(Windows.UI.Color.FromArgb(210, 255, 255, 244));
+        layer.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse
+        {
+            Width = 15, Height = 3.4, Fill = new SolidColorBrush(Windows.UI.Color.FromArgb(38, 0, 0, 0))
+        });
+        Canvas.SetLeft(layer.Children[0], 8.8); Canvas.SetTop(layer.Children[0], 28.2);
+        var rows = new (double Top, double[] Lefts, double Width, double Height)[]
+        {
+            (27.2, new[] { 9.4, 15.4 }, 6.8, 4.2),
+            (23.2, new[] { 10.6, 16.6 }, 6.8, 4.2),
+            (19.2, new[] { 9.2, 15.2 }, 6.8, 4.2),
+            (15.2, new[] { 11.2, 16.8 }, 6.8, 4.2)
+        };
+        for (int row = 0; row < level && row < rows.Length; row++)
+        {
+            var (top, lefts, width, height) = rows[row];
+            foreach (double left in lefts)
+            {
+                var coin = new Microsoft.UI.Xaml.Shapes.Ellipse
+                {
+                    Width = width, Height = height, Fill = fill, Stroke = edge, StrokeThickness = .5
+                };
+                Canvas.SetLeft(coin, left); Canvas.SetTop(coin, top); layer.Children.Add(coin);
+                var core = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = width * .56, Height = height * .5, Fill = face };
+                Canvas.SetLeft(core, left + width * .22); Canvas.SetTop(core, top + height * .24); layer.Children.Add(core);
+                var shine = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 1.1, Height = .6, Fill = glint };
+                Canvas.SetLeft(shine, left + width * .22); Canvas.SetTop(shine, top + .5); layer.Children.Add(shine);
+            }
+        }
+        var sheen = new Border
+        {
+            Width = 2.2, Height = 13, CornerRadius = new CornerRadius(1),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(64, 255, 255, 255))
+        };
+        Canvas.SetLeft(sheen, 8.3); Canvas.SetTop(sheen, 15.5); layer.Children.Add(sheen);
+    }
+
+
+    void ShowCoinBankBalance()
+    {
+        if (coinBankBalance.Visibility == Visibility.Visible)
+        {
+            coinBankTimer?.Stop();
+            coinBankBalance.Visibility = Visibility.Collapsed;
+            return;
+        }
+        try { coinBankBalanceText.Text = "可用金币  " + privacy.CoinBalance.ToString("N0", CultureInfo.InvariantCulture); }
+        catch (IOException ex) { App.RecordEvent("coin balance read failed: " + ex.Message); return; }
+        UpdateCoinJarFill();
+        coinBankBalance.Visibility = Visibility.Visible;
+        PositionCoinBankBalance();
+        if (coinBankTimer == null)
+        {
+            coinBankTimer = DispatcherQueue.CreateTimer();
+            coinBankTimer.Interval = TimeSpan.FromSeconds(4);
+            coinBankTimer.IsRepeating = false;
+            coinBankTimer.Tick += (_, __) => coinBankBalance.Visibility = Visibility.Collapsed;
+        }
+        coinBankTimer.Stop(); coinBankTimer.Start();
+    }
+
+    void PositionCoinBankBalance()
+    {
+        if (coinBankBalance.Visibility != Visibility.Visible || surface.ActualWidth <= 0 || surface.ActualHeight <= 0) return;
+        coinBankBalance.Margin = new Thickness(0);
+        coinBankBalance.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+        double width = coinBankBalance.DesiredSize.Width, height = coinBankBalance.DesiredSize.Height;
+        double scale = PhysicalScale, gap = 3 * scale, edge = 4 * scale;
+        double jarX = surface.ActualWidth - coinBankButton.Width - 4 * scale + coinJarPosition.X;
+        double jarY = surface.ActualHeight - coinBankButton.Height - 10 * scale + coinJarPosition.Y;
+        double x = Math.Clamp(jarX + (coinBankButton.Width - width) / 2, edge, Math.Max(edge, surface.ActualWidth - width - edge));
+        double y = jarY - height - gap;
+        if (y < edge) y = jarY + coinBankButton.Height + gap;
+        y = Math.Clamp(y, edge, Math.Max(edge, surface.ActualHeight - height - edge));
+        coinBankBalance.Margin = new Thickness(x, y, 0, 0);
     }
 
     StackPanel Stat(string title, TextBlock value)
@@ -1142,7 +1398,7 @@ public sealed class MainWindow : Window
 
     bool IsCursorOverHandArea(Point point)
     {
-        if (IsPointInside(pet, point)) return true;
+        if (IsPointInside(coinBankButton, point) || IsPointInside(pet, point)) return true;
         return statsWishMode && IsPointInside(stats, point);
     }
 
@@ -1183,6 +1439,8 @@ public sealed class MainWindow : Window
     void LoadPet()
     {
         int revision = ++petAnimationRevision;
+        CancelSlack(false); slackAnimation?.Dispose(); slackAnimation = null; slackLoading = false; slackMouseBlocked = false;
+        ScheduleSlack();
         reminderAnimationRevision++;
         napActive = false; napPending = false; napRevision++;
         napEndAt = DateTime.MinValue;
@@ -1249,6 +1507,7 @@ public sealed class MainWindow : Window
 
     void PlayPolarCoinAction()
     {
+        CancelSlack(true);
         var source = napActive ? napAnimation : petAnimation;
         if (settings.PetId != "polar-bear" || reminderPetActive || startWorkActive || source == null || coinPetAnimation == null ||
             !uiSettings.AnimationsEnabled || disposed || exiting || !IsWindowVisible(hwnd)) return;
@@ -1280,7 +1539,7 @@ public sealed class MainWindow : Window
     void UpdatePetHoverMonitor()
     {
         bool active = petAnimation != null && !reminderPetActive && !napActive && !napPending && !startWorkActive && !exiting && !disposed && !startupMaskActive && startupRevealStarted && IsWindowVisible(hwnd);
-        if (!active) { petHoverTimer?.Stop(); CancelPolarCoinAction(true); petAnimation?.Stop(); return; }
+        if (!active) { petHoverTimer?.Stop(); CancelSlack(false); CancelPolarCoinAction(true); petAnimation?.Stop(); return; }
         if (petHoverTimer == null)
         {
             petHoverTimer = DispatcherQueue.CreateTimer();
@@ -1295,6 +1554,7 @@ public sealed class MainWindow : Window
         if (petAnimation == null || reminderPetActive || napActive || napPending || startWorkActive || exiting || disposed) return;
         if (!IsWindowVisible(hwnd) || startupMaskActive) { UpdatePetHoverMonitor(); return; }
         if (coinPetActive) return;
+        if (UpdateSlack()) return;
         bool inside = false, overPetPixels = false;
         if (uiSettings.AnimationsEnabled && !isDragging && TryGetHoverPoint(out Point point))
         {
@@ -1307,6 +1567,85 @@ public sealed class MainWindow : Window
             }
         }
         petAnimation.SetHover(inside, overPetPixels);
+    }
+
+    void ScheduleSlack() => nextSlackAt = elapsed.ElapsedMilliseconds + Random.Shared.Next(60 * 60_000, 120 * 60_000 + 1);
+
+    void CancelSlack(bool restoreIdle)
+    {
+        if (!slackActive) return;
+        slackActive = false;
+        slackAnimation?.Stop();
+        ScheduleSlack();
+        if (restoreIdle) petAnimation?.ResetIdle();
+    }
+
+    bool CanStartSlack()
+    {
+        if (settings.PetId != "polar-bear" || petAnimation == null || petAnimation.IsPlaying ||
+            reminderPetActive || reminderDue != 0 || pendingReminders != 0 || napActive || napPending || startWorkActive ||
+            coinPetActive || isDragging || !uiSettings.AnimationsEnabled || IsCursorOverWidget()) return false;
+        try
+        {
+            DateTime now = DateTime.Now;
+            var hours = Logic.WorkHours(now, settings);
+            return Logic.WorkingDay(now, settings) && now.TimeOfDay >= hours.Start &&
+                now.AddSeconds(12).Date == now.Date && now.AddSeconds(12).TimeOfDay < hours.End &&
+                !Logic.IsWorkdayLunch(now, settings) && !Logic.IsWorkdayLunch(now.AddSeconds(12), settings);
+        }
+        catch (FormatException) { return false; }
+    }
+
+    bool UpdateSlack()
+    {
+        if (settings.PetId != "polar-bear" || (!slackActive && !slackMouseBlocked && elapsed.ElapsedMilliseconds < nextSlackAt)) return false;
+        bool over = IsCursorOverWidget();
+        if (slackMouseBlocked)
+        {
+            if (over) return true;
+            slackMouseBlocked = false;
+        }
+        if (slackActive)
+        {
+            if (over)
+            {
+                CancelSlack(true);
+                slackMouseBlocked = true;
+            }
+            else if (slackAnimation == null || !slackAnimation.IsPlaying) CancelSlack(true);
+            return true;
+        }
+        if (elapsed.ElapsedMilliseconds < nextSlackAt || !CanStartSlack()) return false;
+        if (slackAnimation == null)
+        {
+            if (!slackLoading) { slackLoading = true; _ = LoadSlackAsync(petAnimationRevision); }
+            return false;
+        }
+        petAnimation!.Stop();
+        slackActive = true;
+        slackAnimation.PlayOnce();
+        GlassProfile.Event("pet-slack-start");
+        return true;
+    }
+
+    async Task LoadSlackAsync(int revision)
+    {
+        try
+        {
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-slack.frames.br")).ConfigureAwait(false);
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                if (exiting || disposed || revision != petAnimationRevision || settings.PetId != "polar-bear")
+                { animation.Dispose(); return; }
+                slackLoading = false;
+                slackAnimation = animation;
+            })) animation.Dispose();
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is OverflowException || ex is COMException)
+        {
+            Debug.WriteLine("北极熊摸鱼动画无法载入：" + ex.Message);
+            DispatcherQueue.TryEnqueue(() => { if (revision == petAnimationRevision) { slackLoading = false; ScheduleSlack(); } });
+        }
     }
 
     readonly Stopwatch layoutTransitionClock = new Stopwatch();
@@ -1328,6 +1667,8 @@ public sealed class MainWindow : Window
     {
         settings.Calendar = calendar;
         settings.PetId = NormalizePet(settings.PetId);
+        coinBankButton.Visibility = settings.ShowCoinJar ? Visibility.Visible : Visibility.Collapsed;
+        if (!settings.ShowCoinJar) { coinBankBalance.Visibility = Visibility.Collapsed; coinBankTimer?.Stop(); }
         if (!settings.MouseClickThrough) hoverDragArmed = false;
         ApplyWidgetSize();
         ApplyMouseClickThrough();
@@ -1575,6 +1916,11 @@ public sealed class MainWindow : Window
         coinScoreRingHost.Width = coinScoreRingHost.Height = Size(26);
         coinScoreBadge.Padding = new Thickness(0); coinScoreBadge.BorderThickness = new Thickness(0);
         coinScoreBadge.Margin = new Thickness(0, Size(6), Size(16), 0);
+        coinBankButton.Width = Size(32); coinBankButton.Height = Size(36);
+        coinBankButton.Margin = new Thickness(0, 0, Size(4), Size(10));
+        ApplyCoinJarPosition();
+        coinBankBalance.Padding = new Thickness(Size(9), Size(5), Size(9), Size(5));
+        coinBankBalanceText.FontSize = Size(13);
         caption.FontSize = Size(17); caption.CharacterSpacing = 0;
         caption.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
         countdown.FontSize = Size(36); countdown.Margin = new Thickness(0, Size(4), 0, Size(8));
@@ -1740,7 +2086,7 @@ public sealed class MainWindow : Window
         surfaceGeometry.Size = new System.Numerics.Vector2((float)surface.Width, (float)surface.Height);
         float radius = (float)Math.Min(36 * PhysicalScale, Math.Min(surface.Width, surface.Height) * .5);
         surfaceGeometry.CornerRadius = new System.Numerics.Vector2(radius);
-        glass.SynchronizeEdge(radius, GetDpiForWindow(hwnd) / 96.0, PhysicalScale);
+        glass.SynchronizeScale(PhysicalScale);
         glass.Brush.ShapeRadius = Math.Clamp(radius / Math.Max(1, Math.Min(surface.Width, surface.Height) * .5 - 1), 0, 1);
     }
 
@@ -1956,6 +2302,7 @@ public sealed class MainWindow : Window
     void BeginNap(DateTime now, (DateTime? PlayFrom, DateTime End, bool Lunch) window)
     {
         if (exiting || disposed || napActive || settings.PetId != "polar-bear") return;
+        CancelSlack(true);
         napActive = true;
         napEndAt = window.End;
         int revision = ++napRevision;
@@ -2346,6 +2693,7 @@ public sealed class MainWindow : Window
     {
         if (exiting || disposed || settings.PetId != "polar-bear") return;
         int revision = ++reminderAnimationRevision;
+        CancelSlack(true);
         CancelPolarCoinAction(false);
         reminderPetActive = true;
         walkingFrames = null;
@@ -2577,23 +2925,6 @@ public sealed class MainWindow : Window
         glassTone = glassFromTone + (glassTargetTone - glassFromTone) * eased;
         glassTint = glassFromTint + (glassTargetTint - glassFromTint) * eased;
         if (progress >= 1) glassAppearanceClock.Stop();
-        glass.SetTone(glassTone);
-        // A dark wallpaper leaves the clear card edge nearly invisible; the rim
-        // fades in with the dark tone and stays absent on light backgrounds.
-        byte rimTop = (byte)Math.Round(44 * glassTone);
-        byte rimMid = (byte)Math.Round(20 * glassTone);
-        byte rimLow = (byte)Math.Round(8 * glassTone);
-        var rimStops = rimBrush.GradientStops;
-        if (rimStops.Count == 3)
-        {
-            SetStop(rimStops[0], Windows.UI.Color.FromArgb(rimTop, 255, 255, 255));
-            SetStop(rimStops[1], Windows.UI.Color.FromArgb(rimMid, 255, 255, 255));
-            SetStop(rimStops[2], Windows.UI.Color.FromArgb(rimLow, 255, 255, 255));
-        }
-        static void SetStop(GradientStop stop, Windows.UI.Color color)
-        {
-            if (stop.Color != color) stop.Color = color;
-        }
         double tintRGB = 255 * (1 - glassTone);
         if (Math.Abs(glass.Brush.TintR - tintRGB) > .5) glass.Brush.TintR = glass.Brush.TintG = glass.Brush.TintB = tintRGB;
         if (Math.Abs(glass.Brush.TintA - glassTint) > .001) glass.Brush.TintA = glassTint;
@@ -2601,7 +2932,7 @@ public sealed class MainWindow : Window
         if (glassFallback.Color != fallback) glassFallback.Color = fallback;
         glass.UpdateInteraction(uiSettings.AnimationsEnabled);
         if (Math.Abs(statsGlass.GlareAngle - glass.Brush.GlareAngle) > .01) statsGlass.GlareAngle = glass.Brush.GlareAngle;
-        double innerGlare = 4 + .3 * (glass.Brush.GlareFactor - 18);
+        double innerGlare = glass.Brush.GlareFactor * .5;
         if (Math.Abs(statsGlass.GlareFactor - innerGlare) > .005) statsGlass.GlareFactor = innerGlare;
     }
 
@@ -2659,11 +2990,12 @@ public sealed class MainWindow : Window
         SetEyeChip(eyeGlass, 20, 18, 13, 6);
         SetEyeChip(eyeHoverGlass, 34, 30, 21, 10);
         SetEyeChip(eyePressedGlass, 46, 41, 29, 14);
-        var tint = Windows.UI.Color.FromArgb(210, Mix(245, 40), Mix(245, 40), Mix(248, 44));
+        double tintStrength = 1 - .75 * (1 - statsTone) * lightness;
+        var tint = Windows.UI.Color.FromArgb((byte)Math.Round(210 * tintStrength), Mix(245, 40), Mix(245, 40), Mix(248, 44));
         if (statsBackground.Color != tint) statsBackground.Color = tint;
         if (statsGlass.FallbackColor != tint) statsGlass.FallbackColor = tint;
         if (Math.Abs(statsGlass.TintR - tint.R) > .5) { statsGlass.TintR = tint.R; statsGlass.TintG = tint.G; statsGlass.TintB = tint.B; }
-        double alpha = .42 - .06 * statsTone;
+        double alpha = (.42 - .06 * statsTone) * tintStrength;
         if (Math.Abs(statsGlass.TintA - alpha) > .001) statsGlass.TintA = alpha;
     }
 
@@ -3018,14 +3350,14 @@ public sealed class MainWindow : Window
     void OpenSettings()
     {
         if (exiting || disposed) return;
-        if (settingsWindow != null) { settingsWindow.Activate(); return; }
-        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
+        if (settingsWindow != null) { settingsWindow.BringToFront(); return; }
+        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale, () => Save(true));
         settingsWindow.Closed += (_, __) =>
         {
             settingsWindow = null;
             if (previewScale.HasValue && !disposed && !exiting) { previewScale = null; ApplyWidgetSize(); Refresh(); }
         };
-        settingsWindow.Activate();
+        settingsWindow.BringToFront();
     }
 
     void PositionCoinLayer()
@@ -3096,6 +3428,7 @@ public sealed class MainWindow : Window
         coinPopup.IsOpen = false;
         foreach (var story in coinStories.ToArray()) story.Stop();
         coinStories.Clear();
+        ambientParticlesActive = 0;
         activeCoinUpgrade = null;
         coins.Children.Clear();
         if (popupSettleTimer == null)
@@ -3136,8 +3469,134 @@ public sealed class MainWindow : Window
             (int)Math.Round(y * 65535.0 / Math.Max(1, height - 1)), 0, IntPtr.Zero);
     }
 
+    void ShowAmbientShopEffect()
+    {
+        if (disposed || exiting || !uiSettings.AnimationsEnabled || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+        int selectedEffect = privacy.SelectedEffect;
+        if (ambientEffectKind != selectedEffect)
+        {
+            ambientEffectKind = selectedEffect;
+            ambientBatchSize = Random.Shared.Next(1, 3);
+            ambientParticleLimit = Random.Shared.Next(6, 9);
+        }
+        if (selectedEffect < 1 || selectedEffect > 5 || selectedEffect == 4 || !privacy.EffectUnlocked(selectedEffect)) return;
+        int particleCount = Math.Min(ambientBatchSize, Math.Max(0, ambientParticleLimit - ambientParticlesActive));
+        if (particleCount == 0) return;
+        ambientBatchSize = Math.Min(ambientParticleLimit, ambientBatchSize + Random.Shared.Next(1, 3));
+        if (!trackingCoins)
+        {
+            coinPopup.XamlRoot = surface.XamlRoot;
+            PositionCoinLayer();
+            coinPopup.IsOpen = true;
+            trackingCoins = true;
+            CompositionTarget.Rendering += TrackCoinLayer;
+        }
+        double glassWidth = surface.Width / PhysicalScale;
+        var storyboard = new Storyboard();
+        void Motion(DependencyObject target, string property, params (int At, double Value, EasingMode? Ease)[] keys)
+        {
+            var motion = new DoubleAnimationUsingKeyFrames();
+            foreach (var key in keys)
+            {
+                var frame = new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(key.At)), Value = key.Value };
+                if (key.Ease is EasingMode ease) frame.EasingFunction = new QuadraticEase { EasingMode = ease };
+                motion.KeyFrames.Add(frame);
+            }
+            Storyboard.SetTarget(motion, target); Storyboard.SetTargetProperty(motion, property);
+            storyboard.Children.Add(motion);
+        }
+        var effectVisuals = new System.Collections.Generic.List<UIElement>();
+        if (uiSettings.AnimationsEnabled && selectedEffect >= 1 && selectedEffect <= 5 && selectedEffect != 4 && privacy.EffectUnlocked(selectedEffect))
+        {
+            // Reuse the heading's adaptive background estimate; the effect is
+            // outside the card, so a mixed desktop can differ from this sample.
+            bool lightEffectBackground = textAppearanceInitialized ? lightness < .5 :
+                uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R >= 128;
+            double peakOpacity = lightEffectBackground ? .95 : .68;
+            double holdOpacity = lightEffectBackground ? .86 : .62;
+            if (selectedEffect == 1)
+            {
+                // Spread the twinkles across the space above the card.
+                for (int i = 0; i < particleCount; i++)
+                {
+                    double size = (lightEffectBackground ? 11 : 10) + Random.Shared.NextDouble() * 3;
+                    var star = CreateShopEffectParticle(1, size, lightEffectBackground);
+                    var twinkle = new CompositeTransform();
+                    star.RenderTransformOrigin = new Point(.5, .5); star.RenderTransform = twinkle;
+                    double minX = 3, maxX = Math.Max(minX, glassWidth - size - 3);
+                    double minY = 8, maxY = Math.Max(minY, CoinHeadroom - size - 8);
+                    Canvas.SetLeft(star, minX + Random.Shared.NextDouble() * (maxX - minX));
+                    Canvas.SetTop(star, minY + Random.Shared.NextDouble() * (maxY - minY));
+                    coins.Children.Add(star); effectVisuals.Add(star);
+                    int delay = i * 380 + Random.Shared.Next(20, 141), end = delay + 850 + Random.Shared.Next(0, 180);
+                    int second = delay + (end - delay) * 2 / 3;
+                    Motion(twinkle, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
+                    Motion(twinkle, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
+                    Motion(star, "Opacity", (0, 0, null), (delay, 0, null), (delay + 180, peakOpacity, null),
+                        (delay + 400, peakOpacity * .24, null), (second, peakOpacity * .72, null), (end, 0, EasingMode.EaseIn));
+                }
+            }
+            else if (selectedEffect != 1)
+            for (int i = 0; i < particleCount; i++)
+            {
+                double size = (selectedEffect == 2 ? 20 : 17) + Random.Shared.NextDouble() * 3;
+                var particle = CreateShopEffectParticle(selectedEffect, size, lightEffectBackground);
+                double particleWidth = size;
+                var particleTransform = new CompositeTransform();
+                particle.RenderTransformOrigin = new Point(.5, .5);
+                particle.RenderTransform = particleTransform;
+                double startX = 12 + Random.Shared.NextDouble() * Math.Max(0, glassWidth - particleWidth - 24);
+                Canvas.SetLeft(particle, startX);
+                // Keep the entire particle above the card so it cannot cover the coin counter.
+                double startY = 5 + Random.Shared.NextDouble() * Math.Max(0, CoinHeadroom - size - 40);
+                Canvas.SetTop(particle, startY);
+                coins.Children.Add(particle); effectVisuals.Add(particle);
+                int delay = i * 380 + Random.Shared.Next(20, 141);
+                int duration = selectedEffect == 2 ? Random.Shared.Next(2600, 3401) : Random.Shared.Next(1800, 2301), end = delay + duration;
+                double drift = (i == 0 ? -1 : 1) * (7 + Random.Shared.NextDouble() * 5);
+                if (selectedEffect == 2)
+                {
+                    double RandomX() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startX, glassWidth - size - 4 - startX);
+                    double RandomY() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 3 - startY, CoinHeadroom - size - 4 - startY);
+                    double x1 = RandomX(), x2 = RandomX(), x3 = RandomX();
+                    double y1 = RandomY(), y2 = RandomY(), y3 = RandomY();
+                    Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null),
+                        (delay + duration / 3, x1, EasingMode.EaseInOut), (delay + duration * 2 / 3, x2, EasingMode.EaseInOut), (end, x3, EasingMode.EaseInOut));
+                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null),
+                        (delay + duration / 3, y1, EasingMode.EaseInOut), (delay + duration * 2 / 3, y2, EasingMode.EaseInOut), (end, y3, EasingMode.EaseInOut));
+                }
+                else
+                {
+                    Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null), (delay + duration / 2, drift, EasingMode.EaseInOut), (end, drift * .4, EasingMode.EaseInOut));
+                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null), (end, 25, EasingMode.EaseOut));
+                }
+                Motion(particleTransform, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
+                Motion(particleTransform, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
+                if (selectedEffect == 2)
+                    Motion(particle, "Opacity", (0, 0, null), (delay, 0, null), (delay + 300, .95, null),
+                        (delay + 750, .58, null), (delay + 1200, .95, null),
+                        (delay + duration * 2 / 3, .65, null), (end - 250, .9, null), (end, 0, EasingMode.EaseIn));
+                else
+                    Motion(particle, "Opacity", (0, 0, null), (delay, 0, null), (delay + 250, peakOpacity, null), (delay + duration * 2 / 3, holdOpacity, null), (end, 0, EasingMode.EaseIn));
+            }
+        }
+        ambientParticlesActive += effectVisuals.Count;
+        storyboard.Completed += (_, __) =>
+        {
+            coinStories.Remove(storyboard);
+            foreach (var visual in effectVisuals) coins.Children.Remove(visual);
+            ambientParticlesActive = Math.Max(0, ambientParticlesActive - effectVisuals.Count);
+            if (coins.Children.Count == 0) CloseCoinLayer();
+        };
+        coinStories.Add(storyboard);
+        storyboard.Begin();
+    }
+
     void EmitCoin()
     {
+        if (emittedCoins == int.MaxValue) return;
+        try { emittedCoins = privacy.AddCoin(); }
+        catch (IOException ex) { App.RecordEvent("coin save failed: " + ex.Message); return; }
         GlassProfile.Event("coin-emit");
         if (settings.PetId == "polar-bear")
         {
@@ -3152,7 +3611,7 @@ public sealed class MainWindow : Window
             trackingCoins = true;
             CompositionTarget.Rendering += TrackCoinLayer;
         }
-        int tier = CoinTier(emittedCoins + 1);
+        int tier = CoinTier(emittedCoins);
         double coinSize = 27 + tier * .35, halfCoin = coinSize / 2;
         var face = CreateCoinFace(tier, coinSize, out Border? sheen);
         var coin = new Border
@@ -3168,7 +3627,7 @@ public sealed class MainWindow : Window
         double glassWidth = surface.Width / PhysicalScale;
         double startX = left + halfCoin;
         // A balanced fan of short arcs, with small variations instead of unrelated random parameters.
-        int lane = emittedCoins % 5;
+        int lane = (emittedCoins - 1) % 5;
         double offset = lane switch { 0 => -36, 1 => -12, 2 => 22, 3 => -24, _ => 10 };
         double hitX = Math.Clamp(startX + offset + Random.Shared.NextDouble() * 6 - 3, 40, glassWidth - 40);
         double drift = Math.Sign(hitX - startX) * (7 + Random.Shared.NextDouble() * 3);
@@ -3235,7 +3694,6 @@ public sealed class MainWindow : Window
         Motion(transform, "TranslateX", xKeys.ToArray());
         Motion(transform, "TranslateY", yKeys.ToArray());
         Motion(transform, "Rotation", rotationKeys.ToArray());
-        ++emittedCoins;
         long goal = NextCoinGoal(emittedCoins);
         coinScore.Text = emittedCoins.ToString("N0", CultureInfo.InvariantCulture);
         coinScoreTarget.Text = goal.ToString("N0", CultureInfo.InvariantCulture);
@@ -3244,6 +3702,7 @@ public sealed class MainWindow : Window
         coinScoreRingSegment.Point = new Point(13 + Math.Cos(scoreAngle) * 10, 13 + Math.Sin(scoreAngle) * 10);
         coinScoreRingSegment.IsLargeArc = scoreProgress > .5;
         coinScoreLastAt = elapsed.ElapsedMilliseconds;
+        coinScoreHasEvent = true;
         coinScoreBadge.Visibility = Visibility.Visible;
         Motion(transform, "ScaleX", (0, 1, null), (apexAt / 2, .3 + Random.Shared.NextDouble() * .06, null),
             (apexAt, 1, null), ((apexAt + hitAt) / 2, .25, null), (hitAt, 1, null),
@@ -3284,6 +3743,62 @@ public sealed class MainWindow : Window
         };
         Storyboard.SetTarget(lift, petClickLift); Storyboard.SetTargetProperty(lift, "Y");
         petClickAnimation = new Storyboard(); petClickAnimation.Children.Add(lift); petClickAnimation.Begin();
+    }
+
+    static FrameworkElement CreateShopEffectParticle(int effect, double size, bool lightBackground)
+    {
+        var canvas = new Canvas { Width = 20, Height = 20, IsHitTestVisible = false };
+        var tint = lightBackground
+            ? (effect == 1 ? Windows.UI.Color.FromArgb(255, 171, 105, 28) :
+               effect == 2 ? Windows.UI.Color.FromArgb(255, 139, 112, 25) :
+               effect == 5 ? Windows.UI.Color.FromArgb(255, 156, 94, 32) : Windows.UI.Color.FromArgb(255, 51, 124, 153))
+            : (effect == 1 ? Windows.UI.Color.FromArgb(255, 255, 224, 157) :
+               effect == 2 ? Windows.UI.Color.FromArgb(255, 236, 232, 151) :
+               effect == 5 ? Windows.UI.Color.FromArgb(255, 255, 210, 142) : Windows.UI.Color.FromArgb(255, 184, 220, 235));
+        var glow = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
+        glow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(85, tint.R, tint.G, tint.B), Offset = 0 });
+        glow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, tint.R, tint.G, tint.B), Offset = 1 });
+        canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 20, Height = 20, Fill = glow });
+        if (effect == 1)
+        {
+            var star = new Microsoft.UI.Xaml.Shapes.Polygon { Points = new PointCollection(), Fill = new SolidColorBrush(tint), Stroke = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(230, 111, 63, 12) : Windows.UI.Color.FromArgb(190, 128, 82, 30)), StrokeThickness = .8 };
+            foreach (var point in new[] { new Point(10, 2.7), new Point(11.6, 8.2), new Point(17.3, 10), new Point(11.6, 11.8), new Point(10, 17.3), new Point(8.4, 11.8), new Point(2.7, 10), new Point(8.4, 8.2) }) star.Points.Add(point);
+            canvas.Children.Add(star);
+        }
+        else if (effect == 2)
+        {
+            var fireflyGlow = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
+            fireflyGlow.GradientStops.Add(new GradientStop { Color = lightBackground ? Windows.UI.Color.FromArgb(200, 179, 132, 32) : Windows.UI.Color.FromArgb(230, 255, 226, 132), Offset = 0 });
+            fireflyGlow.GradientStops.Add(new GradientStop { Color = lightBackground ? Windows.UI.Color.FromArgb(90, 193, 145, 46) : Windows.UI.Color.FromArgb(115, 255, 205, 94), Offset = .38 });
+            fireflyGlow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, 255, 214, 126), Offset = 1 });
+            canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 20, Height = 20, Fill = fireflyGlow });
+            var core = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 4.5, Height = 4.5,
+                Fill = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(255, 149, 103, 20) : Windows.UI.Color.FromArgb(255, 255, 246, 202)) };
+            Canvas.SetLeft(core, 7.75); Canvas.SetTop(core, 7.75); canvas.Children.Add(core);
+        }
+        else if (effect == 3)
+        {
+            var snowBrush = new SolidColorBrush(tint);
+            for (int arm = 0; arm < 6; arm++)
+            {
+                double angle = arm * Math.PI / 3, dx = Math.Sin(angle), dy = -Math.Cos(angle);
+                double px = -dy, py = dx;
+                void SnowLine(double x1, double y1, double x2, double y2) => canvas.Children.Add(
+                    new Microsoft.UI.Xaml.Shapes.Line { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
+                        Stroke = snowBrush, StrokeThickness = 1.15, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round });
+                SnowLine(10, 10, 10 + dx * 7, 10 + dy * 7);
+                SnowLine(10 + dx * 4.7, 10 + dy * 4.7, 10 + dx * 3 + px * 1.7, 10 + dy * 3 + py * 1.7);
+                SnowLine(10 + dx * 4.7, 10 + dy * 4.7, 10 + dx * 3 - px * 1.7, 10 + dy * 3 - py * 1.7);
+            }
+        }
+        else if (effect == 5)
+        {
+            var leaf = new Microsoft.UI.Xaml.Shapes.Polygon { Points = new PointCollection(), Fill = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(255, 156, 94, 32) : Windows.UI.Color.FromArgb(255, 238, 169, 75)) };
+            foreach (var point in new[] { new Point(4, 15), new Point(5, 9), new Point(9, 5), new Point(16, 4), new Point(15, 11), new Point(11, 15) }) leaf.Points.Add(point);
+            canvas.Children.Add(leaf);
+            canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Line { X1 = 5, Y1 = 15, X2 = 14, Y2 = 6, Stroke = new SolidColorBrush(Windows.UI.Color.FromArgb(210, 255, 232, 178)), StrokeThickness = 1 });
+        }
+        return new Viewbox { Width = size, Height = size, Stretch = Stretch.Uniform, Child = canvas, IsHitTestVisible = false, Opacity = 0 };
     }
 
     Canvas CreateCoinImpact(int tier, double x, int hitAt, double strength, Storyboard story)
@@ -3745,6 +4260,10 @@ public sealed class MainWindow : Window
     Win32Point initialCursor;
     PointInt32 initialWindowPos;
     PointInt32 lastDragPosition;
+    Win32Point previousTapCursor;
+    PointInt32 doubleTapStartWindow;
+    long previousTapAt = -10000;
+    bool restoreDoubleTapPosition;
 
     void OnCardPointerPressed(object sender, PointerRoutedEventArgs e)
     {
@@ -3778,6 +4297,14 @@ public sealed class MainWindow : Window
 
         // Use the same physical coordinate source as the move/release paths.
         if (!GetCursorPos(out Win32Point pressCursor)) return;
+
+        long tapAt = elapsed.ElapsedMilliseconds;
+        bool sameTapSequence = tapAt - previousTapAt <= GetDoubleClickTime() &&
+            Math.Abs(pressCursor.X - previousTapCursor.X) <= GetSystemMetrics(36) &&
+            Math.Abs(pressCursor.Y - previousTapCursor.Y) <= GetSystemMetrics(37);
+        if (!sameTapSequence) doubleTapStartWindow = native.Position;
+        restoreDoubleTapPosition = sameTapSequence;
+        previousTapCursor = pressCursor; previousTapAt = tapAt;
 
         dragUsesMouse = e.Pointer.PointerDeviceType == PointerDeviceType.Mouse;
         dragReleasePending = false;
@@ -4897,8 +5424,11 @@ public sealed class MainWindow : Window
             DoubleRestWeekStart = s.DoubleRestWeekStart,
             HideAmount = true,
             ShowSalaryLayout = s.ShowSalaryLayout,
+            ShowCoinJar = s.ShowCoinJar,
+            CoinJarX = s.CoinJarX,
+            CoinJarY = s.CoinJarY,
             WishEnabled = s.WishEnabled,
-            Wishes = s.Wishes != null ? s.Wishes.ConvertAll(w => new WishEntry { Name = w.Name, Target = w.Target, Saved = w.Saved }) : new System.Collections.Generic.List<WishEntry>(),
+            Wishes = s.Wishes != null ? s.Wishes.ConvertAll(w => new WishEntry { Id = w.Id, Name = w.Name, Target = w.Target, Saved = w.Saved }) : new System.Collections.Generic.List<WishEntry>(),
             WishAllocation = s.WishAllocation,
             WishStartDate = s.WishStartDate,
             WishName = s.WishName,
@@ -5004,6 +5534,7 @@ public sealed class MainWindow : Window
         if (disposed) return;
         try { EndDrag(null); } catch (Exception ex) { Debug.WriteLine(ex.Message); }
         disposed = true;
+        coinBankTimer?.Stop();
         hoverDragArmed = false;
         ResetHoverHold();
         HideHoverEffect();
@@ -5013,7 +5544,7 @@ public sealed class MainWindow : Window
         petAnimationRevision++;
         if (petEnterHook != IntPtr.Zero) { UnhookWindowsHookEx(petEnterHook); petEnterHook = IntPtr.Zero; }
         petEnterHookProc = null;
-        petHoverTimer?.Stop(); petAnimation?.Dispose(); petAnimation = null;
+        petHoverTimer?.Stop(); CancelSlack(false); slackAnimation?.Dispose(); slackAnimation = null; petAnimation?.Dispose(); petAnimation = null;
         startWorkRevision++; startWorkActive = false;
         startWorkAnimation?.Dispose(); startWorkAnimation = null;
         coinPetActive = false;
@@ -5076,6 +5607,7 @@ public sealed class MainWindow : Window
     [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr window, ref GlassMargins margins);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr handle, int attribute, ref int value, int size);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] static extern uint GetDoubleClickTime();
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern bool GetCursorPos(out Win32Point lpPoint);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);

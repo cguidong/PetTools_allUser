@@ -44,6 +44,7 @@ namespace OffWorkWidget
     }
     public class WishEntry
     {
+        public string Id = Guid.NewGuid().ToString("N");
         public string Name = "";
         public decimal Target = 0;
         public decimal Saved = 0;
@@ -85,6 +86,9 @@ namespace OffWorkWidget
         public decimal WishSaved = 0;
         public bool HideAmount = true;
         public bool ShowSalaryLayout = false;
+        public bool ShowCoinJar = true;
+        public double CoinJarX = -1;
+        public double CoinJarY = -1;
         public int AmountVisibleSeconds = 0;
         public bool WaterReminder = true;
         public bool WalkReminder = true;
@@ -112,8 +116,14 @@ namespace OffWorkWidget
             if (s.Wishes.Count == 0 &&
                 !string.IsNullOrWhiteSpace(s.WishName) && s.WishTarget > 0 && s.WishSaved >= 0)
                 s.Wishes.Add(new WishEntry { Name = s.WishName.Trim(), Target = s.WishTarget, Saved = s.WishSaved });
+            var wishIds = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var wish in s.Wishes)
             {
+                if (!Guid.TryParseExact(wish.Id, "N", out _) || !wishIds.Add(wish.Id))
+                {
+                    wish.Id = Guid.NewGuid().ToString("N");
+                    wishIds.Add(wish.Id);
+                }
                 wish.Name = (wish.Name ?? "").Trim();
                 if (wish.Name.Length > 8) wish.Name = wish.Name.Substring(0, 8);
             }
