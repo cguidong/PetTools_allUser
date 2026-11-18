@@ -4728,10 +4728,8 @@ namespace OffWorkWidget.WinUI
                 // proximity scale used while the wheel is scrolling.
                 var popHost = new Grid { Width = 26, Height = 26, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
                 popHost.Children.Add(icon);
-                var content = new StackPanel { Spacing = 1, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-                content.Children.Add(popHost);
-                content.Children.Add(new TextBlock { Text = OffWorkWidget.HoverEffects.DisplayName(id), FontSize = 12, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Center, IsTextScaleFactorEnabled = false });
-                var row = new Border { Height = rowHeight, Child = content, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0 };
+                var row = new Border { Height = rowHeight, Child = popHost, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0 };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(row, OffWorkWidget.HoverEffects.DisplayName(id));
                 row.Tapped += (_, __) =>
                 {
                     wheelViewer.ChangeView(null, wheelIndex * rowHeight, null, false);
