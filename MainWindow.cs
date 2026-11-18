@@ -3355,7 +3355,7 @@ public sealed class MainWindow : Window
     {
         if (exiting || disposed) return;
         if (settingsWindow != null) { settingsWindow.BringToFront(); return; }
-        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale, () => Save(true));
+        settingsWindow = new SettingsWindow(settings, privacy, ToggleSalaryLayout, HideSalary, next => { privacy.SaveSalary(next.Salary); settings = next; previewScale = null; ApplySettings(); Save(true); }, PreviewScale);
         settingsWindow.Closed += (_, __) =>
         {
             settingsWindow = null;

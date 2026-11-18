@@ -26,7 +26,6 @@ namespace OffWorkWidget.WinUI
         readonly Action hideSalary;
         readonly Action<OffWorkWidget.Settings> saveSettings;
         readonly Action<double>? previewScale;
-        readonly Action persistWishIds;
 
         const double WindowCornerRadius = 36;
         readonly Grid windowSurface = new Grid();
@@ -242,11 +241,10 @@ namespace OffWorkWidget.WinUI
 
         public SettingsWindow(OffWorkWidget.Settings current, OffWorkWidget.PrivacyStore privacy,
             Action toggleSalaryLayout, Action hideSalary,
-            Action<OffWorkWidget.Settings> saveSettings, Action<double>? previewScale = null, Action? persistWishIds = null)
+            Action<OffWorkWidget.Settings> saveSettings, Action<double>? previewScale = null)
         {
             this.current = current; this.privacy = privacy; this.toggleSalaryLayout = toggleSalaryLayout;
             this.hideSalary = hideSalary; this.saveSettings = saveSettings; this.previewScale = previewScale;
-            this.persistWishIds = persistWishIds ?? (() => { });
             automatic = current.AutomaticAppearance;
             night = current.NightMode; petId = current.PetId; initialPetId = petId; hoverEffect = OffWorkWidget.HoverEffects.Normalize(current.HoverEffect); observedSalary = current.Salary;
             alternatingWeekends = current.AlternatingWeekends;
@@ -349,11 +347,11 @@ namespace OffWorkWidget.WinUI
 
             settingsScroll = new ScrollViewer { Content = form, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
             settingsScroll.ViewChanged += (_, __) => UpdateScrollChrome();
-            form.Margin = new Thickness(16, 40, 16, 5);
+            form.Margin = new Thickness(16, 0, 16, 5);
             form.Children.Add(new Border { Height = 56, IsHitTestVisible = false });
             settingsScroll.Loaded += (_, __) => BindTitleTransition();
             var scrollSurface = CreateScrollSurface();
-            Grid.SetRow(scrollSurface, 0); Grid.SetRowSpan(scrollSurface, 2); root.Children.Add(scrollSurface);
+            Grid.SetRow(scrollSurface, 1); root.Children.Add(scrollSurface);
             BuildPetSelector();
 
             BuildWorkingHoursContent();
@@ -800,11 +798,11 @@ namespace OffWorkWidget.WinUI
 
         Grid CreateScrollSurface()
         {
+            // Keep text on XAML's native DPI-aware rendering path.
             var host = new Grid(); host.Children.Add(settingsScroll);
-            AttachScrollEdgeFade(host);
             var rail = new Canvas
             {
-                Width = 12, Margin = new Thickness(0, 42, 2, 8), HorizontalAlignment = HorizontalAlignment.Right,
+                Width = 12, Margin = new Thickness(0, 2, 2, 8), HorizontalAlignment = HorizontalAlignment.Right,
                 Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Opacity = 0
             };
             var thumb = new Border { Width = 3, CornerRadius = new CornerRadius(3), Background = subInkBrush };
@@ -869,66 +867,6 @@ namespace OffWorkWidget.WinUI
                 Reveal(); e.Handled = true;
             };
             return host;
-        }
-
-        void AttachScrollEdgeFade(Grid host)
-        {
-            // Redirect only the scroll pixels; the original XAML retains focus and input.
-            var output = new Border { IsHitTestVisible = false };
-            host.Children.Add(output);
-            Microsoft.UI.Composition.Visual? source = null;
-            Microsoft.UI.Composition.CompositionVisualSurface? surface = null, maskSurface = null;
-            Microsoft.UI.Composition.CompositionSurfaceBrush? sourceBrush = null, maskBrush = null;
-            Microsoft.UI.Composition.CompositionLinearGradientBrush? gradient = null;
-            Microsoft.UI.Composition.CompositionMaskBrush? masked = null;
-            Microsoft.UI.Composition.SpriteVisual? maskVisual = null, sprite = null;
-            void Resize()
-            {
-                if (surface == null || maskSurface == null || gradient == null || maskVisual == null || sprite == null) return;
-                float width = (float)Math.Max(1, settingsScroll.ActualWidth);
-                float height = (float)Math.Max(1, settingsScroll.ActualHeight);
-                var size = new System.Numerics.Vector2(width, height);
-                surface.SourceSize = maskSurface.SourceSize = size;
-                maskVisual.Size = sprite.Size = size;
-                gradient.ColorStops[1].Offset = Math.Min(.20f, 28 / height);
-                gradient.ColorStops[2].Offset = Math.Min(.40f, 64 / height);
-                gradient.ColorStops[3].Offset = Math.Max(.60f, 1 - 32 / height);
-            }
-            void Release()
-            {
-                Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(output, null);
-                if (source != null) source.Opacity = 1;
-                if (surface != null) surface.SourceVisual = null;
-                if (maskSurface != null) maskSurface.SourceVisual = null;
-                sprite?.Dispose(); masked?.Dispose(); sourceBrush?.Dispose(); maskBrush?.Dispose();
-                surface?.Dispose(); maskSurface?.Dispose(); maskVisual?.Dispose(); gradient?.Dispose();
-                source = null; surface = maskSurface = null; sourceBrush = maskBrush = null;
-                gradient = null; masked = null; maskVisual = sprite = null;
-            }
-            host.Loaded += (_, __) =>
-            {
-                if (windowClosed || surface != null) return;
-                source = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(settingsScroll);
-                var compositor = source.Compositor;
-                surface = compositor.CreateVisualSurface(); surface.SourceVisual = source;
-                sourceBrush = compositor.CreateSurfaceBrush(surface);
-                gradient = compositor.CreateLinearGradientBrush();
-                gradient.StartPoint = new System.Numerics.Vector2(0, 0);
-                gradient.EndPoint = new System.Numerics.Vector2(0, 1);
-                foreach (var stop in new[] { (0f, (byte)0), (.05f, (byte)0), (.15f, (byte)255), (.90f, (byte)255), (1f, (byte)0) })
-                    gradient.ColorStops.Add(compositor.CreateColorGradientStop(stop.Item1, Windows.UI.Color.FromArgb(stop.Item2, 255, 255, 255)));
-                maskVisual = compositor.CreateSpriteVisual(); maskVisual.Brush = gradient;
-                maskSurface = compositor.CreateVisualSurface(); maskSurface.SourceVisual = maskVisual;
-                maskBrush = compositor.CreateSurfaceBrush(maskSurface);
-                masked = compositor.CreateMaskBrush(); masked.Source = sourceBrush; masked.Mask = maskBrush;
-                sprite = compositor.CreateSpriteVisual(); sprite.Brush = masked;
-                Resize();
-                Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.SetElementChildVisual(output, sprite);
-                source.Opacity = 0;
-            };
-            settingsScroll.SizeChanged += (_, __) => Resize();
-            host.Unloaded += (_, __) => Release();
-            Closed += (_, __) => Release();
         }
 
         void BuildHeader()
@@ -2674,7 +2612,6 @@ namespace OffWorkWidget.WinUI
             details.Children.Add(labels);
             wishRowsHost = new StackPanel { Spacing = 12 };
             details.Children.Add(wishRowsHost);
-            details.Children.Add(new TextBlock { Text = "投入金币立即生效；删除心愿不会返还金币。", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
             panel.Children.Add(wishDetailsHost);
             card.Child = panel;
 
@@ -2750,35 +2687,6 @@ namespace OffWorkWidget.WinUI
             Grid.SetColumn(editor.Delete, 3); grid.Children.Add(editor.Delete);
             var rowContainer = new StackPanel { Spacing = 3 };
             rowContainer.Children.Add(grid);
-            if (!blank)
-            {
-                var coinRow = new Grid { Margin = new Thickness(8, 1, 0, 0), MinHeight = 30 };
-                coinRow.ColumnDefinitions.Add(new ColumnDefinition());
-                coinRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                var stars = new TextBlock { Foreground = subInkBrush, FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
-                var deposit = new Button { Content = "投入 100 金币", Height = 30, MinWidth = 96, Padding = new Thickness(8, 3, 8, 3), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 12 };
-                deposit.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
-                deposit.Resources["ButtonBackgroundPressed"] = timePressedBrush;
-                void RefreshWishStars() => stars.Text = "心愿星星 ★ × " + privacy.WishStars(editor.Id).ToString("N0", CultureInfo.InvariantCulture);
-                RefreshWishStars();
-                deposit.Click += (_, __) =>
-                {
-                    try
-                    {
-                        // Persist legacy wish IDs before the database transaction can spend coins.
-                        persistWishIds();
-                        if (!privacy.DepositWishStar(editor.Id)) { stars.Text = "金币不足，投入需要 100 金币"; return; }
-                        RefreshWishStars();
-                        refreshEffectShop?.Invoke();
-                    }
-                    catch (IOException) { stars.Text = "保存失败，请稍后重试"; }
-                };
-                coinRow.Children.Add(stars);
-                Grid.SetColumn(deposit, 1); coinRow.Children.Add(deposit);
-                rowContainer.Children.Add(coinRow);
-            }
-            else
-                rowContainer.Children.Add(new TextBlock { Text = "保存心愿后可投入金币点亮星星", Foreground = subInkBrush, FontSize = 12, Margin = new Thickness(8, 1, 0, 0) });
             if (!blank && achievedWishKeys.Contains(WishKey(wish)))
             {
                 editor.Status = new TextBlock
@@ -4504,9 +4412,9 @@ namespace OffWorkWidget.WinUI
             var throughRow = new Grid { ColumnSpacing = 12 };
             throughRow.ColumnDefinitions.Add(new ColumnDefinition());
             throughRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var throughLabels = new StackPanel { Spacing = 2 };
-            throughLabels.Children.Add(new TextBlock { Text = "鼠标穿透", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
-            throughLabels.Children.Add(new TextBlock { Text = "点击可穿透下一层", FontSize = 12, Foreground = subInkBrush, Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
+            var throughLabels = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+            throughLabels.Children.Add(new TextBlock { Text = "鼠标穿透", FontSize = 14, Foreground = inkBrush, TextWrapping = TextWrapping.Wrap });
+            throughLabels.Children.Add(new TextBlock { Text = "点击可穿透下一层", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
             mouseClickThrough = CreateGreenSwitch(current.MouseClickThrough);
             mouseClickThrough.VerticalAlignment = VerticalAlignment.Center;
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(mouseClickThrough, "鼠标穿透");
@@ -4519,10 +4427,10 @@ namespace OffWorkWidget.WinUI
             hoverDragRow = new Grid { ColumnSpacing = 12 };
             hoverDragRow.ColumnDefinitions.Add(new ColumnDefinition());
             hoverDragRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var hoverLabels = new StackPanel { Spacing = 2 };
-            hoverLabels.Children.Add(new TextBlock { Text = "悬停拖动", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center });
+            var hoverLabels = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+            hoverLabels.Children.Add(new TextBlock { Text = "悬停拖动", FontSize = 14, Foreground = inkBrush, TextWrapping = TextWrapping.Wrap });
             int initialDragSeconds = Math.Clamp(current.HoverDragSeconds, 1, 3);
-            var hoverDragHint = new TextBlock { Text = $"悬停 {initialDragSeconds} 秒后可拖动", FontSize = 12, Foreground = subInkBrush, Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false, VerticalAlignment = VerticalAlignment.Center };
+            var hoverDragHint = new TextBlock { Text = $"悬停 {initialDragSeconds} 秒后可拖动", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
             hoverLabels.Children.Add(hoverDragHint);
             hoverDragSeconds = new ComboBox
             {
@@ -4676,9 +4584,9 @@ namespace OffWorkWidget.WinUI
             var row = new Grid { ColumnSpacing = 12 };
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var labels = new StackPanel { Spacing = 4 };
-            labels.Children.Add(new TextBlock { Text = "开机启动", FontSize = 14, Foreground = inkBrush, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false });
-            var hint = new TextBlock { Text = "登录后自动显示挂件", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, MinHeight = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false };
+            var labels = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+            labels.Children.Add(new TextBlock { Text = "开机启动", FontSize = 14, Foreground = inkBrush, TextWrapping = TextWrapping.Wrap });
+            var hint = new TextBlock { Text = "登录后自动显示挂件", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
             labels.Children.Add(hint);
             bool canRead = true;
             try { startupInitiallyEnabled = StartupRegistration.IsEnabled(); }
@@ -5087,14 +4995,9 @@ namespace OffWorkWidget.WinUI
             var selectorRow = new Grid { ColumnSpacing = 12 };
             selectorRow.ColumnDefinitions.Add(new ColumnDefinition());
             selectorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var labels = new StackPanel { Spacing = 4 };
-            labels.Children.Add(new TextBlock { Text = "悬停特效", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center, Height = 26, LineHeight = 24, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, IsTextScaleFactorEnabled = false });
-            labels.Children.Add(new TextBlock
-            {
-                Text = "悬停光标样式", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap,
-                Height = 24, LineHeight = 22, LineStackingStrategy = LineStackingStrategy.BlockLineHeight,
-                Padding = new Thickness(0, 0, 0, 2), IsTextScaleFactorEnabled = false
-            });
+            var labels = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+            labels.Children.Add(new TextBlock { Text = "悬停特效", FontSize = 14, Foreground = inkBrush, TextWrapping = TextWrapping.Wrap });
+            labels.Children.Add(new TextBlock { Text = "悬停光标样式", FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap });
             selectorRow.Children.Add(labels);
             Grid.SetColumn(selector, 1); selectorRow.Children.Add(selector);
             return selectorRow;

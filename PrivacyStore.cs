@@ -303,29 +303,6 @@ namespace OffWorkWidget
             }
             finally { Native.sqlite3_finalize(stmt); }
         }
-        public int WishStars(string wishId)
-        {
-            if (!Guid.TryParseExact(wishId, "N", out _)) throw new ArgumentException("无效的心愿标识。", nameof(wishId));
-            return ReadMetaInt("wish_stars_" + wishId.ToLowerInvariant());
-        }
-        public bool DepositWishStar(string wishId)
-        {
-            if (!Guid.TryParseExact(wishId, "N", out _)) throw new ArgumentException("无效的心愿标识。", nameof(wishId));
-            string key = "wish_stars_" + wishId.ToLowerInvariant();
-            Execute("BEGIN IMMEDIATE");
-            try
-            {
-                int balance = CoinBalance, stars = ReadMetaInt(key);
-                if (balance < 100 || stars == int.MaxValue) { Execute("COMMIT"); return false; }
-                WriteMetaInt("coins_balance", balance - 100);
-                WriteMetaInt(key, stars + 1);
-                ApplyPendingEffectRefund();
-                Execute("COMMIT");
-            }
-            catch { Execute("ROLLBACK"); throw; }
-            BalanceChanged?.Invoke();
-            return true;
-        }
         int ReadMetaInt(string key)
         {
             IntPtr stmt = Prepare("SELECT value FROM privacy_meta WHERE key=?");
