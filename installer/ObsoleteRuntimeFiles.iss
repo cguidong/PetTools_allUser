@@ -1,4 +1,7 @@
 ﻿[InstallDelete]
+; Remove replaced cow-cat media when upgrading.
+Type: files; Name: "{app}\assets\cow-cat-walk.png"
+Type: files; Name: "{app}\assets\cow-cat-wash.frames.br"
 ; Exact files shipped by former 1.0.2 installers; preserve user data.
 Type: files; Name: "{app}\Accessibility.dll"
 Type: files; Name: "{app}\D3DCompiler_47_cor3.dll"

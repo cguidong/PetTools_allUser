@@ -18,11 +18,12 @@ internal sealed class DesktopGlassSource : IDisposable
 {
     readonly IntPtr handle;
     readonly Grid surface;
-    readonly Border card;
-    readonly Border image = new Border { CornerRadius = new CornerRadius(36), IsHitTestVisible = false };
+    // The parent composition clip supplies the single antialiased outer contour.
+    readonly Border image = new Border { IsHitTestVisible = false };
     readonly ImageBrush sourceBrush = new ImageBrush { Stretch = Stretch.Fill };
     readonly MatrixTransform samplingTransform = new MatrixTransform();
     readonly DispatcherQueueTimer timer;
+    readonly DispatcherQueue dispatcher;
     WriteableBitmap? bitmap, atlasBitmap;
     Stream? bitmapStream, atlasStream;
     bool visualDrag, followMovingHost, preparingWindowMove, retainedVisualBounds;
@@ -33,6 +34,20 @@ internal sealed class DesktopGlassSource : IDisposable
     IntPtr renderWindowHandle;
     byte[]? spareScenePixels, sceneScratchPixels;
     internal Action? BeforeRender;
+    internal Func<bool>? NeedsAnimation;
+    bool rendering;
+    internal void WakeRendering()
+    {
+        if (rendering || paused || disposed || !IsActive) return;
+        CompositionTarget.Rendering += OnRendering;
+        rendering = true;
+    }
+    void RestRendering()
+    {
+        if (!rendering) return;
+        CompositionTarget.Rendering -= OnRendering;
+        rendering = false;
+    }
     bool disposed, frozen, inFlight, paused, layoutProbeInFlight;
     WindowBackdropCapture.Frame? atlas;
     int atlasX, atlasY, atlasVersion, displayedVersion, displayedX = int.MinValue, displayedY;
@@ -158,22 +173,26 @@ internal sealed class DesktopGlassSource : IDisposable
 
     internal void Pause()
     {
+        if (paused) return;
         paused = true;
         timer.Stop();
+        RestRendering();
+        CompositorWindowCapture.ReleaseAll();
     }
 
     internal void Resume()
     {
-        if (disposed || frozen || !IsActive) return;
+        if (disposed || frozen || !IsActive || !paused) return;
         paused = false;
+        WakeRendering();
         timer.Start();
+        RequestFrame();
     }
 
     internal DesktopGlassSource(Window window, Grid surface, Border card)
     {
         handle = WinRT.Interop.WindowNative.GetWindowHandle(window);
         this.surface = surface;
-        this.card = card;
         // The opt-in experiment excludes the widget from screen capture. Normal runs remain visible.
         if (ScreenCaptureExperiment.Enabled)
         {
@@ -184,7 +203,8 @@ internal sealed class DesktopGlassSource : IDisposable
                 MessageBoxW(handle, "当前系统无法启用无黄边采样，玻璃背景暂时不可用。请联系开发者检查。", "有盼", 0x30);
         }
         else SetWindowDisplayAffinity(handle, 0);
-        timer = window.DispatcherQueue.CreateTimer();
+        dispatcher = window.DispatcherQueue;
+        timer = dispatcher.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(CaptureInterval);
         timer.Tick += (_, __) => RequestFrame();
         card.Loaded += (_, __) => Start();
@@ -199,8 +219,9 @@ internal sealed class DesktopGlassSource : IDisposable
         surface.Children.Insert(0, image);
         IsActive = true;
         lastPublishAt = MotionClock;
-        CompositionTarget.Rendering += OnRendering;
+        WakeRendering();
         StartWindowEvents();
+        CompositorWindowCapture.ContentChanged += OnContentChanged;
         RequestFrame();
         timer.Start();
     }
@@ -218,6 +239,14 @@ internal sealed class DesktopGlassSource : IDisposable
                 lastRenderingTick = GlassProfile.Timestamp();
             }
             BeforeRender?.Invoke();
+            if (!visualDrag && !preparingWindowMove && !followMovingHost &&
+                MotionClock >= backgroundMotionUntil && NeedsAnimation?.Invoke() != true)
+            {
+                if (!frozen)
+                    timer.Interval = TimeSpan.FromMilliseconds(atlas?.LiveUpdates == true ? 500 : CaptureInterval);
+                RestRendering();
+                return;
+            }
             // Throttle through Capture; requesting a frame every render (144 Hz)
             // was the main source of fast-drag stutter.
             if (followMovingHost) Capture();
@@ -293,6 +322,7 @@ internal sealed class DesktopGlassSource : IDisposable
         // render tick; a moving window is already one frame late when it lands.
         backgroundMotionUntil = MotionClock + 180;
         backgroundLayoutUntil = backgroundMotionUntil;
+        WakeRendering();
         KickBackgroundFrame();
     }
 
@@ -300,11 +330,28 @@ internal sealed class DesktopGlassSource : IDisposable
     {
         if (disposed || frozen || paused || !IsActive) return;
         if (Interlocked.Exchange(ref backgroundFrameKick, 1) != 0) return;
-        surface.DispatcherQueue.TryEnqueue(() =>
+        dispatcher.TryEnqueue(DispatcherQueuePriority.High, () =>
         {
             Volatile.Write(ref backgroundFrameKick, 0);
             try { RequestFrame(); } catch (Exception ex) { NoteFailure("kick", ex); }
         });
+    }
+
+    int contentNotificationQueued;
+    void OnContentChanged()
+    {
+        // The capture worker only signals. Read UI state on its owning dispatcher.
+        if (Interlocked.Exchange(ref contentNotificationQueued, 1) != 0) return;
+        if (!dispatcher.TryEnqueue(DispatcherQueuePriority.High, () =>
+        {
+            Volatile.Write(ref contentNotificationQueued, 0);
+            if (disposed || paused || frozen || !IsActive || visualDrag || preparingWindowMove) return;
+            long revision = CompositorWindowCapture.Revision;
+            if (revision == contentRevision) return;
+            contentRevision = revision;
+            backgroundMotionUntil = MotionClock + 180;
+            RequestFrame();
+        })) Volatile.Write(ref contentNotificationQueued, 0);
     }
 
     async void UpdateBackgroundMotion()
@@ -312,6 +359,15 @@ internal sealed class DesktopGlassSource : IDisposable
         if (disposed || frozen || paused || !IsActive || visualDrag || preparingWindowMove ||
             !IsWindowVisible(handle) || IsIconic(handle)) return;
         long now = MotionClock;
+        // Content and HWND events wake capture directly. Between events the timer
+        // also captures the current layout, so a separate idle probe is redundant.
+        if (now >= backgroundMotionUntil && atlas != null && !atlas.PendingRegion &&
+            Volatile.Read(ref windowMotionDirty) == 0 && CompositorWindowCapture.Revision == contentRevision)
+        {
+            int idle = atlas.LiveUpdates ? 500 : CaptureInterval;
+            if ((int)timer.Interval.TotalMilliseconds != idle) timer.Interval = TimeSpan.FromMilliseconds(idle);
+            return;
+        }
         if (now - lastRefreshProbe > 2000)
         {
             lastRefreshProbe = now;
@@ -366,6 +422,7 @@ internal sealed class DesktopGlassSource : IDisposable
 
     internal void BeginVisualDrag(int x, int y, int width, int height, bool renderImmediately = true)
     {
+        WakeRendering();
         visualDrag = true; retainedVisualBounds = false;
         dragSpeed = 0; dragSampleAt = 0;
         // A drag must not reuse the pre-drag scene stamps: the window under the
@@ -384,6 +441,7 @@ internal sealed class DesktopGlassSource : IDisposable
 
     internal void PrepareWindowMove()
     {
+        WakeRendering();
         preparingWindowMove = true;
         Capture();
     }
@@ -537,7 +595,7 @@ internal sealed class DesktopGlassSource : IDisposable
         // Reading a smaller margin while the cursor is fast cuts capture cost;
         // the atlas still covers the next frame's displacement.
         int movingMargin = FastDrag ? FastMovingCaptureMargin : MovingCaptureMargin;
-        int margin = followMovingHost || preparingWindowMove ? movingMargin : visualDrag ? CaptureMargin : 16;
+        int margin = followMovingHost || preparingWindowMove ? movingMargin : visualDrag ? CaptureMargin : 0;
         // Preserve look-ahead along motion without reading a full margin on the idle axis.
         int marginX = followMovingHost && motionDirectionX == 0 ? movingMargin / 2 : margin;
         int marginY = followMovingHost && motionDirectionY == 0 ? movingMargin / 2 : margin;
@@ -630,12 +688,8 @@ internal sealed class DesktopGlassSource : IDisposable
                 var scratch = scratchBuffer?.Length != byteCount ? new byte[byteCount] : scratchBuffer;
                 // A look-ahead crop can change while the displayed card is still covered by the
                 // previous complete texture. Hold it during GPU warm-up instead of flashing lower layers.
-                bool preservePendingScene = previous != null &&
-                    ((movingScene && WindowBackdropCapture.CanHoldFrameDuringDrag(previous,
-                        cardX, cardY, cardWidth, cardHeight)) ||
-                    WindowBackdropCapture.CanReuseFrame(previous, handle, left, top, right - left, bottom - top));
                 var fresh = WindowBackdropCapture.CaptureAt(handle, left, top, right - left, bottom - top,
-                    outputBuffer, scratch, preservePendingScene, avoidBlockingSources,
+                    outputBuffer, scratch, preservePendingScene: true, avoidBlockingSources: avoidBlockingSources,
                     allowPendingFill: pendingSince != 0 && MotionClock - pendingSince >= PendingFillAfterMilliseconds);
                 double composeMs = GlassProfile.Ms(composeStarted);
                 long metricsStarted = GlassProfile.Timestamp();
@@ -679,11 +733,12 @@ internal sealed class DesktopGlassSource : IDisposable
             // Geometry can move within a valid atlas while the worker runs. Match text tone
             // to the live crop too, rather than applying luminance from the old position.
             long liveMetricsStarted = movedDuringCapture ? GlassProfile.Timestamp() : 0;
-            var currentAnalysis = movedDuringCapture
+            var currentAnalysis = movedDuringCapture && captured.Frame.Success && !FastDrag &&
+                MotionClock - lastMetricsAt >= MetricsRefreshMilliseconds
                 ? ComputeMetrics(captured.Frame.PixelsBGRA, captured.Frame.Width, captured.Frame.Height,
                     captured.Frame.ScreenX, captured.Frame.ScreenY, latestX, latestY, latestWidth, latestHeight,
                     Volatile.Read(ref analysisRegions))
-                : captured.Analysis;
+                : movedDuringCapture ? null : captured.Analysis;
             if (movedDuringCapture && GlassProfile.Enabled)
             {
                 double liveMetricsMs = GlassProfile.Ms(liveMetricsStarted);
@@ -780,6 +835,11 @@ internal sealed class DesktopGlassSource : IDisposable
             }
             else hasCapturedSceneStamp = false;
             CapturedWindows = frame.CapturedWindows;
+            if (!rendering && !followMovingHost && !visualDrag && !preparingWindowMove)
+            {
+                var interval = TimeSpan.FromMilliseconds(frame.LiveUpdates ? 500 : CaptureInterval);
+                if (timer.Interval != interval) timer.Interval = interval;
+            }
             LastError = null;
             // The UI continuation can publish before the next render tick; do not hold a ready frame.
             if (!captured.Unchanged) RenderLatest();
@@ -797,7 +857,7 @@ internal sealed class DesktopGlassSource : IDisposable
                 if (retryLatestBounds && !disposed && !frozen && !paused && IsActive)
                     surface.DispatcherQueue.TryEnqueue(RequestFrame);
                 else if (Volatile.Read(ref backgroundFrameWanted) != 0 && !followMovingHost && !visualDrag &&
-                    MotionClock < backgroundMotionUntil && MotionClock - lastPassStart >= BackgroundMotionInterval &&
+                    MotionClock < backgroundMotionUntil &&
                     !disposed && !frozen && !paused && IsActive)
                     RequestFrame();
             }
@@ -806,8 +866,6 @@ internal sealed class DesktopGlassSource : IDisposable
 
     internal void SynchronizeGeometry()
     {
-        var radius = card.CornerRadius;
-        if (!image.CornerRadius.Equals(radius)) image.CornerRadius = radius;
         if (!image.Width.Equals(surface.Width)) image.Width = surface.Width;
         if (!image.Height.Equals(surface.Height)) image.Height = surface.Height;
     }
@@ -880,8 +938,11 @@ internal sealed class DesktopGlassSource : IDisposable
             int sourceOffset = (offsetY * atlas.Width + offsetX) * 4;
             var stream = bitmapStream;
             stream.Position = 0;
-            for (int row = 0; row < h; row++)
-                stream.Write(atlas.PixelsBGRA, sourceOffset + row * sourceStride, w * 4);
+            if (w == atlas.Width)
+                stream.Write(atlas.PixelsBGRA, sourceOffset, sourceStride * h);
+            else
+                for (int row = 0; row < h; row++)
+                    stream.Write(atlas.PixelsBGRA, sourceOffset + row * sourceStride, w * 4);
             bitmap.Invalidate();
             uploadMs = GlassProfile.Ms(uploadStarted);
             sourceBrush.Transform = null;
@@ -1016,6 +1077,7 @@ internal sealed class DesktopGlassSource : IDisposable
         IsActive = false;
         timer.Stop();
         CompositionTarget.Rendering -= OnRendering;
+        CompositorWindowCapture.ContentChanged -= OnContentChanged;
         for (int i = 0; i < windowEventHooks.Length; i++)
         {
             if (windowEventHooks[i] != IntPtr.Zero) UnhookWinEvent(windowEventHooks[i]);

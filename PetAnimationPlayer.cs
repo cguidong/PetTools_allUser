@@ -129,6 +129,7 @@ internal sealed class PetAnimationPlayer : IDisposable
         GlassProfile.Event("pet-animation-fade-start");
     }
 
+    internal bool RestorePosterAfterHover { get; set; }
     internal bool IsPlaying => playing;
 
     internal TimeSpan Duration => TimeSpan.FromSeconds((double)count / fps);
@@ -225,6 +226,7 @@ internal sealed class PetAnimationPlayer : IDisposable
             if (frame != count - 1) ShowFrame(count - 1);
             bool hover = hoverPlayback;
             Stop();
+            if (hover && RestorePosterAfterHover) ShowFrame(0);
             if (hover) armed = outside;
             GlassProfile.Event(hover ? "pet-animation-end" : "pet-reminder-animation-end");
         }

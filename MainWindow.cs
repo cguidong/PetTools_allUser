@@ -453,6 +453,9 @@ public sealed class MainWindow : Window
         surface.Loaded += (_, __) => EnsureRenderEraseMonitor();
         desktopSource = new DesktopGlassSource(this, surface, backdropCard);
         desktopSource.FrameUpdated = UpdateAppearance;
+        glass.InteractionChanged = desktopSource.WakeRendering;
+        desktopSource.NeedsAnimation = () => glass.IsAnimating || textAppearanceClock.IsRunning ||
+            statsAppearanceClock.IsRunning || glassAppearanceClock.IsRunning;
         desktopSource.MetricsUpdated = UpdateAppearance;
         desktopSource.BeforeRender = () => { UpdateDragFrame(); UpdateScalePreviewBounds(rendering: true); UpdateStatsTransition(); UpdateTextTransition(); UpdateGlassTransition(); };
         surface.Loaded += (_, __) => UpdateRenderViewport();
@@ -1472,12 +1475,13 @@ public sealed class MainWindow : Window
     {
         try
         {
-            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", petId == "polar-bear" ? "polar-bear-idle.frames.br" : petId == "panda" ? "panda-doze.frames.br" : "cow-cat-wash.frames.br")).ConfigureAwait(false);
+            var animation = await PetAnimationPlayer.LoadAsync(pet, Path.Combine(AppContext.BaseDirectory, "assets", petId == "polar-bear" ? "polar-bear-idle.frames.br" : petId == "panda" ? "panda-doze.frames.br" : "tabby-office.frames.br")).ConfigureAwait(false);
             if (!DispatcherQueue.TryEnqueue(() =>
             {
                 if (exiting || disposed || revision != petAnimationRevision || settings.PetId != petId)
                 { animation.Dispose(); return; }
                 petAnimation = animation;
+                animation.RestorePosterAfterHover = petId == "cow-cat";
                 if (!reminderPetActive && !napActive) { animation.ShowPoster(); UpdatePetHoverMonitor(); }
                 else if (!napActive && (petId == "panda" || petId == "cow-cat") && DateTime.Now < reminderUntil) animation.PlayOnce();
                 if (petId == "polar-bear" && elapsed.ElapsedMilliseconds - coinPetRequestedAt < PetAnimationPlayer.TriggerQuietMilliseconds) PlayPolarCoinAction();
@@ -1733,7 +1737,6 @@ public sealed class MainWindow : Window
         ApplyTypography();
         card.HorizontalAlignment = HorizontalAlignment.Left; card.VerticalAlignment = VerticalAlignment.Top;
         contentScale.ScaleX = contentScale.ScaleY = scale;
-        backdropCard.CornerRadius = new CornerRadius(36 * scale);
         glass.Brush.BlurAmount = 0;
         surface.HorizontalAlignment = HorizontalAlignment.Left; surface.VerticalAlignment = VerticalAlignment.Top;
         pixelScale = GetDpiForWindow(hwnd) / 96.0 * scale;
@@ -2890,6 +2893,7 @@ public sealed class MainWindow : Window
         var theme = glassTarget > .5 ? ElementTheme.Dark : ElementTheme.Light;
         if (surface.RequestedTheme != theme) surface.RequestedTheme = theme;
         if (hostSurface.RequestedTheme != theme) hostSurface.RequestedTheme = theme;
+        if (desktopSource.NeedsAnimation?.Invoke() == true) desktopSource.WakeRendering();
         GlassProfile.Appearance(GlassProfile.Ms(appearanceStarted), layoutMs, 0, 0,
             textTarget, glassTarget, statsDark, settings.AutomaticAppearance);
     }
@@ -4805,6 +4809,8 @@ public sealed class MainWindow : Window
         HideHoverEffect();
         hoverDragTimer?.Stop();
         native.Hide();
+        desktopSource.Pause();
+        timer.Interval = TimeSpan.FromSeconds(1);
     }
 
     void BuildHoverEffect()
@@ -5378,6 +5384,8 @@ public sealed class MainWindow : Window
         if (exiting || disposed) return;
         Diag("show");
         native.Show();
+        desktopSource.Resume();
+        timer.Interval = TimeSpan.FromMilliseconds(100);
         ApplyMouseClickThrough();
         UpdateHoverDragMonitor();
         Activate();

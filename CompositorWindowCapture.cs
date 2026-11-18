@@ -70,6 +70,7 @@ internal static class CompositorWindowCapture
     static string? lastError;
     static long revision;
     internal static long Revision => Interlocked.Read(ref revision);
+    internal static event Action? ContentChanged;
     internal static string? LastError => Volatile.Read(ref lastError);
 
     // First use starts capture on a worker and returns immediately, without waiting for a frame.
@@ -510,6 +511,7 @@ internal static class CompositorWindowCapture
                                         {
                                             if (cropped) contentActiveUntil = Environment.TickCount64 + 350;
                                             Interlocked.Increment(ref revision);
+                                            ContentChanged?.Invoke();
                                         }
                                         break;
                                     }

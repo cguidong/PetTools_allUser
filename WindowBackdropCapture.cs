@@ -27,6 +27,7 @@ internal static class WindowBackdropCapture
         internal int CapturedWindows { get; init; }
         internal string? Error { get; init; }
         internal bool PendingRegion { get; init; }
+        internal bool LiveUpdates { get; init; }
         internal int ScreenX { get; init; }
         internal int ScreenY { get; init; }
         internal ulong LayoutStamp { get; init; }
@@ -361,23 +362,29 @@ internal static class WindowBackdropCapture
 
     // Geometry-only probe: no PrintWindow, graphics device creation or pixel readback.
     internal static ulong GetLayoutStamp(IntPtr excludedHandle, int x, int y, int width, int height)
+        => GetLayoutStamp(excludedHandle, x, y, width, height, out _);
+
+    static ulong GetLayoutStamp(IntPtr excludedHandle, int x, int y, int width, int height, out ulong order)
     {
         ulong stamp = 14695981039346656037UL;
+        ulong stack = stamp;
         bool passedSelf = false;
         var target = new Rect(x, y, x + width, y + height);
         void Mix(long value) { unchecked { stamp = (stamp ^ (ulong)value) * 1099511628211UL; } }
         EnumWindows((window, _) =>
         {
             if (!passedSelf) { if (window == excludedHandle) passedSelf = true; return true; }
-            if (IsDesktopWindow(window) || !IsWindowVisible(window) || IsIconic(window)) return true;
+            if (!IsWindowVisible(window) || IsIconic(window)) return true;
             // Reject off-target windows with the cheap screen rect before asking DWM;
             // the extended-frame query is a synchronous cross-process call.
             if (!GetWindowRect(window, out Rect native) || !Intersect(target, native, out Rect _)) return true;
-            if (IsCloaked(window) || !GetWindowVisualBounds(window, out Rect bounds) || !Intersect(target, bounds, out Rect overlap)) return true;
+            if (IsDesktopWindow(window) || IsCloaked(window) || !GetWindowVisualBounds(window, out Rect bounds) || !Intersect(target, bounds, out Rect overlap)) return true;
             Mix(window.ToInt64());
+            unchecked { stack = (stack ^ (ulong)window.ToInt64()) * 1099511628211UL; }
             Mix(bounds.Left); Mix(bounds.Top); Mix(bounds.Right); Mix(bounds.Bottom);
             return true;
         }, IntPtr.Zero);
+        order = stack;
         return stamp;
     }
 
@@ -435,9 +442,10 @@ internal static class WindowBackdropCapture
                     LayoutStamp = GetLayoutStamp(excludedHandle, targetX, targetY, width, height) };
             }
             var target = new Rect(targetX, targetY, checked(targetX + width), checked(targetY + height));
-            ulong sceneLayout = GetLayoutStamp(excludedHandle, targetX, targetY, width, height);
+            ulong sceneLayout = GetLayoutStamp(excludedHandle, targetX, targetY, width, height, out ulong sceneOrder);
             var uncovered = new List<Rect> { target };
             var sourceWindows = new List<IntPtr>();
+            int liveSources = 0;
             int outputLength = checked(width * height * 4);
             var output = reusableOutput?.Length == outputLength ? reusableOutput : new byte[outputLength];
             if (ReferenceEquals(output, reusableOutput)) Array.Clear(output);
@@ -468,11 +476,10 @@ internal static class WindowBackdropCapture
                 // Other app windows, including settings, are valid backgrounds.
                 // Only the widget itself starts the below-widget Z-order range.
                 if (window == excludedHandle) return true;
-                if (IsDesktopWindow(window)) return true;
-                if (!IsWindowAvailable(window)) return true;
                 // Cheap native rect rejects most windows; only on-target ones pay
                 // the DWM extended-frame round trip.
                 if (!GetWindowRect(window, out Rect nativeHit) || !Intersect(target, nativeHit, out Rect _)) return true;
+                if (!IsWindowAvailable(window) || IsDesktopWindow(window)) return true;
                 if (!GetWindowVisualBounds(window, out Rect bounds)) return true;
 
                 // Check if bounds intersects any piece in uncovered
@@ -509,14 +516,23 @@ internal static class WindowBackdropCapture
                     var fullBounds = frameBounds;
                     frameBounds = new Rect(frameBounds.Left + frame.PixelLeft, frameBounds.Top + frame.PixelTop,
                         frameBounds.Left + frame.PixelLeft + frame.PixelWidth, frameBounds.Top + frame.PixelTop + frame.PixelHeight);
-                    if (Intersect(target, fullBounds, out Rect needed) &&
-                        (needed.Left < frameBounds.Left || needed.Top < frameBounds.Top ||
-                        needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom))
+                    if (Intersect(target, fullBounds, out Rect needed))
                     {
-                        CompositorWindowCapture.RequestRefresh(window);
-                        MarkPending("crop", window);
-                        if (allowPendingFill) return true;
-                        return !preservePendingScene;
+                        // Recrop before the 96px read-ahead is exhausted, while this frame
+                        // can still be displayed. Ignore edges already at the window limit.
+                        const int lookAhead = 48;
+                        if (needed.Left - lookAhead < frameBounds.Left && fullBounds.Left < frameBounds.Left ||
+                            needed.Top - lookAhead < frameBounds.Top && fullBounds.Top < frameBounds.Top ||
+                            needed.Right + lookAhead > frameBounds.Right && fullBounds.Right > frameBounds.Right ||
+                            needed.Bottom + lookAhead > frameBounds.Bottom && fullBounds.Bottom > frameBounds.Bottom)
+                            CompositorWindowCapture.RequestRefresh(window);
+                        if (needed.Left < frameBounds.Left || needed.Top < frameBounds.Top ||
+                            needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom)
+                        {
+                            MarkPending("crop", window);
+                            if (allowPendingFill) return true;
+                            return !preservePendingScene;
+                        }
                     }
                     if (!GetWindowRect(window, out Rect nativeBounds)) return true;
                     var compositorCoverage = new List<Rect>();
@@ -524,14 +540,32 @@ internal static class WindowBackdropCapture
                     // Transparent sources retain their antialiasing guard and alpha.
                     AddScreenCoverage(ReadWindowCoverage(window, nativeBounds.Right - nativeBounds.Left,
                         nativeBounds.Bottom - nativeBounds.Top, !requiresAlpha), nativeBounds, compositorCoverage);
+                    var opaqueHits = !requiresAlpha ? new List<Rect>() : null;
                     foreach (Rect remaining in uncovered)
                         foreach (Rect visible in compositorCoverage)
                             if (Intersect(remaining, visible, out Rect hit) && Intersect(hit, frameBounds, out Rect clipped))
-                                CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
-                    hasTransparency = true;
+                            {
+                                if (requiresAlpha)
+                                    CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
+                                else if (hasTransparency)
+                                    CompositeOpaque(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
+                                else
+                                    for (int row = clipped.Top; row < clipped.Bottom; row++)
+                                        Buffer.BlockCopy(frame.PixelsBGRA, ((row - frameBounds.Top) * frame.PixelWidth + clipped.Left - frameBounds.Left) * 4,
+                                            output, ((row - target.Top) * width + clipped.Left - target.Left) * 4, (clipped.Right - clipped.Left) * 4);
+                                opaqueHits?.Add(clipped);
+                            }
+                    hasTransparency |= requiresAlpha;
+                    liveSources++;
                     sourceWindows.Add(window);
                     captured++;
-                    uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
+                    if (opaqueHits == null) uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
+                    else foreach (Rect covered in opaqueHits)
+                    {
+                        var remaining = new List<Rect>();
+                        foreach (Rect piece in uncovered) Subtract(piece, covered, remaining);
+                        uncovered = remaining;
+                    }
                     return uncovered.Count > 0;
                 }
                 // Keep a still-valid scene during GPU warm-up; otherwise fill from lower layers. PrintWindow
@@ -745,6 +779,11 @@ internal static class WindowBackdropCapture
 
             for (int index = 3; index < output.Length; index += 4) output[index] = 255;
 
+            // Reject a composite assembled across a source move or Z-order change.
+            ulong latestLayout = GetLayoutStamp(excludedHandle, targetX, targetY, width, height, out ulong latestOrder);
+            if (sceneOrder != latestOrder || (!avoidBlockingSources && sceneLayout != latestLayout))
+                return new Frame { Error = "背景窗口位置已变化。", PendingRegion = true };
+
             // Card and text-region analysis is performed by DesktopGlassSource on the capture worker.
             return new Frame
             {
@@ -752,6 +791,7 @@ internal static class WindowBackdropCapture
                 Height = height,
                 PixelsBGRA = output,
                 CapturedWindows = captured,
+                LiveUpdates = !pendingRegion && captured > 0 && captured == liveSources,
                 SourceWindows = sourceWindows.ToArray(),
                 ScreenX = targetX, ScreenY = targetY, LayoutStamp = sceneLayout,
                 PendingRegion = pendingRegion
@@ -775,6 +815,17 @@ internal static class WindowBackdropCapture
         if (GetWindowVisualBounds(window, out bounds) && bounds.Right - bounds.Left == width && bounds.Bottom - bounds.Top == height)
             return true;
         return GetWindowRect(window, out bounds) && bounds.Right - bounds.Left == width && bounds.Bottom - bounds.Top == height;
+    }
+
+    private static void CompositeOpaque(byte[] output, int outputWidth, Rect target, byte[] source, int sourceWidth, Rect sourceBounds, Rect hit)
+    {
+        for (int y = hit.Top; y < hit.Bottom; y++)
+        for (int x = hit.Left; x < hit.Right; x++)
+        {
+            int from = ((y - sourceBounds.Top) * sourceWidth + x - sourceBounds.Left) * 4;
+            int to = ((y - target.Top) * outputWidth + x - target.Left) * 4;
+            WriteOpaque(output, to, source[from], source[from + 1], source[from + 2], true);
+        }
     }
 
     private static void CompositeTransparent(byte[] output, int outputWidth, Rect target, byte[] source, int sourceWidth, Rect sourceBounds, Rect hit)

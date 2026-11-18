@@ -5458,7 +5458,7 @@ namespace OffWorkWidget.WinUI
         }
 
         static BitmapImage PetImage(string id) => new BitmapImage(new Uri("ms-appx:///assets/" + (id == "polar-bear" ? "polar-bear-idle" : id) + ".png"));
-        static string PetName(string id) => id switch { "panda" => "熊猫", "polar-bear" => "北极熊", _ => "奶牛猫" };
+        static string PetName(string id) => id switch { "panda" => "熊猫", "polar-bear" => "北极熊", _ => "狸花猫" };
 
         [StructLayout(LayoutKind.Sequential)] struct ClientRect { internal int Left, Top, Right, Bottom; }
         [StructLayout(LayoutKind.Sequential)] struct ScreenPoint { public int X, Y; }

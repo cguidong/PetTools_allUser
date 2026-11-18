@@ -86,7 +86,7 @@ namespace OffWorkWidget
         public decimal WishSaved = 0;
         public bool HideAmount = true;
         public bool ShowSalaryLayout = false;
-        public bool ShowCoinJar = true;
+        public bool ShowCoinJar = false;
         public double CoinJarX = -1;
         public double CoinJarY = -1;
         public int AmountVisibleSeconds = 0;

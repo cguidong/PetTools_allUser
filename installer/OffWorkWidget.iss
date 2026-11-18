@@ -5,7 +5,7 @@
   #error OutputDir is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0.107"
+  #define AppVersion "1.1.0"
 #endif
 #ifndef MinWindowsVersion
   #define MinWindowsVersion "10.0.19041"
@@ -65,7 +65,7 @@ FinishedLabel=有盼已准备就绪。%n愿每一天，都有值得期待的下�
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："
 [Files]
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "*.pdb,prerequisites\*,createdump.exe,mscordaccore.dll,mscordaccore_amd64_*.dll,Microsoft.DiaSymReader.Native.amd64.dll,RestartAgent.exe,Microsoft.Windows.Widgets.dll,Microsoft.Windows.Widgets.Projection.dll,Microsoft.Windows.Widgets.winmd"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "assets\cow-cat-walk.png,assets\cow-cat-wash.frames.br,*.pdb,prerequisites\*,createdump.exe,mscordaccore.dll,mscordaccore_amd64_*.dll,Microsoft.DiaSymReader.Native.amd64.dll,RestartAgent.exe,Microsoft.Windows.Widgets.dll,Microsoft.Windows.Widgets.Projection.dll,Microsoft.Windows.Widgets.winmd"; Flags: ignoreversion recursesubdirs createallsubdirs
 #include "ObsoleteRuntimeFiles.iss"
 [InstallDelete]
 Type: files; Name: "{autodesktop}\下班倒计时.lnk"

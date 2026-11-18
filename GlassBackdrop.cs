@@ -17,6 +17,8 @@ internal sealed class GlassBackdrop : IDisposable
     private double glareFactor = 4, glareTargetFactor = 4;
     private double opticalScale = -1;
     internal LiquidGlassBrush Brush { get; }
+    internal bool IsAnimating => glareAngle != glareTargetAngle || glareFactor != glareTargetFactor;
+    internal Action? InteractionChanged;
     internal bool IsSupported => true;
     internal string? LastError => LiquidGlassBrush.LastError;
 
@@ -59,6 +61,7 @@ internal sealed class GlassBackdrop : IDisposable
     {
         glareTargetAngle = active ? -55 + Math.Clamp(x, -1, 1) * 10 - Math.Clamp(y, -1, 1) * 5 : -55;
         glareTargetFactor = active ? 5 : 4;
+        if (IsAnimating) InteractionChanged?.Invoke();
     }
 
     internal void UpdateInteraction(bool animationsEnabled)
