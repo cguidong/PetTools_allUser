@@ -18,6 +18,21 @@ using Windows.Graphics;
 
 namespace OffWorkWidget.WinUI
 {
+    sealed class ShopEffectOption
+    {
+        public int Id { get; }
+        public string Name { get; }
+        public ImageSource Thumbnail { get; }
+
+        public ShopEffectOption(int id, string name, string asset)
+        {
+            Id = id;
+            Name = name;
+            var uri = new Uri("ms-appx:///assets/shop-effects/" + asset);
+            Thumbnail = asset.EndsWith(".svg", StringComparison.Ordinal) ? new SvgImageSource(uri) : new BitmapImage(uri);
+        }
+    }
+
     public sealed class SettingsWindow : Window
     {
         readonly OffWorkWidget.Settings current;
@@ -27,6 +42,7 @@ namespace OffWorkWidget.WinUI
         readonly Action<OffWorkWidget.Settings> saveSettings;
         readonly Action<double>? previewScale;
 
+        internal const float SelectedIconScale = 1.32f;
         const double WindowCornerRadius = 36;
         readonly Grid windowSurface = new Grid();
         readonly Grid windowContent = new Grid();
@@ -63,7 +79,7 @@ namespace OffWorkWidget.WinUI
         TextBlock adjustmentSummary = null!;
         Microsoft.UI.Dispatching.DispatcherQueueTimer? scrollRailTimer;
 
-        bool windowClosed, petCommitted;
+        bool windowClosed;
         bool raisedForActivation;
         TimeSpan startTime, endTime;
         TimeSpan lunchStart, lunchEnd;
@@ -121,7 +137,7 @@ namespace OffWorkWidget.WinUI
         static string WishKey(OffWorkWidget.WishEntry wish) =>
             wish.Name + "|" + wish.Target.ToString(CultureInfo.InvariantCulture);
         int waterMinutes, walkMinutes;
-        ComboBox reminderDisplay = null!;
+        bool reminderPopup;
         string reminderPosition = "center";
         int reminderX, reminderY;
         Window? positionPreview;
@@ -180,8 +196,6 @@ namespace OffWorkWidget.WinUI
         readonly AcrylicBrush headerBackgroundBrush = new AcrylicBrush { Opacity = 0 };
         readonly SolidColorBrush footerBackgroundBrush = new SolidColorBrush();
         readonly SolidColorBrush footerActionBrush = new SolidColorBrush();
-        readonly SolidColorBrush petWheelSurfaceBrush = new SolidColorBrush();
-        readonly RadialGradientBrush petWheelFade = new RadialGradientBrush();
         Border? footerBar;
         readonly LinearGradientBrush footerFade = new LinearGradientBrush();
         readonly LinearGradientBrush headerFade = new LinearGradientBrush();
@@ -212,7 +226,6 @@ namespace OffWorkWidget.WinUI
         bool salaryAuthorized, automatic, night, privacyPromptOpen;
         string? salaryDraft;
         string petId;
-        string initialPetId;
         string hoverEffect;
         decimal observedSalary;
         IntPtr hwnd;
@@ -236,8 +249,6 @@ namespace OffWorkWidget.WinUI
         readonly SolidColorBrush timePressedBrush = new SolidColorBrush();
         readonly SolidColorBrush dividerBrush = new SolidColorBrush();
         readonly SolidColorBrush accentBlue = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0, 122, 255));
-        readonly SolidColorBrush cancelGray = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 229, 229, 234));
-        readonly SolidColorBrush cancelDarkGray = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 58, 58, 60));
 
         public SettingsWindow(OffWorkWidget.Settings current, OffWorkWidget.PrivacyStore privacy,
             Action toggleSalaryLayout, Action hideSalary,
@@ -246,7 +257,7 @@ namespace OffWorkWidget.WinUI
             this.current = current; this.privacy = privacy; this.toggleSalaryLayout = toggleSalaryLayout;
             this.hideSalary = hideSalary; this.saveSettings = saveSettings; this.previewScale = previewScale;
             automatic = current.AutomaticAppearance;
-            night = current.NightMode; petId = current.PetId; initialPetId = petId; hoverEffect = OffWorkWidget.HoverEffects.Normalize(current.HoverEffect); observedSalary = current.Salary;
+            night = current.NightMode; petId = current.PetId; hoverEffect = OffWorkWidget.HoverEffects.Normalize(current.HoverEffect); observedSalary = current.Salary;
             alternatingWeekends = current.AlternatingWeekends;
             doubleRestWeekStart = DateTime.TryParseExact(current.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime anchor)
                 ? OffWorkWidget.Logic.WeekStart(anchor) : OffWorkWidget.Logic.WeekStart(DateTime.Today);
@@ -369,7 +380,6 @@ namespace OffWorkWidget.WinUI
             root.Loaded += (_, __) => themeReady = true;
             Closed += (_, __) =>
             {
-                RevertPetPreview();
                 positionPreview?.Close();
                 windowClosed = true; scrollRailTimer?.Stop();
                 pendingAppearanceMode = null;
@@ -381,6 +391,8 @@ namespace OffWorkWidget.WinUI
                 CompositionTarget.Rendering -= AnimatePopupOptionsReveal; animatingPopupOptions = false; popupOptionsClock.Stop();
                 CompositionTarget.Rendering -= AnimateAlternatingWeekReveal; animatingRestRow = false; restRowClock.Stop();
                 CompositionTarget.Rendering -= AnimateTitleSpring; titleSpringRunning = false;
+                CompositionTarget.Rendering -= AnimateFooterChrome; animatingFooterChrome = false; footerChromeClock.Stop();
+                CompositionTarget.Rendering -= AnimateWishDetails; animatingWishDetails = false; wishDetailsClock.Stop();
                 renderFrameMonitor?.Dispose(); frameMonitor.Dispose();
                 frostedBackground.SystemBackdrop = null; SystemBackdrop = null;
                 Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(windowContent).Clip = null;
@@ -388,15 +400,8 @@ namespace OffWorkWidget.WinUI
             };
         }
 
-        void RevertPetPreview()
-        {
-            if (petCommitted || petId == initialPetId) return;
-            petId = initialPetId;
-        }
-
         void CloseSettings()
         {
-            RevertPetPreview();
             // Hide the composed frame before Closed disconnects its backdrop and rounded clip.
             native.Hide();
             Close();
@@ -628,8 +633,6 @@ namespace OffWorkWidget.WinUI
             root.Background = pageBackgroundBrush;
             footerActionBrush.Color = dark ? Windows.UI.Color.FromArgb(255, 58, 58, 60) : Windows.UI.Color.FromArgb(255, 229, 229, 234);
             footerBackgroundBrush.Color = dark ? Windows.UI.Color.FromArgb(190, 28, 28, 30) : Windows.UI.Color.FromArgb(210, 242, 242, 247);
-            petWheelSurfaceBrush.Color = dark ? Windows.UI.Color.FromArgb(160, 35, 35, 38) : Windows.UI.Color.FromArgb(255, 255, 255, 255);
-            UpdatePetWheelFade();
             if (footerFade.GradientStops.Count == 2)
             {
                 var c = footerBackgroundBrush.Color;
@@ -768,34 +771,13 @@ namespace OffWorkWidget.WinUI
         }
 
 
-        static Brush MenuFrost(bool dark)
-        {
-            var brush = new LinearGradientBrush
-            {
-                StartPoint = new Windows.Foundation.Point(0, 0),
-                EndPoint = new Windows.Foundation.Point(0, 1)
-            };
-            brush.GradientStops.Add(new GradientStop
-            {
-                Offset = 0,
-                Color = dark ? Windows.UI.Color.FromArgb(255, 46, 46, 49) : Windows.UI.Color.FromArgb(255, 252, 252, 255)
-            });
-            brush.GradientStops.Add(new GradientStop
-            {
-                Offset = 1,
-                Color = dark ? Windows.UI.Color.FromArgb(255, 34, 34, 37) : Windows.UI.Color.FromArgb(255, 246, 248, 252)
-            });
-            return brush;
-        }
+        static Windows.UI.Color WheelSurfaceColor(bool dark) =>
+            dark ? Windows.UI.Color.FromArgb(255, 44, 44, 46) : Microsoft.UI.Colors.White;
 
-        void UpdatePetWheelFade()
-        {            if (petWheelFade.GradientStops.Count != 3) return;
-            var c = petWheelSurfaceBrush.Color;
-            var clear = Windows.UI.Color.FromArgb(0, c.R, c.G, c.B);
-            petWheelFade.GradientStops[0].Color = c;
-            petWheelFade.GradientStops[1].Color = c;
-            petWheelFade.GradientStops[2].Color = clear;
-        }
+        static SolidColorBrush WheelSelectionBrush(bool dark) => new SolidColorBrush(
+            dark ? Windows.UI.Color.FromArgb(255, 58, 58, 60) : Windows.UI.Color.FromArgb(255, 239, 240, 244));
+
+        static double WheelRowOpacity(double distance) => Math.Max(.2, 1 - distance * .3);
 
         Grid CreateScrollSurface()
         {
@@ -940,7 +922,6 @@ namespace OffWorkWidget.WinUI
             if (Array.IndexOf(ids, petId) < 0)
             {
                 petId = petId == "cat" || petId == "samoyed" || petId == "corgi" || petId == "red-panda" ? "cow-cat" : "polar-bear";
-                if (!petCommitted) initialPetId = petId;
             }
             int count = ids.Length, repeats = 7, visibleRows = 3;
             double rowHeight = 66, viewportHeight = rowHeight * visibleRows;
@@ -969,7 +950,7 @@ namespace OffWorkWidget.WinUI
             petStack.Children.Add(petThumb); petStack.Children.Add(petArrow);
             petBtn.Content = petStack;
 
-            const double petIconRestScale = 1, petIconSelectedScale = 1.32;
+            const double petIconRestScale = 1, petIconSelectedScale = SelectedIconScale;
             var petImages = new Dictionary<string, BitmapImage>();
             foreach (string id in ids) petImages[id] = PetImage(id);
 
@@ -1025,19 +1006,6 @@ namespace OffWorkWidget.WinUI
                 rowScales.Add(iconScale);
             }
             wheelRows.Children.Add(new Border { Height = padding });
-
-            // The hover-effect selector also uses this fade brush.
-            if (petWheelFade.GradientStops.Count == 0)
-            {
-                petWheelFade.Center = new Windows.Foundation.Point(.5, .5);
-                petWheelFade.GradientOrigin = new Windows.Foundation.Point(.5, .5);
-                petWheelFade.RadiusX = .46;
-                petWheelFade.RadiusY = .46;
-                petWheelFade.GradientStops.Add(new GradientStop { Offset = 0 });
-                petWheelFade.GradientStops.Add(new GradientStop { Offset = .5 });
-                petWheelFade.GradientStops.Add(new GradientStop { Offset = 1 });
-                UpdatePetWheelFade();
-            }
 
             bool initialized = false, wheelOpen = false;
             double? positioningOffset = null;
@@ -1098,7 +1066,7 @@ namespace OffWorkWidget.WinUI
                 for (int i = first; i <= last; i++)
                 {
                     double distance = Math.Abs(i - position);
-                    rowBorders[i].Opacity = Math.Max(0, 1 - distance * .42);
+                    rowBorders[i].Opacity = WheelRowOpacity(distance);
                     double proximity = Math.Max(0, 1 - distance);
                     double eased = proximity * proximity * (3 - 2 * proximity);
                     rowScales[i].ScaleX = rowScales[i].ScaleY =
@@ -1249,13 +1217,13 @@ namespace OffWorkWidget.WinUI
             var petMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left };
             var menuSurface = new Border
             {
-                CornerRadius = new CornerRadius(16), Padding = new Thickness(5),
+                CornerRadius = new CornerRadius(18), Padding = new Thickness(5),
                 Child = flyoutRoot
             };
             petMenu.Content = menuSurface;
             var menuStyle = new Style(typeof(FlyoutPresenter));
             menuStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
-            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(16)));
+            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(18)));
             menuStyle.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Microsoft.UI.Colors.Transparent)));
             menuStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
             petMenu.FlyoutPresenterStyle = menuStyle;
@@ -1272,14 +1240,8 @@ namespace OffWorkWidget.WinUI
                 petKeyboardOpen = petBtn.FocusState == FocusState.Keyboard;
                 panel.RequestedTheme = root.ActualTheme;
                 bool dark = root.ActualTheme == ElementTheme.Dark;
-                menuSurface.Background = MenuFrost(dark);
-                menuSurface.BorderThickness = new Thickness(1);
-                menuSurface.BorderBrush = new SolidColorBrush(dark
-                    ? Windows.UI.Color.FromArgb(30, 255, 255, 255)
-                    : Windows.UI.Color.FromArgb(90, 255, 255, 255));
-                selection.Background = new SolidColorBrush(root.ActualTheme == ElementTheme.Dark
-                    ? Windows.UI.Color.FromArgb(255, 58, 58, 60)
-                    : Windows.UI.Color.FromArgb(255, 239, 240, 244));
+                menuSurface.Background = new SolidColorBrush(WheelSurfaceColor(dark));
+                selection.Background = WheelSelectionBrush(dark);
             };
             petMenu.Closing += (_, __) =>
             {
@@ -1860,7 +1822,7 @@ namespace OffWorkWidget.WinUI
             int hour = isDuration ? amountDurationSeconds / 60 : initial.Hours;
             int minute = isDuration ? amountDurationSeconds % 60 : initial.Minutes;
             bool dark = root.ActualTheme == ElementTheme.Dark;
-            var background = dark ? Windows.UI.Color.FromArgb(255, 44, 44, 46) : Microsoft.UI.Colors.White;
+            var background = WheelSurfaceColor(dark);
             var foreground = dark ? Windows.UI.Color.FromArgb(255, 238, 238, 242) : Windows.UI.Color.FromArgb(255, 28, 28, 30);
             bool compact = applyMinutes != null || isDuration;
             double wheelRowHeight = compact ? 32 : 36;
@@ -1871,10 +1833,10 @@ namespace OffWorkWidget.WinUI
             int totalMinimum = applyMinutes != null ? 1 : 0;
             int totalMaximum = isDuration ? 86400 : applyMinutes != null ? 720 : 1439;
             bool usingInput = false, syncingInput = false;
-            bool editingFirst = false, editingSecond = false, editedInput = false;
+            bool editedInput = false;
             Action hideEditors = () => { };
             Action<TextBox> hideEditor = _ => { };
-            var selectedBackground = new SolidColorBrush(dark ? Windows.UI.Color.FromArgb(255, 58, 58, 60) : Windows.UI.Color.FromArgb(255, 239, 240, 244));
+            var selectedBackground = WheelSelectionBrush(dark);
             TextBox CreateSelectedInput(int value, int maximumLength, string name)
             {
                 var input = new TextBox
@@ -1949,7 +1911,6 @@ namespace OffWorkWidget.WinUI
             }
             void UseWheels()
             {
-                editingFirst = editingSecond = false;
                 usingInput = false; editedInput = false; hideEditors();
                 SyncInputFromWheels(); UpdateTimeSelection();
             }
@@ -2056,19 +2017,16 @@ namespace OffWorkWidget.WinUI
                         finally { cleaning = false; }
                     }
                     if (input.FocusState != FocusState.Unfocused) EditSelection();
-                    // Two hour digits complete the field; jump to minutes so typing
-                    // "0001" or "00:01" fills both halves without extra clicks.
-                    if (input == firstInput && digits.Length >= 2 && input.FocusState != FocusState.Unfocused &&
+                    // A full first field advances; duration minutes can have four digits.
+                    if (input == firstInput && digits.Length == input.MaxLength && input.FocusState != FocusState.Unfocused &&
                         secondInput.FocusState == FocusState.Unfocused)
                     {
-                        editingFirst = false; editingSecond = true;
                         secondInput.Focus(FocusState.Programmatic);
                         secondInput.SelectAll();
                     }
                 };
                 input.LostFocus += (sender, args) =>
                 {
-                    if (input == firstInput) editingFirst = false; else editingSecond = false;
                     hideEditor(input);
                     // Do not sync both fields here: auto-advancing focus to minutes
                     // would overwrite the field being typed into and swallow a key.
@@ -2133,7 +2091,6 @@ namespace OffWorkWidget.WinUI
                 input.GotFocus += (_, __) => ShowEditor(true);
                 input.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, __) =>
                 {
-                    if (input == firstInput) editingFirst = true; else editingSecond = true;
                     ShowEditor(true);
                     // Every click starts a replacement instead of inserting at the
                     // old caret position.
@@ -2144,7 +2101,6 @@ namespace OffWorkWidget.WinUI
                     if (input == firstInput && (int)args.Key == 186 /* ;/: */)
                     {
                         // The separator is a focus move, not editable text.
-                        editingFirst = false; editingSecond = true;
                         secondInput.Focus(FocusState.Programmatic);
                         secondInput.SelectAll();
                         args.Handled = true;
@@ -2154,7 +2110,6 @@ namespace OffWorkWidget.WinUI
                         (args.Key >= Windows.System.VirtualKey.NumberPad0 && args.Key <= Windows.System.VirtualKey.NumberPad9) ||
                         args.Key == Windows.System.VirtualKey.Back || args.Key == Windows.System.VirtualKey.Delete)
                     {
-                        if (input == firstInput) editingFirst = true; else editingSecond = true;
                         ShowEditor(true);
                     }
                 }), true);
@@ -2355,7 +2310,7 @@ namespace OffWorkWidget.WinUI
                 for (int i = first; i <= last; i++)
                 {
                     double distance = Math.Abs(i - position);
-                    labels[i].Opacity = Math.Max(.2, 1 - distance * .3);
+                    labels[i].Opacity = WheelRowOpacity(distance);
                     double proximity = Math.Max(0, 1 - distance);
                     double eased = proximity * proximity * (3 - 2 * proximity);
                     labelScales[i].ScaleX = labelScales[i].ScaleY =
@@ -2450,37 +2405,188 @@ namespace OffWorkWidget.WinUI
             Grid.SetColumn(showCoinJar, 1); coinJarRow.Children.Add(showCoinJar);
             details.Children.Add(coinJarRow);
             var balance = new TextBlock { FontSize = 12, Foreground = subInkBrush };
-            var notice = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, Text = "解锁后永久使用，选择立即生效。" };
-            var buttons = new List<Button>();
-            var effects = new[] { (Id: 0, Name: "默认"), (Id: 1, Name: "星星闪烁"), (Id: 2, Name: "暖光漂浮"), (Id: 3, Name: "雪花飘落"), (Id: 5, Name: "落叶飘飘") };
-            details.Children.Add(balance);
-            for (int i = 0; i < effects.Length; i++)
+            var activeLabel = new TextBlock { FontSize = 12, Foreground = subInkBrush, HorizontalAlignment = HorizontalAlignment.Right };
+            var notice = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap, Visibility = Visibility.Collapsed };
+            void SetNotice(string message)
             {
-                int effect = effects[i].Id;
-                string effectName = effects[i].Name;
-                var row = new Grid { MinHeight = 38 };
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                row.Children.Add(new TextBlock { Text = effectName, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center, FontSize = 13 });
-                var button = new Button { Height = 32, MinWidth = 96, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, HorizontalAlignment = HorizontalAlignment.Right, FontSize = 13 };
-                button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
-                button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
-                buttons.Add(button); Grid.SetColumn(button, 1); row.Children.Add(button); details.Children.Add(row);
-                button.Click += (_, __) =>
+                notice.Text = message;
+                notice.Visibility = message.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            }
+            ShopEffectOption[] effects =
+            {
+                new(0, "默认", "preview-none.svg"), new(1, "星星闪烁", "preview-star.svg"),
+                new(2, "暖光漂浮", "warm-gold.png"), new(3, "雪花飘落", "snow-crystal.png"),
+                new(5, "落叶飘飘", "maple-red.png"), new(7, "樱花飞舞", "sakura-pink.png"),
+                new(8, "萤火微光", "firefly-lime.png"), new(9, "极光流光", "aurora-wave.png"),
+                new(10, "细雨微澜", "rain-drop.png"), new(11, "流星掠过", "meteor-ice.png"),
+                new(12, "炉火余烬", "ember-hot.png"), new(13, "星轨连线", "preview-constellation.svg"),
+                new(14, "鎏金碎箔", "gold-flake.png"), new(15, "赛博数雨", "preview-matrix.svg"),
+                new(16, "游鱼水纹", "fish-koi-0.png")
+            };
+            var parameterPanel = new StackPanel { Spacing = 4 };
+            var parameterSection = CreateOptionsSection("实时参数微调", parameterPanel);
+            var parameterBody = new Border { Child = parameterSection, Padding = new Thickness(0, 0, 0, 6), VerticalAlignment = VerticalAlignment.Top };
+            var parameterHost = new Grid { Height = 0, Opacity = 0 };
+            parameterHost.Children.Add(parameterBody);
+            var parameterClip = new RectangleGeometry();
+            var revealClock = new Stopwatch();
+            bool? showParameters = null;
+            double revealHeight = 0, velocity = 0, fullHeight = 0;
+            void FinishParameterMotion()
+            {
+                CompositionTarget.Rendering -= MoveParameters;
+                revealClock.Reset();
+                velocity = 0;
+                bool visible = showParameters == true;
+                parameterHost.Height = visible ? double.NaN : 0;
+                parameterHost.Opacity = visible ? 1 : 0;
+                parameterBody.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+                parameterHost.Clip = null;
+            }
+            void MoveParameters(object? sender, object args)
+            {
+                double dt = revealClock.Elapsed.TotalSeconds;
+                revealClock.Restart();
+                double target = showParameters == true ? fullHeight : 0;
+                // Exact critically damped spring step, including velocity when the target reverses.
+                const double rate = 23;
+                double offset = revealHeight - target, slope = velocity + rate * offset;
+                double decay = Math.Exp(-rate * dt);
+                revealHeight = target + (offset + slope * dt) * decay;
+                velocity = (velocity - rate * slope * dt) * decay;
+                parameterHost.Height = Math.Max(0, revealHeight);
+                parameterHost.Opacity = Math.Clamp(revealHeight / Math.Max(1, fullHeight), 0, 1);
+                parameterClip.Rect = new Windows.Foundation.Rect(0, 0, parameterHost.ActualWidth, parameterHost.Height);
+                parameterHost.Clip = parameterClip;
+                if (!animationSettings.AnimationsEnabled || (Math.Abs(offset) < .15 && Math.Abs(velocity) < 3))
+                    FinishParameterMotion();
+            }
+            void ShowParameters(bool visible)
+            {
+                if (showParameters == visible) return;
+                bool animate = showParameters.HasValue && parameterHost.ActualWidth > 0 && animationSettings.AnimationsEnabled;
+                showParameters = visible;
+                parameterHost.IsHitTestVisible = visible;
+                if (!animate) { FinishParameterMotion(); return; }
+                if (!revealClock.IsRunning) revealHeight = parameterHost.ActualHeight;
+                parameterBody.Visibility = Visibility.Visible;
+                parameterBody.Measure(new Windows.Foundation.Size(parameterHost.ActualWidth, double.PositiveInfinity));
+                fullHeight = parameterBody.DesiredSize.Height;
+                parameterHost.Height = revealHeight;
+                if (!revealClock.IsRunning)
+                {
+                    revealClock.Start();
+                    CompositionTarget.Rendering += MoveParameters;
+                }
+            }
+            Closed += (_, __) => { CompositionTarget.Rendering -= MoveParameters; revealClock.Reset(); };
+            int displayedEffect = -1;
+            void RefreshParameters(int effect)
+            {
+                if (effect == displayedEffect) return;
+                displayedEffect = effect;
+                parameterPanel.Children.Clear();
+                if (effect == 0 || !privacy.EffectUnlocked(effect)) return;
+                var value = privacy.GetEffectParameters(effect);
+                var reset = new Button { Content = "恢复默认参数", HorizontalAlignment = HorizontalAlignment.Right };
+                var header = new Grid();
+                header.Children.Add(new TextBlock { Text = effects[Array.FindIndex(effects, e => e.Id == effect)].Name, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+                header.Children.Add(reset);
+                parameterPanel.Children.Add(header);
+                void AddSlider(string label, double min, double max, double step, double initial, string format,
+                    Func<OffWorkWidget.EffectParameters, double, OffWorkWidget.EffectParameters> update)
+                {
+                    var row = new Grid { ColumnSpacing = 8 };
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(43) });
+                    row.Children.Add(new TextBlock { Text = label, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center, FontSize = 12 });
+                    var readout = new TextBlock { Text = initial.ToString(format), Foreground = subInkBrush, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, FontSize = 12 };
+                    var slider = new Slider { Minimum = min, Maximum = max, StepFrequency = step, SmallChange = step,
+                        Value = initial, IsThumbToolTipEnabled = false, VerticalAlignment = VerticalAlignment.Center };
+                    Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(slider, label);
+                    Grid.SetColumn(slider, 1); row.Children.Add(slider);
+                    Grid.SetColumn(readout, 2); row.Children.Add(readout);
+                    parameterPanel.Children.Add(row);
+                    slider.ValueChanged += (_, args) =>
+                    {
+                        if (displayedEffect != effect) return;
+                        double next = Math.Round(args.NewValue, 1);
+                        var changed = update(value, next);
+                        if (value == changed) return;
+                        try
+                        {
+                            privacy.SetEffectParameters(effect, changed);
+                            value = changed;
+                            readout.Text = next.ToString(format);
+                        }
+                        catch (IOException)
+                        {
+                            SetNotice("保存失败，请稍后重试。");
+                            slider.Value = args.OldValue;
+                        }
+                    };
+                }
+                AddSlider("粒子数量", 6, 55, 1, value.Count, "0", (p, n) => p with { Count = (int)n });
+                AddSlider("运动速度", .3, 2.2, .1, value.Speed, "0.0'×'", (p, n) => p with { Speed = n });
+                AddSlider("粒子大小", .5, 1.8, .1, value.Size, "0.0'×'", (p, n) => p with { Size = n });
+                AddSlider("整体透明度", 20, 100, 1, value.Opacity, "0'%'", (p, n) => p with { Opacity = (int)n });
+                AddSlider("风力偏移", -1.5, 1.5, .1, value.Wind, "+0.0;-0.0;0.0", (p, n) => p with { Wind = n });
+                parameterPanel.Children.Add(new TextBlock { Text = "风力负值向左，0 为无风，正值向右。", Foreground = subInkBrush, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+                reset.Click += (_, __) =>
                 {
                     try
                     {
-                        if (!privacy.EffectUnlocked(effect))
-                        {
-                            if (!privacy.UnlockEffect(effect)) { notice.Text = "金币不足，继续收集金币吧。"; return; }
-                            notice.Text = effectName + "已解锁，可以随时使用。";
-                        }
-                        else { privacy.SelectEffect(effect); notice.Text = "已切换为" + effectName + "。"; }
-                        RefreshEffects();
+                        privacy.SetEffectParameters(effect, OffWorkWidget.EffectParameters.GetDefaults(effect));
+                        displayedEffect = -1;
+                        RefreshParameters(effect);
                     }
-                    catch (IOException) { notice.Text = "保存失败，请稍后重试。"; }
+                    catch (IOException) { SetNotice("保存失败，请稍后重试。"); }
                 };
             }
+            var summary = new Grid { ColumnSpacing = 8 };
+            summary.ColumnDefinitions.Add(new ColumnDefinition());
+            summary.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            summary.Children.Add(balance);
+            Grid.SetColumn(activeLabel, 1); summary.Children.Add(activeLabel);
+            details.Children.Add(summary);
+
+            var row = new Grid { ColumnSpacing = 8 };
+            row.ColumnDefinitions.Add(new ColumnDefinition());
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            int selectedIndex = Math.Max(0, Array.FindIndex(effects, e => e.Id == privacy.SelectedEffect));
+            var action = new Button { Height = 32, MinWidth = 92, Padding = new Thickness(10, 3, 10, 3), CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 13 };
+            action.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+            action.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            var chooser = BuildShopEffectSelector(effects, selectedIndex, index =>
+            {
+                selectedIndex = index;
+                SetNotice("");
+                RefreshEffects();
+            });
+            row.Children.Add(chooser);
+            Grid.SetColumn(action, 1); row.Children.Add(action);
+            details.Children.Add(row);
+            action.Click += (_, __) =>
+            {
+                var effect = effects[selectedIndex];
+                try
+                {
+                    if (!privacy.EffectUnlocked(effect.Id))
+                    {
+                        if (!privacy.UnlockEffect(effect.Id)) { SetNotice("金币不足，继续收集金币吧。"); return; }
+                        SetNotice(effect.Name + "已解锁。");
+                    }
+                    else
+                    {
+                        privacy.SelectEffect(effect.Id);
+                        SetNotice("");
+                    }
+                    RefreshEffects();
+                }
+                catch (IOException) { SetNotice("保存失败，请稍后重试。"); }
+            };
             void RefreshBalance()
             {
                 try { balance.Text = "可用金币：" + privacy.CoinBalance.ToString("N0", CultureInfo.InvariantCulture); }
@@ -2489,15 +2595,285 @@ namespace OffWorkWidget.WinUI
             void RefreshEffects()
             {
                 int selected = privacy.SelectedEffect;
-                for (int i = 0; i < buttons.Count; i++)
-                    buttons[i].Content = selected == effects[i].Id ? "使用中" : privacy.EffectUnlocked(effects[i].Id) ? "使用" : OffWorkWidget.PrivacyStore.EffectPrice(effects[i].Id) + " 金币解锁";
+                int index = Math.Max(0, Array.FindIndex(effects, e => e.Id == selected));
+                activeLabel.Text = "使用中：" + effects[index].Name;
+                int browsing = effects[selectedIndex].Id;
+                bool active = browsing == selected;
+                action.Content = active ? "使用中" : privacy.EffectUnlocked(browsing) ? "使用" : OffWorkWidget.PrivacyStore.EffectPrice(browsing) + " 金币解锁";
+                action.IsEnabled = !active;
+                if (active && selected != 0) RefreshParameters(selected);
+                ShowParameters(active && selected != 0);
             }
             refreshEffectShop = () => { RefreshBalance(); RefreshEffects(); refreshDailyWord?.Invoke(); };
             details.Children.Add(notice);
-            details.Children.Add(BuildDailyWord());
+            var lowerShop = new StackPanel();
+            lowerShop.Children.Add(parameterHost);
+            lowerShop.Children.Add(BuildDailyWord());
+            details.Children.Add(lowerShop);
             privacy.BalanceChanged += RefreshBalance;
             Closed += (_, __) => privacy.BalanceChanged -= RefreshBalance;
             return details;
+        }
+
+        FrameworkElement BuildShopEffectSelector(ShopEffectOption[] effects, int selectedIndex, Action<int> choose)
+        {
+            const double rowHeight = 34;
+            int count = effects.Length;
+            int Wrap(int index) => (index % count + count) % count;
+            const double viewportHeight = rowHeight * 3;
+            var thumbnail = new Image { Width = 32, Height = 26, Stretch = Stretch.Uniform, VerticalAlignment = VerticalAlignment.Center };
+            var name = new TextBlock { FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
+            var arrow = CreateChevron(90);
+            arrow.Width = arrow.Height = 14;
+            var selectorContent = new Grid { ColumnSpacing = 4 };
+            selectorContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            selectorContent.ColumnDefinitions.Add(new ColumnDefinition());
+            selectorContent.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            selectorContent.Children.Add(thumbnail);
+            Grid.SetColumn(name, 1); selectorContent.Children.Add(name);
+            Grid.SetColumn(arrow, 2); selectorContent.Children.Add(arrow);
+            var selector = new Button
+            {
+                Height = 36, MinWidth = 0, Padding = new Thickness(8, 0, 8, 0), CornerRadius = new CornerRadius(8),
+                Background = inputBackgroundBrush, BorderThickness = new Thickness(0),
+                HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Content = selectorContent
+            };
+            selector.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
+            selector.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(selector, "选择背景特效");
+
+            var wheelRows = new StackPanel { Padding = new Thickness(0, rowHeight, 0, rowHeight) };
+            var viewer = new ScrollViewer
+            {
+                Content = wheelRows, Height = viewportHeight, IsTabStop = true, UseSystemFocusVisuals = false,
+                HorizontalScrollMode = ScrollMode.Disabled, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                VerticalScrollMode = ScrollMode.Enabled, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                IsVerticalScrollChainingEnabled = false, VerticalSnapPointsType = SnapPointsType.None,
+                BringIntoViewOnFocusChange = false
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(viewer, "背景特效滚轮");
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(viewer, "滚动或使用上下方向键选择特效，点击或按回车关闭");
+            var selectionBand = new Border
+            {
+                Height = rowHeight, CornerRadius = new CornerRadius(rowHeight / 2), IsHitTestVisible = false,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var wheelContent = new Grid();
+            wheelContent.Children.Add(selectionBand);
+            wheelContent.Children.Add(viewer);
+            var surface = new Border
+            {
+                Height = viewportHeight + 6, Padding = new Thickness(4, 3, 4, 3),
+                CornerRadius = new CornerRadius(18), Child = wheelContent
+            };
+            var overlay = new Canvas { Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+            overlay.Children.Add(surface);
+            Canvas.SetZIndex(overlay, 100);
+            void PositionOverlay()
+            {
+                var at = selector.TransformToVisual(windowContent).TransformPoint(new Windows.Foundation.Point());
+                surface.Width = selector.ActualWidth;
+                Canvas.SetLeft(surface, at.X);
+                Canvas.SetTop(surface, at.Y + (selector.ActualHeight - surface.Height) / 2);
+            }
+
+            var rowButtons = new List<Button>(effects.Length);
+            var iconTransforms = new List<ScaleTransform>(effects.Length);
+            var frameClock = new Stopwatch();
+            bool ready = false;
+            double position = selectedIndex, goal = selectedIndex, velocity = 0;
+            int wheelDelta = 0;
+
+            void ShowSelection()
+            {
+                thumbnail.Source = effects[selectedIndex].Thumbnail;
+                name.Text = effects[selectedIndex].Name;
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(selector, name.Text);
+            }
+            ShowSelection();
+
+            void SelectIndex(int index)
+            {
+                if (index == selectedIndex) return;
+                selectedIndex = index;
+                ShowSelection();
+                choose(index);
+            }
+
+            void UpdateWheel(double offset)
+            {
+                for (int index = 0; index < rowButtons.Count; index++)
+                {
+                    double distance = Math.Abs(index - offset);
+                    rowButtons[index].Opacity = WheelRowOpacity(distance);
+                    double proximity = Math.Max(0, 1 - distance);
+                    double scale = 1 + (SelectedIconScale - 1) * proximity * proximity * (3 - 2 * proximity);
+                    iconTransforms[index].ScaleX = iconTransforms[index].ScaleY = scale;
+                }
+                SelectIndex(Wrap((int)Math.Round(offset, MidpointRounding.AwayFromZero)));
+            }
+
+            void StopMotion()
+            {
+                CompositionTarget.Rendering -= MoveWheel;
+                frameClock.Reset();
+                velocity = 0;
+            }
+
+            void MoveWheel(object? sender, object args)
+            {
+                double dt = Math.Min(.05, frameClock.Elapsed.TotalSeconds);
+                frameClock.Restart();
+                // Critically damped spring retains its velocity when the next wheel step changes the target.
+                const double rate = 17;
+                double offset = position - goal, slope = velocity + rate * offset;
+                double decay = Math.Exp(-rate * dt);
+                position = goal + (offset + slope * dt) * decay;
+                velocity = (velocity - rate * slope * dt) * decay;
+                if (!animationSettings.AnimationsEnabled || (Math.Abs(position - goal) < .005 && Math.Abs(velocity) < .06))
+                {
+                    position = goal = count + Wrap((int)goal);
+                    viewer.ChangeView(null, position * rowHeight, null, true);
+                    UpdateWheel(position);
+                    StopMotion();
+                    return;
+                }
+                viewer.ChangeView(null, position * rowHeight, null, true);
+                UpdateWheel(position);
+            }
+
+            void MoveTo(int index)
+            {
+                goal = index;
+                if (goal < 0 || goal >= count * 3) goal = count + Wrap(index);
+                if (!animationSettings.AnimationsEnabled)
+                {
+                    goal = count + Wrap((int)goal);
+                    viewer.ChangeView(null, goal * rowHeight, null, true);
+                    UpdateWheel(goal);
+                    return;
+                }
+                if (frameClock.IsRunning) return;
+                position = viewer.VerticalOffset / rowHeight;
+                if (Math.Abs(position - goal) < .005)
+                {
+                    int center = count + Wrap(index);
+                    if (center != index) viewer.ChangeView(null, center * rowHeight, null, true);
+                    return;
+                }
+                frameClock.Start();
+                CompositionTarget.Rendering += MoveWheel;
+            }
+
+            void OnWheel(object sender, PointerRoutedEventArgs e)
+            {
+                if (e.Handled || !ready) return;
+                var wheel = e.GetCurrentPoint(viewer).Properties;
+                if (wheel.IsHorizontalMouseWheel) return;
+                e.Handled = true;
+                wheelDelta += wheel.MouseWheelDelta;
+                int steps = wheelDelta / 120;
+                wheelDelta %= 120;
+                if (steps != 0) MoveTo((frameClock.IsRunning ? (int)goal : (int)Math.Round(viewer.VerticalOffset / rowHeight)) - steps);
+            }
+
+            // The fixed center band supplies the wheel's only row background.
+            var wheelRowTemplate = (ControlTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load("""
+                <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+                    <ContentPresenter Background="Transparent" Content="{TemplateBinding Content}"
+                                      Padding="{TemplateBinding Padding}"
+                                      HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                      VerticalContentAlignment="Center" />
+                </ControlTemplate>
+                """);
+            for (int index = 0; index < count * 3; index++)
+            {
+                int rowIndex = Wrap(index);
+                var scale = new ScaleTransform();
+                var image = new Image
+                {
+                    Source = effects[rowIndex].Thumbnail, Width = 25, Height = 20, Stretch = Stretch.Uniform,
+                    RenderTransform = scale, RenderTransformOrigin = new Windows.Foundation.Point(.5, .5),
+                    HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+                };
+                var icon = new Grid { Width = 36, Height = 30 };
+                icon.Children.Add(image);
+                var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+                content.Children.Add(icon);
+                content.Children.Add(new TextBlock
+                {
+                    Text = effects[rowIndex].Name, FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center
+                });
+                var item = new Button
+                {
+                    Height = rowHeight, Template = wheelRowTemplate, HorizontalAlignment = HorizontalAlignment.Stretch,
+                    HorizontalContentAlignment = HorizontalAlignment.Left, Padding = new Thickness(3, 0, 0, 0), IsTabStop = false,
+                    Content = content
+                };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item, effects[rowIndex].Name);
+                item.Click += (_, __) => { SelectIndex(rowIndex); CloseOverlay(); };
+                item.PointerWheelChanged += OnWheel;
+                rowButtons.Add(item);
+                iconTransforms.Add(scale);
+                wheelRows.Children.Add(item);
+            }
+
+            viewer.PointerWheelChanged += OnWheel;
+            viewer.PointerPressed += (_, __) => StopMotion();
+            viewer.ViewChanged += (_, args) =>
+            {
+                if (!ready || frameClock.IsRunning) return;
+                double offset = viewer.VerticalOffset / rowHeight;
+                UpdateWheel(offset);
+                if (!args.IsIntermediate) MoveTo((int)Math.Round(offset));
+            };
+            viewer.KeyDown += (_, args) =>
+            {
+                int step = args.Key == Windows.System.VirtualKey.Up ? -1 : args.Key == Windows.System.VirtualKey.Down ? 1 : 0;
+                if (step != 0)
+                {
+                    MoveTo((frameClock.IsRunning ? (int)goal : (int)Math.Round(viewer.VerticalOffset / rowHeight)) + step);
+                    args.Handled = true;
+                }
+                else if (args.Key is Windows.System.VirtualKey.Enter or Windows.System.VirtualKey.Escape)
+                {
+                    CloseOverlay();
+                    args.Handled = true;
+                }
+            };
+
+            void CloseOverlay()
+            {
+                ready = false;
+                wheelDelta = 0;
+                StopMotion();
+                windowContent.Children.Remove(overlay);
+                if (!windowClosed) selector.Focus(FocusState.Programmatic);
+            }
+            overlay.PointerPressed += (_, args) =>
+            {
+                if (ReferenceEquals(args.OriginalSource, overlay)) { args.Handled = true; CloseOverlay(); }
+            };
+            selector.Click += (_, __) =>
+            {
+                if (windowContent.Children.Contains(overlay)) return;
+                bool dark = root.ActualTheme == ElementTheme.Dark;
+                surface.Background = new SolidColorBrush(WheelSurfaceColor(dark));
+                selectionBand.Background = WheelSelectionBrush(dark);
+                surface.RequestedTheme = root.ActualTheme;
+                windowContent.Children.Add(overlay);
+                PositionOverlay();
+                overlay.UpdateLayout();
+                position = goal = count + selectedIndex;
+                viewer.ChangeView(null, position * rowHeight, null, true);
+                UpdateWheel(position);
+                ready = true;
+                viewer.Focus(FocusState.Programmatic);
+            };
+            overlay.LayoutUpdated += (_, __) => { if (ready) PositionOverlay(); };
+            Closed += (_, __) => { ready = false; StopMotion(); };
+            return selector;
         }
 
         FrameworkElement BuildDailyWord()
@@ -3243,7 +3619,7 @@ namespace OffWorkWidget.WinUI
             double selectedX = 12 + (width - 24) * selected / 50;
             Canvas.SetLeft(scaleIndicator, selectedX - scaleIndicator.Width / 2);
             Canvas.SetTop(scaleIndicator, 0);
-            Canvas.SetLeft(scaleReadoutBadge, Math.Clamp(selectedX - 27, 0, width - 54));
+            Canvas.SetLeft(scaleReadoutBadge, Math.Clamp(selectedX - 27, 0, Math.Max(0, width - 54)));
             Canvas.SetTop(scaleReadoutBadge, 30);
         }
 
@@ -4102,15 +4478,40 @@ namespace OffWorkWidget.WinUI
             }
             var panel = new StackPanel { Spacing = 12 };
             panel.Children.Add(grid);
-            var modeRow = new Grid { ColumnSpacing = 8 };
-            modeRow.ColumnDefinitions.Add(new ColumnDefinition());
-            modeRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            modeRow.Children.Add(new TextBlock { Text = "提醒方式", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
-            reminderDisplay = new ComboBox { MinWidth = 112, Height = 36, FontSize = 13, Background = inputBackgroundBrush, Foreground = inkBrush, BorderThickness = new Thickness(0), CornerRadius = new CornerRadius(8) };
-            reminderDisplay.Items.Add("挂件内提醒"); reminderDisplay.Items.Add("弹窗提醒");
-            reminderDisplay.SelectedIndex = current.ReminderPopup ? 1 : 0;
-            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(reminderDisplay, "喝水与活动的提醒方式");
-            Grid.SetColumn(reminderDisplay, 1); modeRow.Children.Add(reminderDisplay); panel.Children.Add(modeRow);
+            panel.Children.Add(new TextBlock { Text = "提醒方式", FontSize = 13, Foreground = inkBrush });
+            var modes = new Grid { ColumnSpacing = 2 };
+            var modeButtons = new Microsoft.UI.Xaml.Controls.Primitives.ToggleButton[2];
+            reminderPopup = current.ReminderPopup;
+            for (int i = 0; i < modeButtons.Length; i++)
+            {
+                bool popup = i == 1;
+                var button = new Microsoft.UI.Xaml.Controls.Primitives.ToggleButton
+                {
+                    Content = popup ? "弹窗提醒" : "挂件内提醒", IsChecked = popup == reminderPopup,
+                    HorizontalAlignment = HorizontalAlignment.Stretch, MinHeight = 32, MinWidth = 0,
+                    FontSize = 13, CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0),
+                    Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent), Foreground = inkBrush
+                };
+                foreach (string state in new[] { "", "PointerOver", "Pressed" })
+                {
+                    button.Resources["ToggleButtonBackgroundChecked" + state] = restPresetSelectionBrush;
+                    button.Resources["ToggleButtonForegroundChecked" + state] = inkBrush;
+                }
+                button.Click += (_, __) =>
+                {
+                    button.IsChecked = true;
+                    if (reminderPopup == popup) return;
+                    reminderPopup = popup;
+                    modeButtons[popup ? 0 : 1].IsChecked = false;
+                    UpdatePopupOptionsReveal(popup);
+                };
+                modeButtons[i] = button;
+                modes.ColumnDefinitions.Add(new ColumnDefinition());
+                Grid.SetColumn(button, i);
+                modes.Children.Add(button);
+            }
+            panel.Children.Add(new Border { Child = modes, Padding = new Thickness(3),
+                CornerRadius = new CornerRadius(10), Background = inputBackgroundBrush });
             var popupOptions = new StackPanel { Spacing = 10, Margin = new Thickness(0, 6, 0, 2) };
             reminderPosition = current.ReminderPosition;
             reminderX = current.ReminderX;
@@ -4185,7 +4586,7 @@ namespace OffWorkWidget.WinUI
                 BorderBrush = dividerBrush, BorderThickness = new Thickness(1),
                 Padding = new Thickness(16, 12, 16, 12), Child = positionCard
             });
-            popupOptions.Visibility = reminderDisplay.SelectedIndex == 1 ? Visibility.Visible : Visibility.Collapsed;
+            popupOptions.Visibility = reminderPopup ? Visibility.Visible : Visibility.Collapsed;
             // A switch between 挂件内提醒 and 弹窗提醒 grows/collapses the position
             // card instead of snapping the section height.
             popupOptionsPanel = popupOptions;
@@ -4196,7 +4597,6 @@ namespace OffWorkWidget.WinUI
                 Opacity = popupOptions.Visibility == Visibility.Visible ? 1 : 0,
                 IsHitTestVisible = popupOptions.Visibility == Visibility.Visible
             };
-            reminderDisplay.SelectionChanged += (_, __) => UpdatePopupOptionsReveal(reminderDisplay.SelectedIndex == 1);
             panel.Children.Add(popupOptionsReveal);
             return panel;
         }
@@ -4883,6 +5283,12 @@ namespace OffWorkWidget.WinUI
             wheelRows.Children.Add(new Border { Height = padding });
 
             var wheelHost = new Grid { Height = viewportHeight, Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+            var selection = new Border
+            {
+                Height = rowHeight, VerticalAlignment = VerticalAlignment.Center,
+                CornerRadius = new CornerRadius(18), IsHitTestVisible = false
+            };
+            wheelHost.Children.Add(selection);
             wheelHost.Children.Add(wheelViewer);
 
             bool initialized = false, wheelOpen = false;
@@ -4914,7 +5320,7 @@ namespace OffWorkWidget.WinUI
                 for (int i = first; i <= last; i++)
                 {
                     double distance = Math.Abs(i - position);
-                    rowBorders[i].Opacity = Math.Max(0, 1 - distance * .42);
+                    rowBorders[i].Opacity = WheelRowOpacity(distance);
                     double proximity = Math.Max(0, 1 - distance);
                     double eased = proximity * proximity * (3 - 2 * proximity);
                     rowScales[i].ScaleX = rowScales[i].ScaleY =
@@ -5059,13 +5465,12 @@ namespace OffWorkWidget.WinUI
             var effectMenu = new Flyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.Left };
             var menuSurface = new Border
             {
-                CornerRadius = new CornerRadius(16), Padding = new Thickness(6),
-                BorderThickness = new Thickness(1), Child = flyoutRoot
+                CornerRadius = new CornerRadius(18), Padding = new Thickness(6), Child = flyoutRoot
             };
             effectMenu.Content = menuSurface;
             var menuStyle = new Style(typeof(FlyoutPresenter));
             menuStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
-            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(16)));
+            menuStyle.Setters.Add(new Setter(Control.CornerRadiusProperty, new CornerRadius(18)));
             menuStyle.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Microsoft.UI.Colors.Transparent)));
             menuStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
             effectMenu.FlyoutPresenterStyle = menuStyle;
@@ -5082,10 +5487,8 @@ namespace OffWorkWidget.WinUI
                 keyboardOpen = selector.FocusState == FocusState.Keyboard;
                 panel.RequestedTheme = root.ActualTheme;
                 bool dark = root.ActualTheme == ElementTheme.Dark;
-                menuSurface.Background = MenuFrost(dark);
-                menuSurface.BorderBrush = new SolidColorBrush(dark
-                    ? Windows.UI.Color.FromArgb(30, 255, 255, 255)
-                    : Windows.UI.Color.FromArgb(90, 255, 255, 255));
+                menuSurface.Background = new SolidColorBrush(WheelSurfaceColor(dark));
+                selection.Background = WheelSelectionBrush(dark);
             };
             effectMenu.Closing += (_, __) =>
             {
@@ -5455,7 +5858,7 @@ namespace OffWorkWidget.WinUI
                 WishSaved = wishItems.Count > 0 ? wishItems[0].Saved : 0,
                 WaterReminder = water.IsOn,
                 WalkReminder = walk.IsOn,
-                ReminderPopup = reminderDisplay.SelectedIndex == 1,
+                ReminderPopup = reminderPopup,
                 ReminderPosition = reminderPosition,
                 ReminderX = reminderX,
                 ReminderY = reminderY,
@@ -5475,7 +5878,6 @@ namespace OffWorkWidget.WinUI
             {
                 OffWorkWidget.Logic.Validate(next);
                 saveSettings(next);
-                petCommitted = true;
                 if (startup.IsEnabled && startup.IsOn != startupInitiallyEnabled)
                 {
                     try

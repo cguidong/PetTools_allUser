@@ -2,12 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Net;
+using System.Diagnostics.CodeAnalysis;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace OffWorkWidget
@@ -36,8 +37,8 @@ namespace OffWorkWidget
                 if(!TryFileYear(name, out year) || year < currentYear) continue;
                 try
                 {
-                    using(Stream stream = assembly.GetManifestResourceStream(name))
-                        LoadJson(year, ReadLimited(stream));
+                    using Stream? stream = assembly.GetManifestResourceStream(name);
+                    if (stream != null) LoadJson(year, ReadLimitedAsync(stream, CancellationToken.None).GetAwaiter().GetResult());
                 }
                 catch(IOException) { }
                 catch(DecoderFallbackException) { }
@@ -80,9 +81,8 @@ namespace OffWorkWidget
         {
             lock(gate)
             {
-                string notice;
                 if(pending.ContainsKey(year)) return year + " 年节假日更新中…";
-                if(notices.TryGetValue(year, out notice)) return notice;
+                if(notices.TryGetValue(year, out var notice)) return notice;
                 return years.ContainsKey(year) ? year + " 年节假日已就绪" : year + " 年暂无已公布安排，按每周规则执行";
             }
         }
@@ -90,8 +90,13 @@ namespace OffWorkWidget
         // Validated snapshots never alter the user's own date adjustments.
         internal bool LoadJson(int year, string json)
         {
-            Dictionary<DateTime, bool> rules;
-            if(!ValidateJson(year, json, out rules)) return false;
+            if(!ValidateJson(year, json, out var rules)) return false;
+            ApplyRules(year, rules);
+            return true;
+        }
+
+        private void ApplyRules(int year, Dictionary<DateTime, bool> rules)
+        {
             lock(gate)
             {
                 years[year] = rules;
@@ -101,18 +106,16 @@ namespace OffWorkWidget
                 snapshot = next;
                 notices.Remove(year);
             }
-            return true;
         }
 
-        private static readonly HttpClient httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+        private static readonly HttpClient httpClient = new HttpClient();
 
         internal Task<bool> RefreshAsync(int year, bool force)
         {
             if(year < 1900 || year > 2200) return Task.FromResult(false);
             lock(gate)
             {
-                Task<bool> running;
-                if(pending.TryGetValue(year, out running)) return running;
+                if(pending.TryGetValue(year, out var running)) return running;
                 DateTime saved;
                 DateTime now = DateTime.UtcNow;
                 if(!force && years.ContainsKey(year) && freshness.TryGetValue(year, out saved) && saved <= now && now - saved < TimeSpan.FromDays(7))
@@ -137,20 +140,20 @@ namespace OffWorkWidget
             {
                 try
                 {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(6));
                     using var request = new HttpRequestMessage(HttpMethod.Get, source);
                     request.Headers.TryAddWithoutValidation("User-Agent", "OffWorkWidget-HolidayCalendar/1.0");
-                    using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                    using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                     if (!response.IsSuccessStatusCode) continue;
                     if (response.Content.Headers.ContentLength > MaximumBytes) continue;
                     string json;
-                    using (Stream stream = await response.Content.ReadAsStreamAsync())
+                    using (Stream stream = await response.Content.ReadAsStreamAsync(timeout.Token))
                     {
-                        json = ReadLimited(stream);
+                        json = await ReadLimitedAsync(stream, timeout.Token);
                     }
-                    Dictionary<DateTime, bool> rules;
-                    if (!ValidateJson(year, json, out rules)) continue;
+                    if (!ValidateJson(year, json, out var rules)) continue;
                     bool cached = await Task.Run(() => WriteCache(year, json));
-                    LoadJson(year, json);
+                    ApplyRules(year, rules);
                     lock (gate)
                     {
                         freshness[year] = DateTime.UtcNow;
@@ -159,7 +162,7 @@ namespace OffWorkWidget
                     return true;
                 }
                 catch (HttpRequestException) { }
-                catch (TaskCanceledException) { }
+                catch (OperationCanceledException) { }
                 catch (DecoderFallbackException) { }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
@@ -171,7 +174,7 @@ namespace OffWorkWidget
 
         private bool WriteCache(int year, string json)
         {
-            string temporary = null;
+            string? temporary = null;
             try
             {
                 Directory.CreateDirectory(cacheFolder);
@@ -195,13 +198,13 @@ namespace OffWorkWidget
             }
         }
 
-        private static string ReadLimited(Stream stream)
+        private static async Task<string> ReadLimitedAsync(Stream stream, CancellationToken cancellationToken)
         {
             using(var buffer = new MemoryStream())
             {
                 byte[] chunk = new byte[4096];
                 int count;
-                while((count = stream.Read(chunk, 0, chunk.Length)) != 0)
+                while((count = await stream.ReadAsync(chunk.AsMemory(), cancellationToken).ConfigureAwait(false)) != 0)
                 {
                     if(buffer.Length + count > MaximumBytes) throw new IOException("节假日数据过大");
                     buffer.Write(chunk, 0, count);
@@ -217,7 +220,7 @@ namespace OffWorkWidget
                 Int32.TryParse(file.Substring(15, 4), NumberStyles.None, CultureInfo.InvariantCulture, out year) && year >= 1900 && year <= 2200;
         }
 
-        private static bool ValidateJson(int year, string json, out Dictionary<DateTime, bool> rules)
+        private static bool ValidateJson(int year, string json, [NotNullWhen(true)] out Dictionary<DateTime, bool>? rules)
         {
             rules = null;
             if(year < 1900 || year > 2200 || String.IsNullOrWhiteSpace(json) || Encoding.UTF8.GetByteCount(json) > MaximumBytes) return false;
@@ -228,19 +231,18 @@ namespace OffWorkWidget
                     while(validation.Read())
                     {
                         if(validation.NodeType != System.Xml.XmlNodeType.Element) continue;
-                        string type = validation.GetAttribute("type");
+                        string? type = validation.GetAttribute("type");
                         if(validation.LocalName == "isOffDay" && type != "boolean") return false;
                         if(validation.LocalName == "year" && type != "number") return false;
                     }
                 }
-                CalendarData data;
+                CalendarData? data;
                 using(var stream = new MemoryStream(Encoding.UTF8.GetBytes(json.TrimStart('\uFEFF'))))
-                    data = (CalendarData)new DataContractJsonSerializer(typeof(CalendarData)).ReadObject(stream);
+                    data = (CalendarData?)new DataContractJsonSerializer(typeof(CalendarData)).ReadObject(stream);
                 if(data == null || data.Year != year || data.Papers == null || data.Papers.Length == 0 || data.Days == null || data.Days.Length == 0) return false;
                 foreach(string paper in data.Papers)
                 {
-                    Uri uri;
-                    if(!Uri.TryCreate(paper, UriKind.Absolute, out uri) || uri.Scheme != Uri.UriSchemeHttps ||
+                    if(!Uri.TryCreate(paper, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
                         !(uri.Host == "gov.cn" || uri.Host.EndsWith(".gov.cn", StringComparison.OrdinalIgnoreCase))) return false;
                 }
                 var validated = new Dictionary<DateTime, bool>();
@@ -263,14 +265,14 @@ namespace OffWorkWidget
         private sealed class CalendarData
         {
             [DataMember(Name = "year", IsRequired = true)] public int Year { get; set; }
-            [DataMember(Name = "papers", IsRequired = true)] public string[] Papers { get; set; }
-            [DataMember(Name = "days", IsRequired = true)] public CalendarDay[] Days { get; set; }
+            [DataMember(Name = "papers", IsRequired = true)] public string[]? Papers { get; set; }
+            [DataMember(Name = "days", IsRequired = true)] public CalendarDay[]? Days { get; set; }
         }
         [DataContract]
         private sealed class CalendarDay
         {
-            [DataMember(Name = "name", IsRequired = true)] public string Name { get; set; }
-            [DataMember(Name = "date", IsRequired = true)] public string Date { get; set; }
+            [DataMember(Name = "name", IsRequired = true)] public string? Name { get; set; }
+            [DataMember(Name = "date", IsRequired = true)] public string? Date { get; set; }
             [DataMember(Name = "isOffDay", IsRequired = true)] public bool IsOffDay { get; set; }
         }
     }

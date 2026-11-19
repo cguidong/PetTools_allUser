@@ -22,7 +22,9 @@ namespace OffWorkWidget
             bool lunch = workday && Logic.LunchCovered(now, settings) && Logic.IsLunchTime(now, settings);
             bool active = workday && !lunch && now.TimeOfDay >= hours.Start && now.TimeOfDay < hours.End;
             double delta = hasSample ? (elapsed - lastElapsed).TotalSeconds : 0;
-            bool continuous = hasSample && active && wasActive && now.Date == lastWall.Date && delta >= 0 && delta <= 15;
+            double wallDelta = hasSample ? (now - lastWall).TotalSeconds : 0;
+            bool continuous = hasSample && active && wasActive && now.Date == lastWall.Date &&
+                delta >= 0 && delta <= 15 && wallDelta >= 0 && wallDelta <= 15;
             lastElapsed = elapsed; lastWall = now; hasSample = true; wasActive = active;
             if (!continuous) { waterSeconds = walkSeconds = 0; return 0; }
             waterSeconds = settings.WaterReminder ? waterSeconds + delta : 0;

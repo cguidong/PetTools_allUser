@@ -23,7 +23,7 @@ using Windows.Graphics;
 
 namespace OffWorkWidget.WinUI;
 
-public sealed class MainWindow : Window
+public sealed partial class MainWindow : Window
 {
     Settings settings = new Settings();
     double? previewScale;
@@ -132,7 +132,9 @@ public sealed class MainWindow : Window
     int emittedCoins;
     long coinScoreLastAt;
     long nextAmbientEffectAt;
-    int ambientEffectKind = -1, ambientBatchSize, ambientParticleLimit, ambientParticlesActive;
+    bool ambientPreviewPending;
+    readonly System.Collections.Generic.Dictionary<string, BitmapImage> ambientSprites = new();
+    int ambientEffectKind = -1, ambientParticlesActive;
     bool coinScoreHasEvent;
     readonly TextBlock coinScore = new TextBlock { FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, VerticalAlignment = VerticalAlignment.Center };
     readonly TextBlock coinScoreTarget = new TextBlock { IsTextScaleFactorEnabled = false, TextLineBounds = TextLineBounds.Full, Opacity = .65, VerticalAlignment = VerticalAlignment.Center };
@@ -219,7 +221,6 @@ public sealed class MainWindow : Window
     KeyboardHookProc? petEnterHookProc;
     IntPtr petEnterHook;
     bool petEnterHeld, petEnterHandled;
-    Storyboard? petBreathing;
     int petAnimationRevision;
     readonly DispatcherQueueTimer timer;
     DispatcherQueueTimer? smokeTimer;
@@ -269,14 +270,13 @@ public sealed class MainWindow : Window
     bool glassAppearanceInitialized;
     double glassTone, glassFromTone, glassTargetTone, glassTint, glassFromTint, glassTargetTint;
     bool analysisRegionsDirty = true;
-    int walkingFrame;
-    Microsoft.UI.Xaml.Media.ImageSource[]? walkingFrames;
     readonly DispatcherQueueTimer walkTimer;
 
     public MainWindow()
     {
         smoke = Environment.GetCommandLineArgs().Contains("--smoke-test");
-        dataFolder = Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") ?? (smoke ? Path.Combine(Path.GetTempPath(), "OffWorkWidget-WinUI-smoke") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"));
+        string? isolatedDataFolder = Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA");
+        dataFolder = isolatedDataFolder ?? (smoke ? Path.Combine(Path.GetTempPath(), "OffWorkWidget-WinUI-smoke") : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OffWorkWidget"));
         Directory.CreateDirectory(dataFolder);
         GlassProfile.Configure(dataFolder);
         Title = "有盼";
@@ -286,7 +286,7 @@ public sealed class MainWindow : Window
         SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED);
         SetLayeredWindowAttributes(hwnd, 0, 0, 2 /* LWA_ALPHA */);
         native = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd));
-        string instanceKey = Environment.UserName + (Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") == null ? "" : "-WinUI-Isolated");
+        string instanceKey = Environment.UserName + (isolatedDataFolder == null ? "" : "-WinUI-Isolated");
         if (!smoke)
         {
             instance = new Mutex(true, "Local\\OffWorkWidget-" + instanceKey, out bool first);
@@ -305,6 +305,7 @@ public sealed class MainWindow : Window
             installerExitWait = ThreadPool.RegisterWaitForSingleObject(installerExit, (_, __) => DispatcherQueue.TryEnqueue(() => { exitReason = "installer"; Exit(); }), null, Timeout.Infinite, false);
         }
         string config = Path.Combine(dataFolder, "settings.xml");
+        bool wishAnchorRepaired = false;
         if (File.Exists(config))
         {
             try
@@ -313,34 +314,16 @@ public sealed class MainWindow : Window
                 var loaded = (Settings?)new XmlSerializer(typeof(Settings)).Deserialize(stream);
                 if (loaded == null) throw new InvalidDataException("设置文件内容为空。");
                 if (loaded.Scale > 1.5 && loaded.Scale <= 2) loaded.Scale = 1.5; // Preserve existing settings from the former range.
-                if (loaded.HoverDragSeconds < 1 || loaded.HoverDragSeconds > 3) loaded.HoverDragSeconds = 1;
                 loaded.HoverEffect = HoverEffects.Normalize(loaded.HoverEffect);
-                // Previously a disabled lunch could retain an invalid range. Repair only
-                // that unused range, rather than rejecting the entire settings file.
-                if (!loaded.LunchEnabled)
-                {
-                    try
-                    {
-                        if (Logic.Time(loaded.LunchEnd) <= Logic.Time(loaded.LunchStart)) throw new FormatException();
-                    }
-                    catch (FormatException) { loaded.LunchStart = "12:00"; loaded.LunchEnd = "13:00"; }
-                }
-                // Repair a missing alternating-week anchor instead of rejecting
-                // the whole settings file (which would reset every preference).
-                if (loaded.AlternatingWeekends &&
-                    (!DateTime.TryParseExact(loaded.DoubleRestWeekStart, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime weekAnchor) ||
-                     weekAnchor.DayOfWeek != DayOfWeek.Monday))
-                    loaded.DoubleRestWeekStart = Logic.WeekStart(DateTime.Today).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                Logic.Repair(loaded);
                 // Existing wish pools keep the current cycle's progress, then never
                 // drop back when the next payday arrives.
-                bool wishAnchorRepaired = false;
                 if (loaded.WishEnabled &&
                     !DateTime.TryParseExact(loaded.WishStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
                 {
                     loaded.WishStartDate = Logic.CurrentPayCycleStart(DateTime.Today, loaded).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
                     wishAnchorRepaired = true;
                 }
-                Logic.Repair(loaded);
                 Logic.Validate(loaded);
                 string configText = File.ReadAllText(config);
                 if (!configText.Contains("<ScaleReferenceVersion>") || loaded.ScaleReferenceVersion < 1)
@@ -350,13 +333,13 @@ public sealed class MainWindow : Window
                 }
                 if (!configText.Contains("<ShowSalaryLayout>")) loaded.ShowSalaryLayout = !loaded.HideAmount;
                 settings = loaded;
-                if (wishAnchorRepaired) Save();
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is FormatException || ex is IOException || ex is UnauthorizedAccessException || ex is OverflowException)
             {
                 try { File.Copy(config, config + ".invalid-" + DateTime.Now.ToString("yyyyMMddHHmmssfff", CultureInfo.InvariantCulture)); }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
+                wishAnchorRepaired = false;
                 settings = new Settings();
                 Debug.WriteLine("设置文件无法读取，已使用默认设置；隐私数据库保持独立。");
             }
@@ -364,7 +347,9 @@ public sealed class MainWindow : Window
         calendar = new ChinaHolidayCalendar(Path.Combine(dataFolder, "holidays"));
         settings.Calendar = calendar;
         privacy = new PrivacyStore(Path.Combine(dataFolder, "privacy.db"), settings.Salary);
+        privacy.EffectParametersChanged += QueueAmbientPreview;
         settings.Salary = privacy.LoadSalary(); settings.HideAmount = true;
+        if (wishAnchorRepaired) Save();
         emittedCoins = privacy.CoinCount;
         // Manual make-up work/rest entries only matter on their date; drop the
         // ones that have already passed so the list cleans itself up.
@@ -373,7 +358,10 @@ public sealed class MainWindow : Window
             settings.DateAdjustments.RemoveAll(a => a == null || string.CompareOrdinal(a.Date, todayKey) < 0) > 0;
         if (prunedAdjustments) Save();
         // Keep the Run entry pointing at the current install when the app moved.
-        try { StartupRegistration.RepairPathIfNeeded(); } catch { }
+        if (!smoke && isolatedDataFolder == null)
+        {
+            try { StartupRegistration.RepairPathIfNeeded(); } catch { }
+        }
         bool smokeSettings = false;
         if (smoke)
         {
@@ -569,7 +557,6 @@ public sealed class MainWindow : Window
                 StartNextReminder();
                 return;
             }
-            if (!reminderPetActive && walkingFrames != null) pet.Source = walkingFrames[(walkingFrame++) % walkingFrames.Length];
         };
         timer.Start();
         if (smokeSettings)
@@ -757,18 +744,9 @@ public sealed class MainWindow : Window
         petHost.Tapped += (_, e) => { if (!suppressPetTap) EmitCoin(); suppressPetTap = false; e.Handled = true; };
         petHost.DoubleTapped += (_, e) => { e.Handled = true; };
         pet.RenderTransformOrigin = new Point(.5, 1);
-        var petTransform = new CompositeTransform();
-        var petTransforms = new TransformGroup();
-        petTransforms.Children.Add(petTransform);
-        petTransforms.Children.Add(petClickLift);
-        pet.RenderTransform = petTransforms;
-        pet.PointerEntered += (_, __) => { if (settings.PetId != "polar-bear" && settings.PetId != "panda" && settings.PetId != "cow-cat") { petTransform.ScaleX = 1.035; petTransform.ScaleY = 1.035; } UpdatePetAnimationHover(); };
+        pet.RenderTransform = petClickLift;
+        pet.PointerEntered += (_, __) => UpdatePetAnimationHover();
         pet.PointerMoved += (_, __) => UpdatePetAnimationHover();
-        pet.PointerExited += (_, __) => { petTransform.ScaleX = 1; petTransform.ScaleY = 1; };
-        var breathe = new DoubleAnimation { From = 0, To = -2, Duration = new Duration(TimeSpan.FromSeconds(2.8)), AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever, EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut } };
-        Storyboard.SetTarget(breathe, petTransform); Storyboard.SetTargetProperty(breathe, "TranslateY");
-        petBreathing = new Storyboard(); petBreathing.Children.Add(breathe);
-        pet.Loaded += (_, __) => { if (settings.PetId != "polar-bear" && settings.PetId != "panda" && settings.PetId != "cow-cat") petBreathing.Begin(); };
     }
 
     void BuildCoinBank()
@@ -1105,7 +1083,7 @@ public sealed class MainWindow : Window
             string fullName = string.IsNullOrWhiteSpace(wish.Name) ? "小心愿" : wish.Name.Trim();
             string displayName = fullName.Length > 5 ? fullName.Substring(0, 5) + "…" : fullName;
             if (wishPageNames[i].Text != displayName) wishPageNames[i].Text = displayName;
-            string tip = fullName.Length > 5 ? fullName : null;
+            string? tip = fullName.Length > 5 ? fullName : null;
             if (!Equals(ToolTipService.GetToolTip(wishPageNames[i]), tip)) ToolTipService.SetToolTip(wishPageNames[i], tip);
             decimal target = Math.Max(0, wish.Target);
             decimal progress = i < progressByWish.Length ? progressByWish[i] : 0;
@@ -1465,18 +1443,10 @@ public sealed class MainWindow : Window
         waterPetOverlay.Visibility = Visibility.Collapsed; waterPetOverlay.Source = null; pet.Opacity = 1;
         petAnimation?.Dispose(); petAnimation = null;
         petHoverTimer?.Stop();
-        walkingFrames = null;
         bool polar = settings.PetId == "polar-bear";
         pet.Source = new BitmapImage(new Uri("ms-appx:///assets/" + (polar ? "polar-bear-idle" : settings.PetId) + ".png"));
-        if (polar || settings.PetId == "panda" || settings.PetId == "cow-cat")
-        {
-            petBreathing?.Stop();
-            if (pet.RenderTransform is TransformGroup group && group.Children[0] is CompositeTransform transform)
-            { transform.ScaleX = transform.ScaleY = 1; transform.TranslateY = 0; }
-            _ = LoadPetAnimationAsync(revision, settings.PetId);
-            if (polar) _ = LoadCoinPetAnimationAsync(revision);
-        }
-        else if (pet.IsLoaded) petBreathing?.Begin();
+        _ = LoadPetAnimationAsync(revision, settings.PetId);
+        if (polar) _ = LoadCoinPetAnimationAsync(revision);
     }
 
     async Task LoadPetAnimationAsync(int revision, string petId)
@@ -2468,7 +2438,7 @@ public sealed class MainWindow : Window
         reminderUntil = DateTime.Now.AddSeconds(reminderDue == 3 ? 22 : 20);
         if (settings.ReminderPopup) ShowReminderPopup(reminderDue);
         GlassProfile.Event("pet-reminder-queued-start " + reminderDue);
-        _ = StartWalk();
+        _ = StartReminderAnimation();
     }
 
     static (string Title, string Message, string Body) ReminderText(int due) => due == 3
@@ -2669,8 +2639,8 @@ public sealed class MainWindow : Window
         int marginX = Math.Min(20, area.Width - width), marginY = Math.Min(20, area.Height - height);
         int left = area.X + marginX, right = area.X + area.Width - width - marginX;
         int top = area.Y + marginY, bottom = area.Y + area.Height - height - marginY;
-        int x = position switch { "top-left" or "bottom-left" => left, "top-right" or "bottom-right" => right, _ => area.X + (area.Width - width) / 2 };
-        int y = position switch { "top-left" or "top-right" => top, "bottom-left" or "bottom-right" => bottom, _ => area.Y + (area.Height - height) / 2 };
+        int x = position switch { "top-left" or "center-left" or "bottom-left" => left, "top-right" or "center-right" or "bottom-right" => right, _ => area.X + (area.Width - width) / 2 };
+        int y = position switch { "top-left" or "top-center" or "top-right" => top, "bottom-left" or "bottom-center" or "bottom-right" => bottom, _ => area.Y + (area.Height - height) / 2 };
         return new RectInt32(x, y, width, height);
     }
 
@@ -2679,35 +2649,17 @@ public sealed class MainWindow : Window
         reminderPopup?.AppWindow.Hide();
     }
 
-    async Task StartWalk()
+    Task StartReminderAnimation()
     {
-        if (settings.PetId == "polar-bear") { await StartPolarReminder(reminderDue); return; }
-        if (settings.PetId == "panda" || settings.PetId == "cow-cat")
-        {
-            reminderPetActive = true; walkingFrames = null;
-            petHoverTimer?.Stop(); petAnimation?.PlayOnce();
-            walkTimer.Stop(); walkTimer.Start();
-            return;
-        }
-        try
-        {
-            string petId = settings.PetId;
-            string path = Path.Combine(AppContext.BaseDirectory, "assets", petId + "-walk.png");
-            var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
-            using var stream = await file.OpenAsync(Windows.Storage.FileAccessMode.Read);
-            var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(stream);
-            var frames = new Microsoft.UI.Xaml.Media.ImageSource[4];
-            for (uint i = 0; i < 4; i++)
-            {
-                var transform = new Windows.Graphics.Imaging.BitmapTransform { Bounds = new Windows.Graphics.Imaging.BitmapBounds { X = (i % 2) * decoder.PixelWidth / 2, Y = (i / 2) * decoder.PixelHeight / 2, Width = decoder.PixelWidth / 2, Height = decoder.PixelHeight / 2 } };
-                using var bitmap = await decoder.GetSoftwareBitmapAsync(Windows.Graphics.Imaging.BitmapPixelFormat.Bgra8, Windows.Graphics.Imaging.BitmapAlphaMode.Premultiplied, transform, Windows.Graphics.Imaging.ExifOrientationMode.IgnoreExifOrientation, Windows.Graphics.Imaging.ColorManagementMode.DoNotColorManage);
-                var source = new SoftwareBitmapSource(); await source.SetBitmapAsync(bitmap); frames[i] = source;
-            }
-            if (exiting || disposed || petId != settings.PetId) return;
-            walkingFrames = frames; walkingFrame = 0; walkTimer.Start();
-        }
-        catch (Exception ex) { Debug.WriteLine(ex.Message); }
+        if (settings.PetId == "polar-bear") return StartPolarReminder(reminderDue);
+        reminderPetActive = true;
+        petHoverTimer?.Stop();
+        petAnimation?.PlayOnce();
+        walkTimer.Stop();
+        walkTimer.Start();
+        return Task.CompletedTask;
     }
+
 
     async Task StartPolarReminder(int due)
     {
@@ -2716,7 +2668,6 @@ public sealed class MainWindow : Window
         CancelSlack(true);
         CancelPolarCoinAction(false);
         reminderPetActive = true;
-        walkingFrames = null;
         petHoverTimer?.Stop();
         petAnimation?.Stop();
         petAnimation?.ShowPoster();
@@ -3498,37 +3449,61 @@ public sealed class MainWindow : Window
 
     void ClearAmbientShopEffects()
     {
+        StopFishEffect();
         foreach (var story in ambientEffectStories) story.Stop();
         ambientEffectStories.Clear();
         ambientEffects.Children.Clear();
         ambientParticlesActive = 0;
     }
 
+    void QueueAmbientPreview()
+    {
+        if (!ambientPreviewPending) nextAmbientEffectAt = elapsed.ElapsedMilliseconds + 150;
+        ambientPreviewPending = true;
+    }
+
+    bool UsesDayEffectPalette()
+    {
+        if (!settings.AutomaticAppearance) return !settings.NightMode;
+        return glassAppearanceInitialized ? glassTargetTone < .5 :
+            uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R >= 128;
+    }
+
+
     void ShowAmbientShopEffect()
     {
         if (disposed || exiting || !uiSettings.AnimationsEnabled || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
         int selectedEffect = privacy.SelectedEffect;
-        if (ambientEffectKind != selectedEffect)
+        bool preview = ambientPreviewPending && ambientEffectKind == selectedEffect;
+        ambientPreviewPending = false;
+        if (ambientEffectKind != selectedEffect || preview)
         {
             ClearAmbientShopEffects();
             ambientEffectKind = selectedEffect;
-            ambientBatchSize = Random.Shared.Next(1, 3);
-            ambientParticleLimit = Random.Shared.Next(6, 9);
         }
-        if (selectedEffect < 1 || selectedEffect > 5 || selectedEffect == 4 || !privacy.EffectUnlocked(selectedEffect)) return;
+        if (selectedEffect == 0 || !privacy.EffectUnlocked(selectedEffect)) return;
+        var parameters = privacy.GetEffectParameters(selectedEffect);
+        int limit = parameters.Count;
+        int cadence = selectedEffect == 1 ? 320 : selectedEffect is 10 or 11 ? 420 : 850;
+        nextAmbientEffectAt = elapsed.ElapsedMilliseconds + (long)(cadence / parameters.Speed);
         double cardWidth = surface.Width / PhysicalScale;
         double cardHeight = surface.Height / PhysicalScale;
         if (cardWidth < 32 || cardHeight < 32 || surface.XamlRoot == null) return;
-        int particleCount = Math.Min(ambientBatchSize, Math.Max(0, ambientParticleLimit - ambientParticlesActive));
+        if (selectedEffect == FishShopEffect)
+        {
+            StartFishEffect(parameters, cardWidth, cardHeight);
+            return;
+        }
+        int batchTarget = (limit + 2) / 3;
+        int particleCount = Math.Min(batchTarget, Math.Max(0, limit - ambientParticlesActive));
         if (particleCount == 0) return;
-        ambientBatchSize = Math.Min(ambientParticleLimit, ambientBatchSize + Random.Shared.Next(1, 3));
         var storyboard = new Storyboard();
         void Motion(DependencyObject target, string property, params (int At, double Value, EasingMode? Ease)[] keys)
         {
             var motion = new DoubleAnimationUsingKeyFrames();
             foreach (var key in keys)
             {
-                var frame = new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(key.At)), Value = key.Value };
+                var frame = new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(key.At / parameters.Speed)), Value = key.Value };
                 if (key.Ease is EasingMode ease) frame.EasingFunction = new QuadraticEase { EasingMode = ease };
                 motion.KeyFrames.Add(frame);
             }
@@ -3536,25 +3511,102 @@ public sealed class MainWindow : Window
             storyboard.Children.Add(motion);
         }
         var effectVisuals = new System.Collections.Generic.List<UIElement>(particleCount);
-        bool lightEffectBackground = textAppearanceInitialized ? lightness < .5 :
-            uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R >= 128;
-        double peakOpacity = lightEffectBackground ? .95 : .68;
-        double holdOpacity = lightEffectBackground ? .86 : .62;
-        if (selectedEffect == 1)
+        bool lightEffectBackground = UsesDayEffectPalette();
+        double peakOpacity = (lightEffectBackground ? .95 : .68) * parameters.Opacity / 100;
+        double holdOpacity = (lightEffectBackground ? .86 : .62) * parameters.Opacity / 100;
+        string daySuffix = lightEffectBackground ? "-day" : "";
+        double wind = parameters.Wind * 18;
+        Image Sprite(string name, double width, double height, double x, double y, out CompositeTransform transform)
+        {
+            if (!ambientSprites.TryGetValue(name, out var source))
+                ambientSprites[name] = source = new BitmapImage(new Uri("ms-appx:///assets/shop-effects/" + name + ".png"));
+            transform = new CompositeTransform();
+            var image = new Image { Width = width, Height = height, Stretch = Stretch.Fill, Source = source,
+                IsHitTestVisible = false, Opacity = 0, RenderTransformOrigin = new Point(.5, .5), RenderTransform = transform };
+            Canvas.SetLeft(image, x); Canvas.SetTop(image, y);
+            ambientEffects.Children.Add(image); effectVisuals.Add(image);
+            return image;
+        }
+        int Delay(int index) => index * Math.Min(150, cadence / Math.Max(1, particleCount)) + Random.Shared.Next(15, 70);
+        if (selectedEffect == 13)
+        {
+            // Animate each link from its two moving endpoints. A nearest-neighbour
+            // link per node keeps the graph sparse at the maximum particle count.
+            var nodes = new (double X, double Y, double Dx, double Dy, int Delay)[particleCount];
+            int end = 4600;
+            double range = Math.Min(cardWidth, cardHeight) * .38;
+            var linkBrush = new SolidColorBrush(lightEffectBackground
+                ? Windows.UI.Color.FromArgb(255, 36, 104, 155) : Windows.UI.Color.FromArgb(255, 125, 211, 252));
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                double x = 6 + Random.Shared.NextDouble() * (cardWidth - 12);
+                double y = 6 + Random.Shared.NextDouble() * (cardHeight - 12);
+                if (i % 4 != 0)
+                {
+                    var origin = nodes[i - 1];
+                    double angle = Random.Shared.NextDouble() * Math.PI * 2;
+                    double distance = range * (.36 + Random.Shared.NextDouble() * .55);
+                    x = Math.Clamp(origin.X + Math.Cos(angle) * distance, 5, cardWidth - 5);
+                    y = Math.Clamp(origin.Y + Math.Sin(angle) * distance, 5, cardHeight - 5);
+                }
+                int delay = Delay(i);
+                double dx = Math.Clamp(wind + Random.Shared.Next(-7, 8), 4 - x, cardWidth - 4 - x);
+                double dy = Math.Clamp(Random.Shared.Next(-7, 8), 4 - y, cardHeight - 4 - y);
+                nodes[i] = (x, y, dx, dy, delay);
+                double size = (8 + Random.Shared.NextDouble() * 4) * parameters.Size;
+                var node = Sprite("const-node" + daySuffix, size, size, x - size / 2, y - size / 2, out var glow);
+                Motion(glow, "TranslateX", (0, 0, null), (end, dx, null));
+                Motion(glow, "TranslateY", (0, 0, null), (end, dy, null));
+                Motion(node, "Opacity", (delay, 0, null), (delay + 450, peakOpacity, null),
+                    (end / 2, holdOpacity * .65, null), (end - 650, peakOpacity, null), (end, 0, null));
+                int nearest = -1;
+                double length = range;
+                for (int j = 0; j < i; j++)
+                {
+                    double vx = nodes[j].X - x, vy = nodes[j].Y - y;
+                    double distance = Math.Sqrt(vx * vx + vy * vy);
+                    if (distance < 12 || distance >= length) continue;
+                    length = distance; nearest = j;
+                }
+                if (nearest < 0) continue;
+                var other = nodes[nearest];
+                double vx0 = other.X - x, vy0 = other.Y - y;
+                double vx1 = vx0 + other.Dx - dx, vy1 = vy0 + other.Dy - dy;
+                double angle0 = Math.Atan2(vy0, vx0) * 180 / Math.PI;
+                double angle1 = Math.Atan2(vy1, vx1) * 180 / Math.PI;
+                angle1 = angle0 + Math.IEEERemainder(angle1 - angle0, 360);
+                double endLength = Math.Sqrt(vx1 * vx1 + vy1 * vy1);
+                var follow = new CompositeTransform();
+                var edge = new Border { Width = length, Height = .85 * parameters.Size, Background = linkBrush,
+                    Opacity = 0, IsHitTestVisible = false, RenderTransform = follow, RenderTransformOrigin = new Point(0, .5) };
+                Canvas.SetLeft(edge, x); Canvas.SetTop(edge, y - edge.Height / 2);
+                ambientEffects.Children.Insert(0, edge); effectVisuals.Add(edge);
+                Motion(follow, "TranslateX", (0, 0, null), (end, dx, null));
+                Motion(follow, "TranslateY", (0, 0, null), (end, dy, null));
+                Motion(follow, "Rotation", (0, angle0, null), (end, angle1, null));
+                Motion(follow, "ScaleX", (0, 1, null), (end, endLength / length, null));
+                int bothVisible = Math.Max(delay, other.Delay);
+                double strength = peakOpacity * .55;
+                Motion(edge, "Opacity", (bothVisible, 0, null), (bothVisible + 450, strength * (1 - length / range), null),
+                    (end - 650, strength * Math.Max(0, 1 - endLength / range), null), (end, 0, null));
+            }
+        }
+        else if (selectedEffect == 1)
         {
             for (int i = 0; i < particleCount; i++)
             {
-                double size = (lightEffectBackground ? 11 : 10) + Random.Shared.NextDouble() * 3;
-                var star = CreateShopEffectParticle(1, size, lightEffectBackground);
+                double size = ((lightEffectBackground ? 11 : 10) + Random.Shared.NextDouble() * 3) * parameters.Size;
+                var star = CreateShopStar(size, lightEffectBackground);
                 var twinkle = new CompositeTransform();
                 star.RenderTransformOrigin = new Point(.5, .5); star.RenderTransform = twinkle;
                 Canvas.SetLeft(star, 8 + Random.Shared.NextDouble() * Math.Max(0, cardWidth - size - 16));
                 Canvas.SetTop(star, 8 + Random.Shared.NextDouble() * Math.Max(0, cardHeight - size - 16));
                 ambientEffects.Children.Add(star); effectVisuals.Add(star);
-                int delay = i * 380 + Random.Shared.Next(20, 141), end = delay + 850 + Random.Shared.Next(0, 180);
+                int delay = Delay(i), end = delay + 850 + Random.Shared.Next(0, 180);
                 int second = delay + (end - delay) * 2 / 3;
                 Motion(twinkle, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
                 Motion(twinkle, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
+                if (wind != 0) Motion(twinkle, "TranslateX", (delay, 0, null), (end, wind * .4, null));
                 Motion(star, "Opacity", (0, 0, null), (delay, 0, null), (delay + 180, peakOpacity, null),
                     (delay + 400, peakOpacity * .24, null), (second, peakOpacity * .72, null), (end, 0, EasingMode.EaseIn));
             }
@@ -3563,56 +3615,156 @@ public sealed class MainWindow : Window
         {
             for (int i = 0; i < particleCount; i++)
             {
-                double size = (selectedEffect == 2 ? 20 : 17) + Random.Shared.NextDouble() * 3;
-                var particle = CreateShopEffectParticle(selectedEffect, size, lightEffectBackground);
-                var particleTransform = new CompositeTransform();
-                particle.RenderTransformOrigin = new Point(.5, .5);
-                particle.RenderTransform = particleTransform;
-                const double fallDistance = 25;
-                double startX = 16 + Random.Shared.NextDouble() * Math.Max(0, cardWidth - size - 32);
-                double bottomMargin = 8 + (selectedEffect == 2 ? 0 : fallDistance);
-                double startY = 8 + Random.Shared.NextDouble() * Math.Max(0, cardHeight - size - 8 - bottomMargin);
-                Canvas.SetLeft(particle, startX);
-                Canvas.SetTop(particle, startY);
-                ambientEffects.Children.Add(particle); effectVisuals.Add(particle);
-                int delay = i * 380 + Random.Shared.Next(20, 141);
-                int duration = selectedEffect == 2 ? Random.Shared.Next(2600, 3401) : Random.Shared.Next(1800, 2301), end = delay + duration;
-                double drift = (i == 0 ? -1 : 1) * (7 + Random.Shared.NextDouble() * 5);
-                if (selectedEffect == 2)
+                bool warm = selectedEffect == 2, leaf = selectedEffect is 5 or 7;
+                bool firefly = selectedEffect == 8, aurora = selectedEffect == 9, rain = selectedEffect == 10;
+                bool ember = selectedEffect == 12, foil = selectedEffect == 14;
+                double kind = Random.Shared.NextDouble();
+                if (selectedEffect == 11)
                 {
-                    double RandomX() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startX, cardWidth - size - 4 - startX);
-                    double RandomY() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startY, cardHeight - size - 4 - startY);
-                    double x1 = RandomX(), x2 = RandomX(), x3 = RandomX();
-                    double y1 = RandomY(), y2 = RandomY(), y3 = RandomY();
-                    Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null),
-                        (delay + duration / 3, x1, EasingMode.EaseInOut), (delay + duration * 2 / 3, x2, EasingMode.EaseInOut), (end, x3, EasingMode.EaseInOut));
-                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null),
-                        (delay + duration / 3, y1, EasingMode.EaseInOut), (delay + duration * 2 / 3, y2, EasingMode.EaseInOut), (end, y3, EasingMode.EaseInOut));
+                    double length = (52 + kind * 39) * parameters.Size;
+                    double meteorX = cardWidth * (.3 + Random.Shared.NextDouble() * .74);
+                    double meteorY = cardHeight * (.02 + Random.Shared.NextDouble() * .4);
+                    double fallX = -cardWidth * (.32 + Random.Shared.NextDouble() * .25) + wind;
+                    double fallY = cardHeight * (.28 + Random.Shared.NextDouble() * .2);
+                    var meteor = Sprite((Random.Shared.NextDouble() < .32 ? "meteor-gold" : "meteor-ice") + daySuffix,
+                        length, length / 6, meteorX - length / 12, meteorY - length / 12, out var flight);
+                    meteor.RenderTransformOrigin = new Point(1d / 12, .5);
+                    flight.Rotation = Math.Atan2(-fallY, -fallX) * 180 / Math.PI;
+                    int appear = Delay(i), finish = appear + Random.Shared.Next(700, 1101);
+                    Motion(flight, "TranslateX", (appear, 0, null), (finish, fallX, null));
+                    Motion(flight, "TranslateY", (appear, 0, null), (finish, fallY, null));
+                    Motion(meteor, "Opacity", (appear, 0, null), (appear + 150, peakOpacity, null),
+                        (finish - 220, holdOpacity, null), (finish, 0, EasingMode.EaseIn));
+                    continue;
                 }
-                else
+                if (selectedEffect == 15)
                 {
-                    Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null), (delay + duration / 2, drift, EasingMode.EaseInOut), (end, drift * .4, EasingMode.EaseInOut));
-                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null), (end, fallDistance, EasingMode.EaseOut));
+                    const string glyphs = "01アイウエオカキクケコサシスセソ∑∆Ω79";
+                    double fontSize = (8 + kind * 3) * parameters.Size;
+                    int chars = Random.Shared.Next(4, 8);
+                    var flow = new TranslateTransform();
+                    var stream = new TextBlock { FontFamily = new FontFamily("Consolas"), FontSize = fontSize,
+                        IsTextScaleFactorEnabled = false, LineHeight = fontSize * 1.15, Opacity = 0, IsHitTestVisible = false,
+                        TextAlignment = TextAlignment.Center, RenderTransform = flow };
+                    var green = lightEffectBackground ? Windows.UI.Color.FromArgb(255, 6, 101, 80) : Windows.UI.Color.FromArgb(255, 52, 211, 153);
+                    int appear = Delay(i), finish = appear + Random.Shared.Next(1800, 2701);
+                    for (int k = 0; k < chars; k++)
+                    {
+                        if (k > 0) stream.Inlines.Add(new Microsoft.UI.Xaml.Documents.LineBreak());
+                        bool head = k == chars - 1;
+                        var tint = head ? (lightEffectBackground ? Windows.UI.Color.FromArgb(255, 0, 105, 75) : Windows.UI.Color.FromArgb(255, 236, 253, 245)) :
+                            Windows.UI.Color.FromArgb((byte)(190 * (k + 1) / chars), green.R, green.G, green.B);
+                        var rune = new Microsoft.UI.Xaml.Documents.Run { Text = glyphs[Random.Shared.Next(glyphs.Length)].ToString(), Foreground = new SolidColorBrush(tint) };
+                        stream.Inlines.Add(rune);
+                        if (head)
+                        {
+                            var swap = new ObjectAnimationUsingKeyFrames();
+                            for (int tick = appear + 260; tick < finish; tick += 280)
+                                swap.KeyFrames.Add(new DiscreteObjectKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(tick / parameters.Speed)),
+                                    Value = glyphs[Random.Shared.Next(glyphs.Length)].ToString() });
+                            Storyboard.SetTarget(swap, rune); Storyboard.SetTargetProperty(swap, "Text"); storyboard.Children.Add(swap);
+                        }
+                    }
+                    double x = 4 + Random.Shared.NextDouble() * (cardWidth - fontSize - 6);
+                    double y = Random.Shared.NextDouble() * cardHeight * .5 - chars * stream.LineHeight;
+                    Canvas.SetLeft(stream, x); Canvas.SetTop(stream, y);
+                    ambientEffects.Children.Add(stream); effectVisuals.Add(stream);
+                    Motion(flow, "X", (appear, 0, null), (finish, wind * .45, null));
+                    Motion(flow, "Y", (appear, 0, null), (finish, cardHeight - y, null));
+                    Motion(stream, "Opacity", (appear, 0, null), (appear + 200, peakOpacity, null),
+                        (finish - 240, holdOpacity, null), (finish, 0, null));
+                    continue;
                 }
-                Motion(particleTransform, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
-                Motion(particleTransform, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
-                if (selectedEffect == 2)
-                    Motion(particle, "Opacity", (0, 0, null), (delay, 0, null), (delay + 300, .95, null),
-                        (delay + 750, .58, null), (delay + 1200, .95, null),
-                        (delay + duration * 2 / 3, .65, null), (end - 250, .9, null), (end, 0, EasingMode.EaseIn));
+                string sprite = selectedEffect switch
+                {
+                    2 => kind < .5 ? "warm-gold" : "warm-amber",
+                    7 => kind < .5 ? "sakura-pink" : "sakura-pale",
+                    8 => kind < .65 ? "firefly-lime" : "firefly-amber",
+                    9 => "aurora-star",
+                    10 => "rain-drop",
+                    12 => kind < .45 ? "ember-glow" : "ember-hot",
+                    14 => kind < .24 ? "gold-glint" : "gold-flake",
+                    5 => kind < .36 ? "maple-red" : kind < .70 ? "maple-amber" : "ginkgo",
+                    _ => (kind < .42 ? "snow-soft" : "snow-crystal") + daySuffix
+                };
+                if (!leaf && selectedEffect != 3) sprite += daySuffix;
+                double size = ((ember ? 9 : foil ? 15 : warm ? 14 : leaf ? 19 : firefly ? 14 : aurora ? 8 : rain ? 16 : kind < .42 ? 8 : 16) + Random.Shared.NextDouble() * 6) * parameters.Size;
+                double travel = Math.Min(Math.Max(0, cardHeight - size - 12), (warm ? 22 : 38) + Random.Shared.NextDouble() * 16);
+                double startX = 12 + Random.Shared.NextDouble() * Math.Max(0, cardWidth - size - 24);
+                double startY = 6 + Random.Shared.NextDouble() * Math.Max(0, cardHeight - size - travel - 12) + (warm ? travel : 0);
+                if (ember)
+                {
+                    travel = cardHeight * (.45 + Random.Shared.NextDouble() * .32);
+                    startY = cardHeight - size - Random.Shared.NextDouble() * cardHeight * .18;
+                }
+                int delay = Delay(i);
+                if (rain)
+                {
+                    double landingY = Math.Max(size, cardHeight - 10 - Random.Shared.NextDouble() * 8);
+                    double distance = Math.Max(1, landingY - startY - size * .8);
+                    double shift = Math.Clamp(distance * parameters.Wind * .22, 4 - startX, Math.Max(4 - startX, cardWidth - size - startX - 4));
+                    var drop = Sprite(sprite, size, size, startX, startY, out var falling);
+                    falling.Rotation = -11 - Math.Atan2(shift, distance) * 180 / Math.PI;
+                    int impact = delay + 320 + (int)(distance * 4);
+                    Motion(falling, "TranslateX", (delay, 0, null), (impact, shift, null));
+                    Motion(falling, "TranslateY", (delay, 0, null), (impact, distance, null));
+                    Motion(drop, "Opacity", (delay, 0, null), (delay + 100, peakOpacity, null), (impact - 1, peakOpacity, null), (impact, 0, null));
+                    double width = size * 1.35;
+                    var ripple = Sprite("rain-ripple" + daySuffix, width, width, startX + shift + (size - width) / 2, landingY - width / 2, out var spread);
+                    Motion(spread, "ScaleX", (impact, .15, null), (impact + 600, 1, EasingMode.EaseOut));
+                    Motion(spread, "ScaleY", (impact, .15, null), (impact + 600, 1, EasingMode.EaseOut));
+                    Motion(ripple, "Opacity", (impact, 0, null), (impact + 75, holdOpacity, null), (impact + 600, 0, null));
+                    continue;
+                }
+                int duration = Random.Shared.Next(3200, 4601), end = delay + duration, mid = delay + duration / 2;
+                if (ember && i == 0 && !ambientEffects.Children.OfType<Border>().Any(element => element.Name == "EmberHearth"))
+                {
+                    var gradient = new LinearGradientBrush { StartPoint = new Point(.5, 1), EndPoint = new Point(.5, 0) };
+                    gradient.GradientStops.Add(new GradientStop { Offset = 0, Color = Windows.UI.Color.FromArgb(lightEffectBackground ? (byte)40 : (byte)60, 234, 88, 12) });
+                    gradient.GradientStops.Add(new GradientStop { Offset = .45, Color = Windows.UI.Color.FromArgb(20, 245, 158, 11) });
+                    gradient.GradientStops.Add(new GradientStop { Offset = 1, Color = Windows.UI.Color.FromArgb(0, 245, 158, 11) });
+                    var hearth = new Border { Name = "EmberHearth", Width = cardWidth, Height = cardHeight * .55, Background = gradient,
+                        Opacity = 0, IsHitTestVisible = false };
+                    Canvas.SetTop(hearth, cardHeight - hearth.Height);
+                    ambientEffects.Children.Insert(0, hearth); effectVisuals.Add(hearth);
+                    Motion(hearth, "Opacity", (0, 0, null), (450, peakOpacity, null), (end - 500, holdOpacity, null), (end, 0, null));
+                }
+                if (aurora && i == 0 && !ambientEffects.Children.OfType<Image>().Any(image => image.Name == "AuroraCurtain"))
+                {
+                    var wave = Sprite(lightEffectBackground ? "aurora-wave-day" : "aurora-wave-night", cardWidth * .9, cardHeight * .65, cardWidth * .05, cardHeight * .08, out var curtain);
+                    wave.Name = "AuroraCurtain";
+                    Motion(curtain, "TranslateX", (0, -4, null), (end, 4 + wind * .2, EasingMode.EaseInOut));
+                    Motion(curtain, "ScaleY", (0, .75, null), (mid, 1, EasingMode.EaseInOut), (end, .88, EasingMode.EaseInOut));
+                    Motion(wave, "Opacity", (0, 0, null), (delay + 600, parameters.Opacity / 100d, null), (end - 800, parameters.Opacity / 100d, null), (end, 0, null));
+                }
+                var particle = Sprite(sprite, size, size, startX, startY, out var particleTransform);
+                double drift = (Random.Shared.Next(2) == 0 ? -1 : 1) * (5 + Random.Shared.NextDouble() * 6);
+                Motion(particleTransform, "TranslateX", (delay, 0, null), (mid, drift + wind * .5, EasingMode.EaseInOut), (end, -drift * .45 + wind, EasingMode.EaseInOut));
+                if (firefly)
+                    Motion(particleTransform, "TranslateY", (delay, 0, null), (mid, drift, EasingMode.EaseInOut), (end, -drift * .7, EasingMode.EaseInOut));
                 else
-                    Motion(particle, "Opacity", (0, 0, null), (delay, 0, null), (delay + 250, peakOpacity, null), (delay + duration * 2 / 3, holdOpacity, null), (end, 0, EasingMode.EaseIn));
+                    Motion(particleTransform, "TranslateY", (delay, 0, null), (end, (warm || ember) ? -travel : aurora ? 3 : travel, null));
+                if (!warm && !ember && !firefly && !aurora)
+                {
+                    double angle = Random.Shared.Next(-55, 56);
+                    Motion(particleTransform, "Rotation", (delay, angle, null), (end, angle + Math.Sign(drift) * (foil ? 170 : leaf ? 115 : 45), null));
+                    if (leaf || foil) Motion(particleTransform, "ScaleX", (delay, 1, null), (mid, foil ? .18 : .34, EasingMode.EaseInOut), (end, .94, EasingMode.EaseInOut));
+                }
+                Motion(particle, "Opacity", (0, 0, null), (delay, 0, null), (delay + 440, peakOpacity, null),
+                    (mid, firefly || ember ? holdOpacity * .12 : warm || aurora || foil ? holdOpacity * .55 : holdOpacity, EasingMode.EaseInOut),
+                    (end - 620, holdOpacity, EasingMode.EaseInOut), (end, 0, EasingMode.EaseInOut));
             }
         }
-        ambientParticlesActive += effectVisuals.Count;
+        ambientParticlesActive += particleCount;
         storyboard.Completed += (_, __) =>
         {
             if (!ambientEffectStories.Remove(storyboard)) return;
             foreach (var visual in effectVisuals) ambientEffects.Children.Remove(visual);
-            ambientParticlesActive -= effectVisuals.Count;
+            ambientParticlesActive -= particleCount;
         };
         ambientEffectStories.Add(storyboard);
         storyboard.Begin();
+        if (preview) storyboard.Seek(TimeSpan.FromMilliseconds(380 / parameters.Speed));
     }
 
     void EmitCoin()
@@ -3768,59 +3920,17 @@ public sealed class MainWindow : Window
         petClickAnimation = new Storyboard(); petClickAnimation.Children.Add(lift); petClickAnimation.Begin();
     }
 
-    static FrameworkElement CreateShopEffectParticle(int effect, double size, bool lightBackground)
+    static FrameworkElement CreateShopStar(double size, bool lightBackground)
     {
         var canvas = new Canvas { Width = 20, Height = 20, IsHitTestVisible = false };
-        var tint = lightBackground
-            ? (effect == 1 ? Windows.UI.Color.FromArgb(255, 171, 105, 28) :
-               effect == 2 ? Windows.UI.Color.FromArgb(255, 139, 112, 25) :
-               effect == 5 ? Windows.UI.Color.FromArgb(255, 156, 94, 32) : Windows.UI.Color.FromArgb(255, 51, 124, 153))
-            : (effect == 1 ? Windows.UI.Color.FromArgb(255, 255, 224, 157) :
-               effect == 2 ? Windows.UI.Color.FromArgb(255, 236, 232, 151) :
-               effect == 5 ? Windows.UI.Color.FromArgb(255, 255, 210, 142) : Windows.UI.Color.FromArgb(255, 184, 220, 235));
+        var tint = lightBackground ? Windows.UI.Color.FromArgb(255, 171, 105, 28) : Windows.UI.Color.FromArgb(255, 255, 224, 157);
         var glow = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
         glow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(85, tint.R, tint.G, tint.B), Offset = 0 });
         glow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, tint.R, tint.G, tint.B), Offset = 1 });
         canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 20, Height = 20, Fill = glow });
-        if (effect == 1)
-        {
-            var star = new Microsoft.UI.Xaml.Shapes.Polygon { Points = new PointCollection(), Fill = new SolidColorBrush(tint), Stroke = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(230, 111, 63, 12) : Windows.UI.Color.FromArgb(190, 128, 82, 30)), StrokeThickness = .8 };
-            foreach (var point in new[] { new Point(10, 2.7), new Point(11.6, 8.2), new Point(17.3, 10), new Point(11.6, 11.8), new Point(10, 17.3), new Point(8.4, 11.8), new Point(2.7, 10), new Point(8.4, 8.2) }) star.Points.Add(point);
-            canvas.Children.Add(star);
-        }
-        else if (effect == 2)
-        {
-            var fireflyGlow = new RadialGradientBrush { Center = new Point(.5, .5), GradientOrigin = new Point(.5, .5), RadiusX = .5, RadiusY = .5 };
-            fireflyGlow.GradientStops.Add(new GradientStop { Color = lightBackground ? Windows.UI.Color.FromArgb(200, 179, 132, 32) : Windows.UI.Color.FromArgb(230, 255, 226, 132), Offset = 0 });
-            fireflyGlow.GradientStops.Add(new GradientStop { Color = lightBackground ? Windows.UI.Color.FromArgb(90, 193, 145, 46) : Windows.UI.Color.FromArgb(115, 255, 205, 94), Offset = .38 });
-            fireflyGlow.GradientStops.Add(new GradientStop { Color = Windows.UI.Color.FromArgb(0, 255, 214, 126), Offset = 1 });
-            canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 20, Height = 20, Fill = fireflyGlow });
-            var core = new Microsoft.UI.Xaml.Shapes.Ellipse { Width = 4.5, Height = 4.5,
-                Fill = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(255, 149, 103, 20) : Windows.UI.Color.FromArgb(255, 255, 246, 202)) };
-            Canvas.SetLeft(core, 7.75); Canvas.SetTop(core, 7.75); canvas.Children.Add(core);
-        }
-        else if (effect == 3)
-        {
-            var snowBrush = new SolidColorBrush(tint);
-            for (int arm = 0; arm < 6; arm++)
-            {
-                double angle = arm * Math.PI / 3, dx = Math.Sin(angle), dy = -Math.Cos(angle);
-                double px = -dy, py = dx;
-                void SnowLine(double x1, double y1, double x2, double y2) => canvas.Children.Add(
-                    new Microsoft.UI.Xaml.Shapes.Line { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2,
-                        Stroke = snowBrush, StrokeThickness = 1.15, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round });
-                SnowLine(10, 10, 10 + dx * 7, 10 + dy * 7);
-                SnowLine(10 + dx * 4.7, 10 + dy * 4.7, 10 + dx * 3 + px * 1.7, 10 + dy * 3 + py * 1.7);
-                SnowLine(10 + dx * 4.7, 10 + dy * 4.7, 10 + dx * 3 - px * 1.7, 10 + dy * 3 - py * 1.7);
-            }
-        }
-        else if (effect == 5)
-        {
-            var leaf = new Microsoft.UI.Xaml.Shapes.Polygon { Points = new PointCollection(), Fill = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(255, 156, 94, 32) : Windows.UI.Color.FromArgb(255, 238, 169, 75)) };
-            foreach (var point in new[] { new Point(4, 15), new Point(5, 9), new Point(9, 5), new Point(16, 4), new Point(15, 11), new Point(11, 15) }) leaf.Points.Add(point);
-            canvas.Children.Add(leaf);
-            canvas.Children.Add(new Microsoft.UI.Xaml.Shapes.Line { X1 = 5, Y1 = 15, X2 = 14, Y2 = 6, Stroke = new SolidColorBrush(Windows.UI.Color.FromArgb(210, 255, 232, 178)), StrokeThickness = 1 });
-        }
+        var star = new Microsoft.UI.Xaml.Shapes.Polygon { Points = new PointCollection(), Fill = new SolidColorBrush(tint), Stroke = new SolidColorBrush(lightBackground ? Windows.UI.Color.FromArgb(230, 111, 63, 12) : Windows.UI.Color.FromArgb(190, 128, 82, 30)), StrokeThickness = .8 };
+        foreach (var point in new[] { new Point(10, 2.7), new Point(11.6, 8.2), new Point(17.3, 10), new Point(11.6, 11.8), new Point(10, 17.3), new Point(8.4, 11.8), new Point(2.7, 10), new Point(8.4, 8.2) }) star.Points.Add(point);
+        canvas.Children.Add(star);
         return new Viewbox { Width = size, Height = size, Stretch = Stretch.Uniform, Child = canvas, IsHitTestVisible = false, Opacity = 0 };
     }
 
@@ -5492,12 +5602,19 @@ public sealed class MainWindow : Window
                 if (revision < System.Threading.Volatile.Read(ref saveRevision)) return;
                 string path = Path.Combine(folder, "settings.xml");
                 string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                using (var writer = new StreamWriter(temp, false, new System.Text.UTF8Encoding(true)))
+                try
                 {
-                    new XmlSerializer(typeof(Settings)).Serialize(writer, snapshot);
+                    using (var writer = new StreamWriter(temp, false, new System.Text.UTF8Encoding(true)))
+                        new XmlSerializer(typeof(Settings)).Serialize(writer, snapshot);
+                    if (File.Exists(path)) File.Replace(temp, path, null);
+                    else File.Move(temp, path);
                 }
-                if (File.Exists(path)) File.Replace(temp, path, null);
-                else File.Move(temp, path);
+                finally
+                {
+                    try { File.Delete(temp); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
             }
         }
         catch (Exception ex)
@@ -5581,7 +5698,6 @@ public sealed class MainWindow : Window
         reminderAnimation?.Dispose(); reminderAnimation = null;
         CloseReminderPopup();
         reminderPetActive = false; pendingReminders = reminderDue = 0;
-        petBreathing?.Stop();
 
         layoutTransitionActive = false; layoutTransitionClock.Stop(); CompositionTarget.Rendering -= AnimateLayoutTransition;
         timer?.Stop();
@@ -5605,6 +5721,7 @@ public sealed class MainWindow : Window
         statsAppearanceClock.Stop(); textAppearanceClock.Stop(); glassAppearanceClock.Stop();
         stats.Background = null;
         glass.Dispose();
+        privacy.EffectParametersChanged -= QueueAmbientPreview;
         privacy.Dispose();
         GlassProfile.Shutdown();
     }

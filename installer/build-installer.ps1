@@ -27,9 +27,17 @@ foreach ($required in @('OffWorkWidget.WinUI.exe','OffWorkWidget.WinUI.dll','App
 }
 # WinUI ships MUI files for every Windows language. Keep Chinese, English and the app assets only.
 $keepDirs = @('assets','Microsoft.UI.Xaml','en-us','zh-CN','zh-TW')
-Get-ChildItem -LiteralPath $PayloadDir -Directory | Where-Object {
-    $_.Name -notin $keepDirs -and (Get-ChildItem -LiteralPath $_.FullName -Filter *.mui -File -Recurse -ErrorAction SilentlyContinue)
-} | Remove-Item -Recurse -Force
+$payloadPrefix = $PayloadDir.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+foreach ($directory in (Get-ChildItem -LiteralPath $PayloadDir -Directory)) {
+    if ($directory.Name -in $keepDirs -or $directory.Name -notmatch '^[a-z]{2,3}(-[a-z0-9]{2,8})+$' -or
+        ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+    $entries = @(Get-ChildItem -LiteralPath $directory.FullName -Force)
+    if ($entries.Count -eq 0 -or ($entries | Where-Object { $_.PSIsContainer -or $_.Extension -ne '.mui' })) { continue }
+    $target = (Resolve-Path -LiteralPath $directory.FullName).Path
+    if (!$target.StartsWith($payloadPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "语言资源目录不在发布目录下：$target" }
+    foreach ($entry in $entries) { Remove-Item -LiteralPath $entry.FullName -Force }
+    [IO.Directory]::Delete($target)
+}
 # The VC++ runtime is app-local; the old redist payload is no longer installed.
 $legacyRedist = Join-Path $PayloadDir 'prerequisites\VC_redist.x64.exe'
 if (Test-Path -LiteralPath $legacyRedist) { Remove-Item -LiteralPath $legacyRedist -Force }

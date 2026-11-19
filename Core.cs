@@ -5,7 +5,7 @@ namespace OffWorkWidget
 {
     public class DateAdjustment
     {
-        public string Date;
+        public string Date = "";
         public bool IsWorkday;
     }
     public class DayWorkTime
@@ -69,7 +69,7 @@ namespace OffWorkWidget
         public bool AutomaticAppearance = true;
         public string PetId = "polar-bear";
         public bool UseChinaHolidays = true;
-        internal ChinaHolidayCalendar Calendar;
+        internal ChinaHolidayCalendar? Calendar;
         public int RestDays = 65; // Sunday = bit 0, Saturday = bit 6.
         public int SingleRestDays = 1;
         public int DoubleRestDays = 65;
@@ -304,7 +304,8 @@ namespace OffWorkWidget
                 if(s.UseChinaHolidays && s.Calendar != null) candidates.AddRange(s.Calendar.KnownDates);
                 foreach(DateTime date in candidates) if(date >= now.Date && !WorkingDay(date,s)) nearest = Math.Min(nearest,(date - now.Date).Days);
                 return nearest == int.MaxValue ? -1 : nearest;
-            }            int limit = 7 * (1 + (s.DateAdjustments == null ? 0 : s.DateAdjustments.Count) + (s.UseChinaHolidays && s.Calendar != null ? s.Calendar.RuleCount : 0));
+            }
+            int limit = 7 * (1 + (s.DateAdjustments == null ? 0 : s.DateAdjustments.Count) + (s.UseChinaHolidays && s.Calendar != null ? s.Calendar.RuleCount : 0));
             limit = Math.Min(limit,(DateTime.MaxValue.Date - now.Date).Days + 1);
             for (int i = 0; i < limit; i++) if (!WorkingDay(now.Date.AddDays(i), s)) return i;
             return -1;
@@ -332,8 +333,9 @@ namespace OffWorkWidget
         public static DateTime CurrentPayCycleStart(DateTime now, Settings s)
         {
             DateTime currentPay = PayDate(now.Year, now.Month, s.PayDay);
+            if (now.Date >= currentPay) return currentPay;
             DateTime previous = now.AddMonths(-1);
-            return now.Date >= currentPay ? currentPay : PayDate(previous.Year, previous.Month, s.PayDay);
+            return PayDate(previous.Year, previous.Month, s.PayDay);
         }
         public static decimal EarnedSince(DateTime startDate, DateTime now, Settings s)
         {
@@ -357,9 +359,10 @@ namespace OffWorkWidget
                     pool += Math.Max(0, wish.Saved);
             return pool;
         }
-        public static decimal[] AllocateWishProgress(System.Collections.Generic.IReadOnlyList<WishEntry> wishes, string allocation, decimal pool)
+        public static decimal[] AllocateWishProgress(System.Collections.Generic.IReadOnlyList<WishEntry>? wishes, string allocation, decimal pool)
         {
-            int count = wishes?.Count ?? 0;
+            if (wishes == null) return Array.Empty<decimal>();
+            int count = wishes.Count;
             var result = new decimal[count];
             if (count == 0) return result;
             if (allocation != "split")
@@ -462,7 +465,6 @@ namespace OffWorkWidget
                     !DateTime.TryParseExact(a.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _) || !seenDates.Add(a.Date));
             }
             if (double.IsNaN(s.Scale) || double.IsInfinity(s.Scale) || s.Scale < .5 || s.Scale > 1.5) s.Scale = 1;
-            if (s.WishAllocation != "sequential" && s.WishAllocation != "split") s.WishAllocation = "sequential";
             NormalizeWishes(s);
             s.Wishes.RemoveAll(w => w == null || string.IsNullOrWhiteSpace(w.Name) || w.Target <= 0 || w.Target > 100000000 || w.Saved < 0 || w.Saved > 100000000);
             if (s.Wishes.Count > MaxWishes) s.Wishes.RemoveRange(MaxWishes, s.Wishes.Count - MaxWishes);

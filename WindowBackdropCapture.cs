@@ -267,99 +267,6 @@ internal static class WindowBackdropCapture
         return pixels;
     }
 
-    internal static bool TryGetWallpaperSlice(int screenX, int screenY, int width, int height, byte[] output, out double luminance)
-    {
-        luminance = .5;
-        if (output == null || output.Length < width * height * 4) return false;
-
-        IntPtr deskHost = GetDesktopHostHandle();
-        if (deskHost != IntPtr.Zero && GetWindowVisualBounds(deskHost, out Rect deskBounds))
-        {
-            var target = new Rect(screenX, screenY, screenX + width, screenY + height);
-            byte[]? deskSlice = CaptureWindowSlice(deskHost, deskBounds, target);
-            if (deskSlice != null && deskSlice.Length >= width * height * 4)
-            {
-                int blackCount = 0;
-                for (int i = 0; i < deskSlice.Length; i += 4)
-                {
-                    if (deskSlice[i] == 0 && deskSlice[i + 1] == 0 && deskSlice[i + 2] == 0)
-                        blackCount++;
-                }
-                if (blackCount * 2 < width * height)
-                {
-                    Buffer.BlockCopy(deskSlice, 0, output, 0, width * height * 4);
-                    for (int i = 3; i < output.Length; i += 4) output[i] = 255;
-                    double l = 0;
-                    int s = 0;
-                    for (int index = 0; index < output.Length; index += 4 * 97)
-                    {
-                        l += (output[index] * .0722 + output[index + 1] * .7152 + output[index + 2] * .2126) / 255;
-                        s++;
-                    }
-                    luminance = s == 0 ? .5 : l / s;
-                    return true;
-                }
-            }
-        }
-
-        EnsureWallpaperLoaded();
-        byte[]? wall = wallpaperPixels;
-        int wallW = wallpaperWidth, wallH = wallpaperHeight;
-        if (wall == null || wallW <= 0 || wallH <= 0 || output == null || output.Length < width * height * 4)
-            return false;
-
-        int lineBytes = width * 4;
-        for (int y = 0; y < height; y++)
-        {
-            int srcY = ((screenY + y) % wallH + wallH) % wallH;
-            int dstOffset = y * lineBytes;
-            int srcX = ((screenX % wallW) + wallW) % wallW;
-
-            if (srcX >= 0 && srcX + width <= wallW)
-            {
-                int srcOffset = (srcY * wallW + srcX) * 4;
-                Buffer.BlockCopy(wall, srcOffset, output, dstOffset, lineBytes);
-                for (int i = dstOffset + 3; i < dstOffset + lineBytes; i += 4)
-                    output[i] = 255;
-            }
-            else
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int curX = ((screenX + x) % wallW + wallW) % wallW;
-                    int srcOffset = (srcY * wallW + curX) * 4;
-                    int dOffset = dstOffset + x * 4;
-                    output[dOffset] = wall[srcOffset];
-                    output[dOffset + 1] = wall[srcOffset + 1];
-                    output[dOffset + 2] = wall[srcOffset + 2];
-                    output[dOffset + 3] = 255;
-                }
-            }
-        }
-
-        double light = 0;
-        int samples = 0;
-        for (int index = 0; index < output.Length; index += 4 * 97)
-        {
-            light += (output[index] * .0722 + output[index + 1] * .7152 + output[index + 2] * .2126) / 255;
-            samples++;
-        }
-        luminance = samples == 0 ? .5 : light / samples;
-        return true;
-    }
-
-    internal static Frame Capture(IntPtr excludedHandle)
-    {
-        if (!GetClientRect(excludedHandle, out Rect client))
-            return Failed("无法读取组件尺寸。", 0, 0, 0);
-        var origin = new Point();
-        if (!ClientToScreen(excludedHandle, ref origin))
-            return Failed("无法读取组件位置。", 0, 0, 0);
-        int width = client.Right - client.Left;
-        int height = client.Bottom - client.Top;
-        return CaptureAt(excludedHandle, origin.X, origin.Y, width, height);
-    }
-
     // Geometry-only probe: no PrintWindow, graphics device creation or pixel readback.
     internal static ulong GetLayoutStamp(IntPtr excludedHandle, int x, int y, int width, int height)
         => GetLayoutStamp(excludedHandle, x, y, width, height, out _);
@@ -396,12 +303,6 @@ internal static class WindowBackdropCapture
         !frame.PendingRegion && frame.ScreenX == x && frame.ScreenY == y &&
         frame.Width == width && frame.Height == height && CanReuseFrame(frame) &&
         frame.LayoutStamp == GetLayoutStamp(excludedHandle, x, y, width, height);
-
-    // A complete texture can bridge a moving crop request without publishing a lower-layer flash.
-    // This is a display hold only; the caller must keep requesting fresh frames during the drag.
-    internal static bool CanHoldFrameDuringDrag(Frame frame, int x, int y, int width, int height) =>
-        !frame.PendingRegion && frame.SourceWindows.Length != 0 &&
-        FrameCovers(frame, x, y, width, height) && CanReuseFrame(frame);
 
     internal static bool FrameCovers(Frame frame, int x, int y, int width, int height) =>
         frame.Success && width > 0 && height > 0 && x >= frame.ScreenX && y >= frame.ScreenY &&
@@ -1376,7 +1277,6 @@ internal static class WindowBackdropCapture
         internal int Left, Top, Right, Bottom;
         internal Rect(int left, int top, int right, int bottom) { Left = left; Top = top; Right = right; Bottom = bottom; }
     }
-    [StructLayout(LayoutKind.Sequential)] private struct Point { internal int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct BitmapInfo
     {
         internal uint Size; internal int Width, Height; internal ushort Planes, BitCount;
@@ -1390,8 +1290,6 @@ internal static class WindowBackdropCapture
     [DllImport("user32.dll")] private static extern int GetWindowRgn(IntPtr window, IntPtr region);
     [DllImport("gdi32.dll")] private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
     [DllImport("gdi32.dll")] private static extern uint GetRegionData(IntPtr region, uint size, [Out] byte[]? data);
-    [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr window, out Rect rect);
-    [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr window, ref Point point);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr window, out Rect rect);
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);

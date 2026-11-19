@@ -28,7 +28,7 @@ internal sealed class WidgetMenuWindow : Window
     readonly AccessibilitySettings accessibility = new();
     readonly UISettings systemColors = new();
     readonly bool rounded = OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
-    bool closed, shuttingDown, highContrast;
+    bool closed, shuttingDown;
     int focusIndex;
     double uiScale = 1;
 
@@ -205,7 +205,7 @@ internal sealed class WidgetMenuWindow : Window
 
     void ApplyTheme(bool dark)
     {
-        highContrast = accessibility.HighContrast;
+        bool highContrast = accessibility.HighContrast;
         surface.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
         UiTypography.Apply(surface, dark);
         Windows.UI.Color background = highContrast ? systemColors.UIElementColor(UIElementType.Window)
@@ -244,8 +244,5 @@ internal sealed class WidgetMenuWindow : Window
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Point point, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);
-    [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int width, int height);
-    [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr window, IntPtr region, bool redraw);
-    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 }

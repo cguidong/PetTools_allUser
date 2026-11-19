@@ -10,6 +10,31 @@ using System.Threading.Tasks;
 [assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 namespace OffWorkWidget
 {
+    internal readonly record struct EffectParameters(int Count, double Speed, double Size, int Opacity, double Wind)
+    {
+        internal static EffectParameters GetDefaults(int effect) => effect switch
+        {
+            1 => new(7, 1, 1, 100, 0),
+            2 => new(24, .8, 1, 80, .1),
+            3 => new(32, .8, 1, 85, .2),
+            5 => new(16, .9, 1, 88, .4),
+            7 => new(20, .9, 1, 88, .6),
+            8 => new(20, .7, 1, 90, 0),
+            9 => new(24, .8, 1, 75, .2),
+            10 => new(34, 1.2, 1, 75, -.3),
+            11 => new(8, 1, 1, 92, 0),
+            12 => new(28, 1, 1, 90, .2),
+            13 => new(22, .8, 1, 82, 0),
+            14 => new(22, .8, 1, 86, .3),
+            15 => new(18, 1, 1, 72, 0),
+            16 => new(9, .9, 1, 92, 0),
+            _ => throw new ArgumentOutOfRangeException(nameof(effect))
+        };
+
+        internal bool IsValid => Count is >= 6 and <= 55 && Speed is >= .3 and <= 2.2 &&
+            Size is >= .5 and <= 1.8 && Opacity is >= 20 and <= 100 && Wind is >= -1.5 and <= 1.5;
+    }
+
     public sealed class PrivacyStore : IDisposable
     {
         const int Rounds = 210000;
@@ -19,7 +44,8 @@ namespace OffWorkWidget
         {
             try
             {
-                if (path != ":memory:") Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
+                if (path != ":memory:" && Path.GetDirectoryName(Path.GetFullPath(path)) is string directory)
+                    Directory.CreateDirectory(directory);
                 Check(Native.sqlite3_open_v2(Utf8(path), out db, 6, IntPtr.Zero));
                 Check(Native.sqlite3_busy_timeout(db, 3000));
                 Execute("PRAGMA secure_delete=ON");
@@ -28,7 +54,7 @@ namespace OffWorkWidget
                 // Existing cumulative coins become spendable once, only when the balance is first created.
                 Execute("INSERT OR IGNORE INTO privacy_meta(key,value) SELECT 'coins_balance',value FROM privacy_meta WHERE key='coins_total'");
                 Execute("INSERT OR IGNORE INTO privacy_meta(key,value) VALUES('coins_balance','0')");
-                if (Read() == null) Execute("INSERT INTO privacy(id,salt,hash,rounds,salary) VALUES(1,'','','',?)", Seal(initialSalary));
+                if (Read() == null) Execute("INSERT OR IGNORE INTO privacy(id,salt,hash,rounds,salary) VALUES(1,'','','',?)", Seal(initialSalary));
                 LoadSalary(); // A damaged database must not fall back to an unlocked default.
                 RefundRetiredEffects();
             }
@@ -38,8 +64,34 @@ namespace OffWorkWidget
         public int CoinBalance => ReadMetaInt("coins_balance");
         internal event Action? BalanceChanged;
         public int SelectedEffect => ReadMetaInt("effect_selected");
-        public static int EffectPrice(int effect) => effect switch { 1 => 100, 2 => 150, 3 => 300, 5 => 300, _ => throw new ArgumentOutOfRangeException(nameof(effect)) };
-        public bool EffectUnlocked(int effect) => effect == 0 || ((effect == 1 || effect == 2 || effect == 3 || effect == 5) && ReadMetaInt("effect_unlocked_" + effect) == 1);
+        static int ShopPrice(int effect) => effect switch
+        {
+            1 => 100, 2 or 8 => 150, 3 or 5 or 7 or 12 or 13 or 14 or 15 => 300, 9 or 11 => 500, 10 => 200, 16 => 1000, _ => 0
+        };
+        public static int EffectPrice(int effect) => ShopPrice(effect) is > 0 and var price ? price : throw new ArgumentOutOfRangeException(nameof(effect));
+        public bool EffectUnlocked(int effect) => effect == 0 || (ShopPrice(effect) > 0 && ReadMetaInt("effect_unlocked_" + effect) == 1);
+        internal event Action? EffectParametersChanged;
+        internal EffectParameters GetEffectParameters(int effect)
+        {
+            var defaults = EffectParameters.GetDefaults(effect);
+            var json = ReadMeta("effect_parameters_" + effect);
+            if (json == null) return defaults;
+            try
+            {
+                var value = System.Text.Json.JsonSerializer.Deserialize<EffectParameters>(json);
+                return value.IsValid ? value : defaults;
+            }
+            catch (System.Text.Json.JsonException) { return defaults; }
+        }
+        internal void SetEffectParameters(int effect, EffectParameters value)
+        {
+            var defaults = EffectParameters.GetDefaults(effect);
+            if (!EffectUnlocked(effect) || !value.IsValid) throw new ArgumentOutOfRangeException(nameof(value));
+            string key = "effect_parameters_" + effect;
+            if (value == defaults) Execute("DELETE FROM privacy_meta WHERE key=?", key);
+            else Execute("INSERT OR REPLACE INTO privacy_meta(key,value) VALUES(?,?)", key, System.Text.Json.JsonSerializer.Serialize(value));
+            EffectParametersChanged?.Invoke();
+        }
         void RefundRetiredEffects()
         {
             Execute("BEGIN IMMEDIATE");
@@ -88,7 +140,6 @@ namespace OffWorkWidget
         public bool UnlockEffect(int effect)
         {
             int price = EffectPrice(effect);
-            bool spent = false;
             Execute("BEGIN IMMEDIATE");
             try
             {
@@ -99,10 +150,9 @@ namespace OffWorkWidget
                 WriteMetaInt("effect_unlocked_" + effect, 1);
                 ApplyPendingEffectRefund();
                 Execute("COMMIT");
-                spent = true;
             }
             catch { Execute("ROLLBACK"); throw; }
-            if (spent) BalanceChanged?.Invoke();
+            BalanceChanged?.Invoke();
             return true;
         }
         // Result and payment are committed together so reopening today never charges twice.
@@ -141,6 +191,7 @@ namespace OffWorkWidget
         {
             if (!EffectUnlocked(effect)) throw new InvalidOperationException("请先解锁特效。");
             WriteMetaInt("effect_selected", effect);
+            EffectParametersChanged?.Invoke();
         }
         public bool HasPassword { get { return ReadRequired()[1].Length != 0; } }
         public decimal LoadSalary()
@@ -179,10 +230,15 @@ namespace OffWorkWidget
             var row = ReadRequired();
             cancellationToken.ThrowIfCancellationRequested();
             bool verified = await Task.Run(() => VerifyRow(password, row), cancellationToken);
-            EnsurePasswordState(row, cancellationToken);
-            if (verified) WriteMetaInt("unlock_failures", 0);
-            else WriteMetaInt("unlock_failures", Math.Min(999, UnlockFailures + 1));
-            return verified;
+            Execute("BEGIN IMMEDIATE");
+            try
+            {
+                EnsurePasswordState(row, cancellationToken);
+                WriteMetaInt("unlock_failures", verified ? 0 : Math.Min(UnlockFailures, 998) + 1);
+                Execute("COMMIT");
+                return verified;
+            }
+            catch { Execute("ROLLBACK"); throw; }
         }
         public async Task SetInitialPasswordAsync(string password, CancellationToken cancellationToken = default)
         {
@@ -207,14 +263,12 @@ namespace OffWorkWidget
         {
             ValidatePassword(password);
             cancellationToken.ThrowIfCancellationRequested();
-            byte[] salt = new byte[32]; using (var random = RandomNumberGenerator.Create()) random.GetBytes(salt);
+            byte[] salt = RandomNumberGenerator.GetBytes(32);
             byte[]? hash = null;
             try
             {
                 hash = await Task.Run(() => Derive(password, salt, Rounds), cancellationToken);
-                EnsurePasswordState(original, cancellationToken);
-                CommitPassword(salt, hash, resetSalary);
-                WriteMetaInt("unlock_failures", 0);
+                CommitPassword(salt, hash, resetSalary, original, cancellationToken);
             }
             finally
             {
@@ -235,30 +289,43 @@ namespace OffWorkWidget
         }
         public void SetInitialPassword(string password)
         {
-            if (HasPassword) throw new InvalidOperationException("已设置密码，请验证原密码后修改。");
-            WritePassword(password, false);
+            var row = ReadRequired();
+            if (row[1].Length != 0) throw new InvalidOperationException("已设置密码，请验证原密码后修改。");
+            WritePassword(password, false, row);
         }
         public void ChangePassword(string oldPassword, string newPassword)
         {
-            if (!Verify(oldPassword)) throw new ArgumentException("原密码不正确。");
-            WritePassword(newPassword, false);
+            var row = ReadRequired();
+            if (!VerifyRow(oldPassword, row)) throw new ArgumentException("原密码不正确。");
+            WritePassword(newPassword, false, row);
         }
-        public void ResetPasswordAndSalary(string password) { WritePassword(password, true); }
-        void WritePassword(string password, bool resetSalary)
+        public void ResetPasswordAndSalary(string password) { WritePassword(password, true, ReadRequired()); }
+        void WritePassword(string password, bool resetSalary, string[] original)
         {
             ValidatePassword(password);
-            byte[] salt = new byte[32]; using(var random = RandomNumberGenerator.Create()) random.GetBytes(salt);
-            byte[] hash = Derive(password,salt,Rounds);
-            try { CommitPassword(salt, hash, resetSalary); WriteMetaInt("unlock_failures", 0); }
-            finally { Array.Clear(hash,0,hash.Length); }
+            byte[] salt = RandomNumberGenerator.GetBytes(32);
+            byte[]? hash = null;
+            try
+            {
+                hash = Derive(password, salt, Rounds);
+                CommitPassword(salt, hash, resetSalary, original, CancellationToken.None);
+            }
+            finally
+            {
+                if (hash != null) Array.Clear(hash, 0, hash.Length);
+                Array.Clear(salt, 0, salt.Length);
+            }
         }
-        void CommitPassword(byte[] salt, byte[] hash, bool resetSalary)
+        void CommitPassword(byte[] salt, byte[] hash, bool resetSalary, string[] original, CancellationToken cancellationToken)
         {
-            string sealedSalary = resetSalary ? Seal(0) : ReadRequired()[3];
             Execute("BEGIN IMMEDIATE");
             try
             {
-                Execute("UPDATE privacy SET salt=?,hash=?,rounds=?,salary=? WHERE id=1", Convert.ToBase64String(salt), Convert.ToBase64String(hash), Rounds.ToString(CultureInfo.InvariantCulture), sealedSalary);
+                EnsurePasswordState(original, cancellationToken);
+                Execute("UPDATE privacy SET salt=?,hash=?,rounds=? WHERE id=1",
+                    Convert.ToBase64String(salt), Convert.ToBase64String(hash), Rounds.ToString(CultureInfo.InvariantCulture));
+                if (resetSalary) Execute("UPDATE privacy SET salary=? WHERE id=1", Seal(0));
+                WriteMetaInt("unlock_failures", 0);
                 Execute("COMMIT");
             }
             catch { Execute("ROLLBACK"); throw; }
@@ -274,7 +341,7 @@ namespace OffWorkWidget
             finally { Array.Clear(clear,0,clear.Length); }
         }
         string[] ReadRequired() { var row = Read(); if(row == null) throw new InvalidDataException("隐私数据缺失。"); return row; }
-        string[] Read()
+        string[]? Read()
         {
             IntPtr stmt = Prepare("SELECT salt,hash,rounds,salary FROM privacy WHERE id=1");
             try
@@ -301,7 +368,8 @@ namespace OffWorkWidget
             }
             finally { Native.sqlite3_finalize(stmt); }
         }
-        int ReadMetaInt(string key)
+        int ReadMetaInt(string key) => int.TryParse(ReadMeta(key), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) ? Math.Max(0, value) : 0;
+        string? ReadMeta(string key)
         {
             IntPtr stmt = Prepare("SELECT value FROM privacy_meta WHERE key=?");
             try
@@ -309,13 +377,12 @@ namespace OffWorkWidget
                 byte[] text = Utf8(key);
                 Check(Native.sqlite3_bind_text(stmt, 1, text, text.Length - 1, new IntPtr(-1)));
                 int result = Native.sqlite3_step(stmt);
-                if (result == 101) return 0;
+                if (result == 101) return null;
                 if (result != 100) Check(result);
                 int length = Native.sqlite3_column_bytes(stmt, 0);
                 byte[] bytes = new byte[length];
                 Marshal.Copy(Native.sqlite3_column_text(stmt, 0), bytes, 0, length);
-                return int.TryParse(Encoding.UTF8.GetString(bytes), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value)
-                    ? Math.Max(0, value) : 0;
+                return Encoding.UTF8.GetString(bytes);
             }
             finally { Native.sqlite3_finalize(stmt); }
         }

@@ -162,7 +162,7 @@ internal sealed class DesktopGlassSource : IDisposable
             NullableDiff(TextRegionLuminance, other.TextRegionLuminance) ||
             StatsDark != other.StatsDark;
         static bool NullableDiff(double? left, double? right) =>
-            left.HasValue != right.HasValue || (left.HasValue && Math.Abs(left.Value - right.Value) > .001);
+            left.HasValue != right.HasValue || (left is double a && right is double b && Math.Abs(a - b) > .001);
     }
 
     internal void SetAnalysisRegions(int textX, int textY, int textW, int textH,

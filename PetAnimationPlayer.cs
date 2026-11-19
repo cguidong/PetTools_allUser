@@ -223,14 +223,14 @@ internal sealed class PetAnimationPlayer : IDisposable
         int next = (int)(clock.Elapsed.TotalSeconds * fps);
         if (next >= count)
         {
-            if (frame != count - 1) ShowFrame(count - 1);
+            if (frame != count - 1 || blended) ShowFrame(count - 1);
             bool hover = hoverPlayback;
             Stop();
             if (hover && RestorePosterAfterHover) ShowFrame(0);
             if (hover) armed = outside;
             GlassProfile.Event(hover ? "pet-animation-end" : "pet-reminder-animation-end");
         }
-        else if (next != frame) ShowFrame(next);
+        else if (next != frame || blended) ShowFrame(next);
     }
 
     void RenderTriggeredLoop()
