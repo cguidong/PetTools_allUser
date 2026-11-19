@@ -10,6 +10,8 @@ internal static class ScreenCaptureExperiment
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("OFFWORKWIDGET_SCREEN_CAPTURE_TEST") == "1" ||
         (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041) && !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000));
+    internal static readonly object RemoteGate = new();
+    internal static volatile bool RemoteEnabled;
     internal static bool AffinityReady;
     private const int Srccopy = 0x00CC0020;
     private const int SmXVirtualScreen = 76, SmYVirtualScreen = 77, SmCxVirtualScreen = 78, SmCyVirtualScreen = 79;

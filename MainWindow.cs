@@ -515,6 +515,7 @@ public sealed partial class MainWindow : Window
         timer.Interval = TimeSpan.FromMilliseconds(100);
         timer.Tick += (_, __) =>
         {
+            desktopSource.UpdateRemoteBackdrop();
             if (!sessionNotificationRegistered && elapsed.Elapsed.TotalSeconds >= nextSessionRegistrationAttempt) TryRegisterSessionNotifications();
             if (!smoke && !previewFrozen && elapsed.Elapsed.TotalSeconds > 5 && Environment.GetEnvironmentVariable("OFFWORKWIDGET_TEST_DATA") != null)
             {

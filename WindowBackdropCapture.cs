@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -333,14 +334,20 @@ internal static class WindowBackdropCapture
                 return Failed("背景采样必须在工作线程执行。", width, height, captured);
             if (width <= 0 || height <= 0 || (long)width * height > 8_000_000)
                 return Failed("组件尺寸超出采样范围。", width, height, captured);
-            if (ScreenCaptureExperiment.Enabled)
+            if (ScreenCaptureExperiment.Enabled || ScreenCaptureExperiment.RemoteEnabled)
             {
-                if (!ScreenCaptureExperiment.AffinityReady)
-                    return Failed("实验采样无法排除挂件，已停止采样。", width, height, captured);
-                byte[] pixels = ScreenCaptureExperiment.Capture(targetX, targetY, width, height, reusableOutput);
-                return new Frame { Width = width, Height = height, PixelsBGRA = pixels,
-                    CapturedWindows = 1, ScreenX = targetX, ScreenY = targetY,
-                    LayoutStamp = GetLayoutStamp(excludedHandle, targetX, targetY, width, height) };
+                byte[]? pixels = null;
+                lock (ScreenCaptureExperiment.RemoteGate)
+                {
+                    if (ScreenCaptureExperiment.Enabled && !ScreenCaptureExperiment.AffinityReady)
+                        return Failed("实验采样无法排除挂件，已停止采样。", width, height, captured);
+                    if (ScreenCaptureExperiment.Enabled || ScreenCaptureExperiment.RemoteEnabled)
+                        pixels = ScreenCaptureExperiment.Capture(targetX, targetY, width, height, reusableOutput);
+                }
+                if (pixels != null)
+                    return new Frame { Width = width, Height = height, PixelsBGRA = pixels,
+                        CapturedWindows = 1, ScreenX = targetX, ScreenY = targetY,
+                        LayoutStamp = GetLayoutStamp(excludedHandle, targetX, targetY, width, height) };
             }
             var target = new Rect(targetX, targetY, checked(targetX + width), checked(targetY + height));
             ulong sceneLayout = GetLayoutStamp(excludedHandle, targetX, targetY, width, height, out ulong sceneOrder);
@@ -398,80 +405,88 @@ internal static class WindowBackdropCapture
                 GetClassName(window, windowClass, windowClass.Capacity);
                 bool requiresAlpha = (exStyle & (0x00080000 /* WS_EX_LAYERED */ | 0x00200000 /* WS_EX_NOREDIRECTIONBITMAP */)) != 0 ||
                     windowClass.ToString() == "WinUIDesktopWin32WindowClass";
+                bool blackOverlay = false;
                 // GPU child surfaces need compositor capture even when their top-level
                 // HWND has ordinary styles. Keep the shell overflow's existing mask.
                 if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.TryGetFrame(window, target.Left, target.Top,
                     width, height, out var frame) && frame != null)
                 {
                     using var frameLease = frame;
-                    // A resized HWND can expose PrintWindow's stale black backing.
-                    // Wait for a matching compositor snapshot instead of stretching it.
-                    if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds))
+                    // Sunlogin can expose an opaque black capture surface over the actual desktop.
+                    blackOverlay = IsBlackCapture(frame.PixelsBGRA, frame.PixelWidth,
+                        new Rect(0, 0, frame.PixelWidth, frame.PixelHeight), requireOpaque: true) && IsSunloginWindow(window);
+                    if (!blackOverlay)
                     {
-                        CompositorWindowCapture.RequestRefresh(window);
-                        MarkPending("bounds", window);
-                        if (allowPendingFill) return true;
-                        return !preservePendingScene;
-                    }
-                    if (!IsWindowAvailable(window)) return true;
-                    var fullBounds = frameBounds;
-                    frameBounds = new Rect(frameBounds.Left + frame.PixelLeft, frameBounds.Top + frame.PixelTop,
-                        frameBounds.Left + frame.PixelLeft + frame.PixelWidth, frameBounds.Top + frame.PixelTop + frame.PixelHeight);
-                    if (Intersect(target, fullBounds, out Rect needed))
-                    {
-                        // Recrop before the 96px read-ahead is exhausted, while this frame
-                        // can still be displayed. Ignore edges already at the window limit.
-                        const int lookAhead = 48;
-                        if (needed.Left - lookAhead < frameBounds.Left && fullBounds.Left < frameBounds.Left ||
-                            needed.Top - lookAhead < frameBounds.Top && fullBounds.Top < frameBounds.Top ||
-                            needed.Right + lookAhead > frameBounds.Right && fullBounds.Right > frameBounds.Right ||
-                            needed.Bottom + lookAhead > frameBounds.Bottom && fullBounds.Bottom > frameBounds.Bottom)
-                            CompositorWindowCapture.RequestRefresh(window);
-                        if (needed.Left < frameBounds.Left || needed.Top < frameBounds.Top ||
-                            needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom)
+                        // A resized HWND can expose PrintWindow's stale black backing.
+                        // Wait for a matching compositor snapshot instead of stretching it.
+                        if (!TryGetCompositorBounds(window, frame.Width, frame.Height, out Rect frameBounds))
                         {
-                            MarkPending("crop", window);
+                            CompositorWindowCapture.RequestRefresh(window);
+                            MarkPending("bounds", window);
                             if (allowPendingFill) return true;
                             return !preservePendingScene;
                         }
-                    }
-                    if (!GetWindowRect(window, out Rect nativeBounds)) return true;
-                    var compositorCoverage = new List<Rect>();
-                    // A compositor snapshot can predate a native region shrink.
-                    // Transparent sources retain their antialiasing guard and alpha.
-                    AddScreenCoverage(ReadWindowCoverage(window, nativeBounds.Right - nativeBounds.Left,
-                        nativeBounds.Bottom - nativeBounds.Top, !requiresAlpha), nativeBounds, compositorCoverage);
-                    var opaqueHits = !requiresAlpha ? new List<Rect>() : null;
-                    foreach (Rect remaining in uncovered)
-                        foreach (Rect visible in compositorCoverage)
-                            if (Intersect(remaining, visible, out Rect hit) && Intersect(hit, frameBounds, out Rect clipped))
+                        if (!IsWindowAvailable(window)) return true;
+                        var fullBounds = frameBounds;
+                        frameBounds = new Rect(frameBounds.Left + frame.PixelLeft, frameBounds.Top + frame.PixelTop,
+                            frameBounds.Left + frame.PixelLeft + frame.PixelWidth, frameBounds.Top + frame.PixelTop + frame.PixelHeight);
+                        if (Intersect(target, fullBounds, out Rect needed))
+                        {
+                            // Recrop before the 96px read-ahead is exhausted, while this frame
+                            // can still be displayed. Ignore edges already at the window limit.
+                            const int lookAhead = 48;
+                            if (needed.Left - lookAhead < frameBounds.Left && fullBounds.Left < frameBounds.Left ||
+                                needed.Top - lookAhead < frameBounds.Top && fullBounds.Top < frameBounds.Top ||
+                                needed.Right + lookAhead > frameBounds.Right && fullBounds.Right > frameBounds.Right ||
+                                needed.Bottom + lookAhead > frameBounds.Bottom && fullBounds.Bottom > frameBounds.Bottom)
+                                CompositorWindowCapture.RequestRefresh(window);
+                            if (needed.Left < frameBounds.Left || needed.Top < frameBounds.Top ||
+                                needed.Right > frameBounds.Right || needed.Bottom > frameBounds.Bottom)
                             {
-                                if (requiresAlpha)
-                                    CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
-                                else if (hasTransparency)
-                                    CompositeOpaque(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
-                                else
-                                    for (int row = clipped.Top; row < clipped.Bottom; row++)
-                                        Buffer.BlockCopy(frame.PixelsBGRA, ((row - frameBounds.Top) * frame.PixelWidth + clipped.Left - frameBounds.Left) * 4,
-                                            output, ((row - target.Top) * width + clipped.Left - target.Left) * 4, (clipped.Right - clipped.Left) * 4);
-                                opaqueHits?.Add(clipped);
+                                MarkPending("crop", window);
+                                if (allowPendingFill) return true;
+                                return !preservePendingScene;
                             }
-                    hasTransparency |= requiresAlpha;
-                    liveSources++;
-                    sourceWindows.Add(window);
-                    captured++;
-                    if (opaqueHits == null) uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
-                    else foreach (Rect covered in opaqueHits)
-                    {
-                        var remaining = new List<Rect>();
-                        foreach (Rect piece in uncovered) Subtract(piece, covered, remaining);
-                        uncovered = remaining;
+                        }
+                        if (!GetWindowRect(window, out Rect nativeBounds)) return true;
+                        var compositorCoverage = new List<Rect>();
+                        // A compositor snapshot can predate a native region shrink.
+                        // Transparent sources retain their antialiasing guard and alpha.
+                        AddScreenCoverage(ReadWindowCoverage(window, nativeBounds.Right - nativeBounds.Left,
+                            nativeBounds.Bottom - nativeBounds.Top, !requiresAlpha), nativeBounds, compositorCoverage);
+                        var opaqueHits = !requiresAlpha ? new List<Rect>() : null;
+                        foreach (Rect remaining in uncovered)
+                            foreach (Rect visible in compositorCoverage)
+                                if (Intersect(remaining, visible, out Rect hit) && Intersect(hit, frameBounds, out Rect clipped))
+                                {
+                                    if (requiresAlpha)
+                                        CompositeTransparent(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
+                                    else if (hasTransparency)
+                                        CompositeOpaque(output, width, target, frame.PixelsBGRA, frame.PixelWidth, frameBounds, clipped);
+                                    else
+                                        for (int row = clipped.Top; row < clipped.Bottom; row++)
+                                            Buffer.BlockCopy(frame.PixelsBGRA, ((row - frameBounds.Top) * frame.PixelWidth + clipped.Left - frameBounds.Left) * 4,
+                                                output, ((row - target.Top) * width + clipped.Left - target.Left) * 4, (clipped.Right - clipped.Left) * 4);
+                                    opaqueHits?.Add(clipped);
+                                }
+                        hasTransparency |= requiresAlpha;
+                        liveSources++;
+                        sourceWindows.Add(window);
+                        captured++;
+                        if (opaqueHits == null) uncovered = RemoveOpaqueCoverage(output, width, target, uncovered);
+                        else foreach (Rect covered in opaqueHits)
+                        {
+                            var remaining = new List<Rect>();
+                            foreach (Rect piece in uncovered) Subtract(piece, covered, remaining);
+                            uncovered = remaining;
+                        }
+                        return uncovered.Count > 0;
                     }
-                    return uncovered.Count > 0;
                 }
                 // Keep a still-valid scene during GPU warm-up; otherwise fill from lower layers. PrintWindow
                 // can synchronously stall the source app's UI (notably Qt windows).
-                if (!IsTrayOverflowWindow(window) && CompositorWindowCapture.IsStarting(window))
+                if (blackOverlay && (requiresAlpha || avoidBlockingSources)) return true;
+                if (!blackOverlay && !IsTrayOverflowWindow(window) && CompositorWindowCapture.IsStarting(window))
                 {
                     MarkPending("starting", window);
                     if (allowPendingFill) return true;
@@ -516,6 +531,12 @@ internal static class WindowBackdropCapture
                         return !preservePendingScene;
                     }
                     byte[]? slice = CaptureWindowSlice(window, bounds, target, sliceBuffer, trayCoverage, windowCoverage);
+                    // PrintWindow supplies BGR pixels, but its alpha byte is undefined.
+                    if (slice != null && Intersect(target, nativeHit, out var screenCrop) &&
+                        IsBlackCapture(slice, width, new Rect(screenCrop.Left - target.Left, screenCrop.Top - target.Top,
+                            screenCrop.Right - target.Left, screenCrop.Bottom - target.Top), requireOpaque: false) &&
+                        (blackOverlay || IsSunloginWindow(window)))
+                        return true;
                     if (slice != null && IsWindowAvailable(window))
                     {
                         sourceWindows.Add(window);
@@ -907,6 +928,38 @@ internal static class WindowBackdropCapture
     private static readonly Dictionary<IntPtr, WindowSnapshot> snapshots = new();
     private static bool refreshingSnapshot;
     private const int SnapshotPixelBudget = 12_000_000;
+
+    private static bool IsSunloginWindow(IntPtr window)
+    {
+        if (GetWindowThreadProcessId(window, out uint pid) == 0 || pid == 0) return false;
+        try
+        {
+            using var process = Process.GetProcessById((int)pid);
+            string name = process.ProcessName;
+            return name.Equals("AweSun", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("Sunlogin", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+    }
+
+    private static bool IsBlackCapture(byte[] pixels, int stride, Rect crop, bool requireOpaque)
+    {
+        long pixelCount = (long)(crop.Right - crop.Left) * (crop.Bottom - crop.Top);
+        if (pixelCount <= 0 || stride < crop.Right || (long)crop.Bottom * stride * 4 > pixels.Length) return false;
+        long remainingNonBlack = pixelCount / 200;
+        for (int y = crop.Top; y < crop.Bottom; y++)
+        {
+            int offset = (y * stride + crop.Left) * 4;
+            for (int x = crop.Left; x < crop.Right; x++, offset += 4)
+                if ((pixels[offset] != 0 || pixels[offset + 1] != 0 || pixels[offset + 2] != 0 ||
+                    (requireOpaque && pixels[offset + 3] != 255)) && --remainingNonBlack < 0)
+                    return false;
+        }
+        return true;
+    }
+
 
     internal static bool HasDesktopContent(byte[]? pixels, int pixelCount, bool opaqueCompositor)
     {
@@ -1311,6 +1364,7 @@ internal static class WindowBackdropCapture
     [DllImport("gdi32.dll")] private static extern bool SetWindowOrgEx(IntPtr hdc, int x, int y, IntPtr prev);
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr hWnd, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string? lpszClass, string? lpszWindow);

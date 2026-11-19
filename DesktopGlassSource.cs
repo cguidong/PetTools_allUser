@@ -20,6 +20,7 @@ internal sealed class DesktopGlassSource : IDisposable
     readonly Grid surface;
     // The parent composition clip supplies the single antialiased outer contour.
     readonly Border image = new Border { IsHitTestVisible = false };
+    long nextOverlayCheck;
     readonly ImageBrush sourceBrush = new ImageBrush { Stretch = Stretch.Fill };
     readonly MatrixTransform samplingTransform = new MatrixTransform();
     readonly DispatcherQueueTimer timer;
@@ -215,6 +216,32 @@ internal sealed class DesktopGlassSource : IDisposable
         };
         card.Loaded += (_, __) => Start();
         if (card.IsLoaded) Start();
+    }
+
+    internal void UpdateRemoteBackdrop()
+    {
+        if (ScreenCaptureExperiment.Enabled || disposed || !IsActive || !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000) ||
+            Environment.TickCount64 < nextOverlayCheck) return;
+        nextOverlayCheck = Environment.TickCount64 + 600;
+        if (!GetWindowRect(handle, out var w)) return;
+        bool active = false;
+        IntPtr overlay = IntPtr.Zero;
+        while ((overlay = FindWindowEx(IntPtr.Zero, overlay, "ORAY_FLUTTER_VIEW_CONTAINER", null)) != IntPtr.Zero)
+        {
+            if (!WindowBackdropCapture.IsWindowAvailable(overlay) || !GetWindowRect(overlay, out var r)) continue;
+            if (r.Left < w.Right && w.Left < r.Right && r.Top < w.Bottom && w.Top < r.Bottom)
+            {
+                active = true;
+                break;
+            }
+        }
+        if (active == ScreenCaptureExperiment.RemoteEnabled) return;
+        lock (ScreenCaptureExperiment.RemoteGate)
+        {
+            if (!SetWindowDisplayAffinity(handle, active ? 0x11u : 0u)) return;
+            ScreenCaptureExperiment.RemoteEnabled = active;
+        }
+        Capture();
     }
 
     internal void Start()
@@ -592,7 +619,7 @@ internal sealed class DesktopGlassSource : IDisposable
         SampleDragSpeed(x, y);
         // A static, complete atlas only needs geometry probing every 32ms. Moving
         // the sampling transform still happens every render, without a worker task.
-        if (!ScreenCaptureExperiment.Enabled && followMovingHost && hasCapturedSceneStamp && atlas != null && !atlas.PendingRegion &&
+        if (!ScreenCaptureExperiment.Enabled && !ScreenCaptureExperiment.RemoteEnabled && followMovingHost && hasCapturedSceneStamp && atlas != null && !atlas.PendingRegion &&
             AtlasCovers(x, y, w, h) && Volatile.Read(ref windowMotionDirty) == 0 &&
             now >= Volatile.Read(ref layoutBurstUntil) &&
             now - Volatile.Read(ref lastSceneProbeAt) < MovingLayoutProbeInterval &&
@@ -685,7 +712,7 @@ internal sealed class DesktopGlassSource : IDisposable
                     else sceneLayout = lastSceneProbeLayout;
                     sceneContent = CompositorWindowCapture.Revision;
                     // Only transform the existing texture when its screen-anchored scene is unchanged.
-                    if (!ScreenCaptureExperiment.Enabled && capturedStamp && compareScene && previous != null && !previous.PendingRegion &&
+                    if (!ScreenCaptureExperiment.Enabled && !ScreenCaptureExperiment.RemoteEnabled && capturedStamp && compareScene && previous != null && !previous.PendingRegion &&
                         previous.Width == right - left && previous.Height == bottom - top &&
                         sceneLayout == previousLayout && sceneContent == previousContent && recentlyCaptured)
                     {
