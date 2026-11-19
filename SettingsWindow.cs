@@ -250,12 +250,15 @@ namespace OffWorkWidget.WinUI
         readonly SolidColorBrush dividerBrush = new SolidColorBrush();
         readonly SolidColorBrush accentBlue = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 0, 122, 255));
 
+        readonly Action<int?> previewShopEffect;
+
         public SettingsWindow(OffWorkWidget.Settings current, OffWorkWidget.PrivacyStore privacy,
             Action toggleSalaryLayout, Action hideSalary,
-            Action<OffWorkWidget.Settings> saveSettings, Action<double>? previewScale = null)
+            Action<OffWorkWidget.Settings> saveSettings, Action<int?> previewShopEffect, Action<double>? previewScale = null)
         {
             this.current = current; this.privacy = privacy; this.toggleSalaryLayout = toggleSalaryLayout;
             this.hideSalary = hideSalary; this.saveSettings = saveSettings; this.previewScale = previewScale;
+            this.previewShopEffect = previewShopEffect;
             automatic = current.AutomaticAppearance;
             night = current.NightMode; petId = current.PetId; hoverEffect = OffWorkWidget.HoverEffects.Normalize(current.HoverEffect); observedSalary = current.Salary;
             alternatingWeekends = current.AlternatingWeekends;
@@ -2418,10 +2421,13 @@ namespace OffWorkWidget.WinUI
                 new(2, "暖光漂浮", "warm-gold.png"), new(3, "雪花飘落", "snow-crystal.png"),
                 new(5, "落叶飘飘", "maple-red.png"), new(7, "樱花飞舞", "sakura-pink.png"),
                 new(8, "萤火微光", "firefly-lime.png"), new(9, "极光流光", "aurora-wave.png"),
-                new(10, "细雨微澜", "rain-drop.png"), new(11, "流星掠过", "meteor-ice.png"),
-                new(12, "炉火余烬", "ember-hot.png"), new(13, "星轨连线", "preview-constellation.svg"),
+                new(10, "细雨微澜", "rain-drop.png"), new(11, "流星", "meteor-ice.png"),
+                new(12, "炉火余烬", "ember-hot.png"), new(13, "星尘磁聚", "dust-blue.png"),
                 new(14, "鎏金碎箔", "gold-flake.png"), new(15, "赛博数雨", "preview-matrix.svg"),
-                new(16, "游鱼水纹", "fish-koi-0.png")
+                new(16, "游鱼水纹", "fish-koi-0.png"),
+                new(17, "微光烟花", "preview-firework.svg"), new(18, "落墨晕染", "preview-ink.svg"),
+                new(19, "引力旋涡", "preview-vortex.svg"), new(20, "蝶舞花影", "butterfly.png"),
+                new(21, "纸鹤乘风", "origami.png"), new(22, "轻羽飘梦", "feather.png")
             };
             var parameterPanel = new StackPanel { Spacing = 4 };
             var parameterSection = CreateOptionsSection("实时参数微调", parameterPanel);
@@ -2562,6 +2568,8 @@ namespace OffWorkWidget.WinUI
             var chooser = BuildShopEffectSelector(effects, selectedIndex, index =>
             {
                 selectedIndex = index;
+                int effect = effects[index].Id;
+                previewShopEffect(effect == privacy.SelectedEffect ? null : effect);
                 SetNotice("");
                 RefreshEffects();
             });
@@ -2581,6 +2589,7 @@ namespace OffWorkWidget.WinUI
                     else
                     {
                         privacy.SelectEffect(effect.Id);
+                        previewShopEffect(null);
                         SetNotice("");
                     }
                     RefreshEffects();
@@ -2596,7 +2605,7 @@ namespace OffWorkWidget.WinUI
             {
                 int selected = privacy.SelectedEffect;
                 int index = Math.Max(0, Array.FindIndex(effects, e => e.Id == selected));
-                activeLabel.Text = "使用中：" + effects[index].Name;
+                activeLabel.Text = index == selectedIndex ? "使用中：" + effects[index].Name : "预览中：" + effects[selectedIndex].Name;
                 int browsing = effects[selectedIndex].Id;
                 bool active = browsing == selected;
                 action.Content = active ? "使用中" : privacy.EffectUnlocked(browsing) ? "使用" : OffWorkWidget.PrivacyStore.EffectPrice(browsing) + " 金币解锁";
@@ -2697,6 +2706,8 @@ namespace OffWorkWidget.WinUI
             {
                 if (index == selectedIndex) return;
                 selectedIndex = index;
+                int effect = effects[index].Id;
+                previewShopEffect(effect == privacy.SelectedEffect ? null : effect);
                 ShowSelection();
                 choose(index);
             }

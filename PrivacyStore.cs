@@ -28,6 +28,12 @@ namespace OffWorkWidget
             14 => new(22, .8, 1, 86, .3),
             15 => new(18, 1, 1, 72, 0),
             16 => new(9, .9, 1, 92, 0),
+            17 => new(18, 1, 1, 90, 0),
+            18 => new(6, .8, 1, 85, .1),
+            19 => new(24, 1, 1, 90, 0),
+            20 => new(9, .85, 1, 94, 0),
+            21 => new(6, .85, 1, 93, .2),
+            22 => new(12, .75, 1, 94, .3),
             _ => throw new ArgumentOutOfRangeException(nameof(effect))
         };
 
@@ -62,13 +68,23 @@ namespace OffWorkWidget
         }
         public int CoinCount => ReadMetaInt("coins_total");
         public int CoinBalance => ReadMetaInt("coins_balance");
+        internal const int CoinBalanceLimit = 9999;
         internal event Action? BalanceChanged;
+        internal event Action? EffectUnlockedChanged;
+        internal void NotifyBalanceChanged() => BalanceChanged?.Invoke();
         public int SelectedEffect => ReadMetaInt("effect_selected");
         static int ShopPrice(int effect) => effect switch
         {
-            1 => 100, 2 or 8 => 150, 3 or 5 or 7 or 12 or 13 or 14 or 15 => 300, 9 or 11 => 500, 10 => 200, 16 => 1000, _ => 0
+            1 => 100, 2 or 8 => 150, 3 or 5 or 7 or 12 or 13 or 14 or 15 => 300, 9 or 11 => 500, 10 => 200, 16 => 1000, 17 => 260, 18 => 300, 19 => 520, 20 => 600, 21 => 640, 22 => 780, _ => 0
         };
         public static int EffectPrice(int effect) => ShopPrice(effect) is > 0 and var price ? price : throw new ArgumentOutOfRangeException(nameof(effect));
+        internal bool AllShopEffectsUnlocked()
+        {
+            for (int effect = 1; effect <= 22; effect++)
+                if (ShopPrice(effect) > 0 && !EffectUnlocked(effect)) return false;
+            return true;
+        }
+
         public bool EffectUnlocked(int effect) => effect == 0 || (ShopPrice(effect) > 0 && ReadMetaInt("effect_unlocked_" + effect) == 1);
         internal event Action? EffectParametersChanged;
         internal EffectParameters GetEffectParameters(int effect)
@@ -116,12 +132,14 @@ namespace OffWorkWidget
         {
             int pending = ReadMetaInt("retired_effect_refund_pending");
             if (pending == 0) return;
-            int balance = CoinBalance, credit = Math.Min(pending, int.MaxValue - balance);
+            int balance = CoinBalance, credit = Math.Min(pending, Math.Max(0, CoinBalanceLimit - balance));
             if (credit == 0) return;
             WriteMetaInt("coins_balance", balance + credit);
             WriteMetaInt("retired_effect_refund_pending", pending - credit);
         }
-        public int AddCoin()
+        public int AddCoin() => AddCoins(1);
+
+        internal int AddCoins(int amount)
         {
             int count;
             Execute("BEGIN IMMEDIATE");
@@ -129,8 +147,9 @@ namespace OffWorkWidget
             {
                 count = CoinCount;
                 int balance = CoinBalance;
-                if (count < int.MaxValue) WriteMetaInt("coins_total", ++count);
-                if (balance < int.MaxValue) WriteMetaInt("coins_balance", balance + 1);
+                count = (int)Math.Min(int.MaxValue, (long)count + amount);
+                WriteMetaInt("coins_total", count);
+                if (balance < CoinBalanceLimit) WriteMetaInt("coins_balance", (int)Math.Min(CoinBalanceLimit, (long)balance + amount));
                 Execute("COMMIT");
             }
             catch { Execute("ROLLBACK"); throw; }
@@ -153,6 +172,7 @@ namespace OffWorkWidget
             }
             catch { Execute("ROLLBACK"); throw; }
             BalanceChanged?.Invoke();
+            EffectUnlockedChanged?.Invoke();
             return true;
         }
         // Result and payment are committed together so reopening today never charges twice.
