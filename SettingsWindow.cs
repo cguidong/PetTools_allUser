@@ -155,7 +155,7 @@ namespace OffWorkWidget.WinUI
         TextBlock holidayStatus, passwordStatus, scaleLabel;
         Action? refreshAdjustmentReveal;
         Action? refreshEffectShop;
-        Action? refreshDailyFortune;
+        Action? refreshDailyWord;
         Image petThumb;
         Border incomeContent, restContent, careContent;
         Grid incomeChevron, restChevron, careChevron;
@@ -620,6 +620,7 @@ namespace OffWorkWidget.WinUI
         void ApplyThemeBrushes()
         {
             bool dark = root.ActualTheme == ElementTheme.Dark;
+            UiTypography.Apply(root, dark);
             cornerMaterial.Color = dark ? Windows.UI.Color.FromArgb(233, 45, 45, 45) : Windows.UI.Color.FromArgb(226, 245, 245, 245);
             // All appearance modes share the same glass surface; the mode only
             // forces the light/dark palette, so manual day/night match automatic.
@@ -1574,6 +1575,7 @@ namespace OffWorkWidget.WinUI
                 var button = new Button { Height = 36, CornerRadius = new CornerRadius(8), Background = inputBackgroundBrush, BorderThickness = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center, Content = display };
                 button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush; button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
                 Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, first ? "午休开始时间" : "午休结束时间");
+                UiTypography.Preserve(button);
                 button.Click += (_, __) => ShowTimeWheelCore(button, display, false, false, null, 0,
                     value => { if (first) lunchStart = value; else lunchEnd = value; }, first ? lunchStart : lunchEnd);
                 column.Children.Add(button); Grid.SetColumn(column, i); lunchTimes.Children.Add(column);
@@ -1621,6 +1623,7 @@ namespace OffWorkWidget.WinUI
                 var button = new Button { Height = 36, CornerRadius = new CornerRadius(8), Background = inputBackgroundBrush, BorderThickness = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Center, Content = display };
                 button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush; button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
                 Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, first ? "所选星期上班时间" : "所选星期下班时间");
+                UiTypography.Preserve(button);
                 button.Click += (_, __) => ShowTimeWheelCore(button, display, false, false, null, 0,
                     value => { if (first) dayTimeStart = value; else dayTimeEnd = value; RememberDayTime(); }, first ? dayTimeStart : dayTimeEnd);
                 column.Children.Add(button); Grid.SetColumn(column, i); dayTimeTimes.Children.Add(column);
@@ -1837,6 +1840,7 @@ namespace OffWorkWidget.WinUI
 
             btn.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
             btn.Resources["ButtonBackgroundPressed"] = timePressedBrush;
+            UiTypography.Preserve(btn);
 
             btn.Click += (_, __) =>
             {
@@ -2468,67 +2472,193 @@ namespace OffWorkWidget.WinUI
                             notice.Text = effectName + "已解锁，可以随时使用。";
                         }
                         else { privacy.SelectEffect(effect); notice.Text = "已切换为" + effectName + "。"; }
-                        Refresh();
+                        RefreshEffects();
                     }
                     catch (IOException) { notice.Text = "保存失败，请稍后重试。"; }
                 };
             }
-            void Refresh()
+            void RefreshBalance()
             {
-                balance.Text = "可用金币：" + privacy.CoinBalance.ToString("N0", CultureInfo.InvariantCulture);
+                try { balance.Text = "可用金币：" + privacy.CoinBalance.ToString("N0", CultureInfo.InvariantCulture); }
+                catch (IOException ex) { Debug.WriteLine("无法读取金币余额：" + ex.Message); }
+            }
+            void RefreshEffects()
+            {
                 int selected = privacy.SelectedEffect;
                 for (int i = 0; i < buttons.Count; i++)
                     buttons[i].Content = selected == effects[i].Id ? "使用中" : privacy.EffectUnlocked(effects[i].Id) ? "使用" : OffWorkWidget.PrivacyStore.EffectPrice(effects[i].Id) + " 金币解锁";
             }
-            refreshEffectShop = () => { Refresh(); refreshDailyFortune?.Invoke(); };
+            refreshEffectShop = () => { RefreshBalance(); RefreshEffects(); refreshDailyWord?.Invoke(); };
             details.Children.Add(notice);
-            details.Children.Add(BuildDailyFortune());
+            details.Children.Add(BuildDailyWord());
+            privacy.BalanceChanged += RefreshBalance;
+            Closed += (_, __) => privacy.BalanceChanged -= RefreshBalance;
             return details;
         }
 
-        FrameworkElement BuildDailyFortune()
+        FrameworkElement BuildDailyWord()
         {
-            var messages = new[] {
-                "今天也在认真生活，给自己一个微笑。", "慢一点也没关系，你正在向前。",
-                "忙碌之余，记得喝口水、伸个懒腰。", "今天的小进步，值得被看见。",
-                "好运正在路上，先好好照顾自己。", "工作有期限，快乐也要安排上。",
-                "摸一会儿鱼，再精神满满地出发。", "今天适合给自己一点小奖励。",
-                "下班倒计时已经开始，期待好时光。", "辛苦啦，今天也离下班更近一步。",
-                "不必事事完美，尽力就很棒。", "愿你今天的烦恼早早下班。"
-            };
             var panel = new StackPanel { Spacing = 8, Margin = new Thickness(0, 10, 0, 0) };
             panel.Children.Add(new Border { Height = 1, Background = dividerBrush });
             var row = new Grid { MinHeight = 38 };
             row.ColumnDefinitions.Add(new ColumnDefinition());
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            row.Children.Add(new TextBlock { Text = "每日抽签", FontSize = 13, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
-            var button = new Button { Height = 32, MinWidth = 96, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 13 };
+            row.Children.Add(new TextBlock { Text = "今日有盼", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center });
+            var button = new Button { Content = "10 金币抽词", Height = 32, MinWidth = 96, Padding = new Thickness(12, 4, 12, 4), CornerRadius = new CornerRadius(8), BorderThickness = new Thickness(0), Background = inputBackgroundBrush, Foreground = inkBrush, FontSize = 13 };
             button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
             button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
             Grid.SetColumn(button, 1); row.Children.Add(button); panel.Children.Add(row);
-            var result = new TextBlock { FontSize = 12, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
-            panel.Children.Add(result);
-            DateTime displayedDay = DateTime.Today;
-            void Refresh()
+            var title = new TextBlock { FontSize = 19, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = inkBrush };
+            var message = new TextBlock { FontSize = 13, Foreground = subInkBrush, TextWrapping = TextWrapping.Wrap };
+            var streamedMessage = new StreamingText(message);
+            var reaction = new Image { Width = 88, Height = 66, Margin = new Thickness(8, 0, 0, 0), Visibility = Visibility.Collapsed };
+            var words = new StackPanel { Spacing = 5, VerticalAlignment = VerticalAlignment.Center };
+            words.Children.Add(title);
+            words.Children.Add(streamedMessage);
+            var result = new Grid();
+            result.ColumnDefinitions.Add(new ColumnDefinition());
+            result.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            result.Children.Add(words);
+            Grid.SetColumn(reaction, 1);
+            result.Children.Add(reaction);
+            var wordCard = new Border { Padding = new Thickness(12, 10, 12, 10), CornerRadius = new CornerRadius(10), Background = inputBackgroundBrush, Child = result, VerticalAlignment = VerticalAlignment.Top };
+            var reveal = new Grid();
+            reveal.Children.Add(wordCard);
+            panel.Children.Add(reveal);
+
+            var revealClock = new Stopwatch();
+            var revealClip = new RectangleGeometry();
+            double revealFrom = 0, revealTo = 0;
+
+            void FinishReveal()
             {
-                displayedDay = DateTime.Today;
-                int value = privacy.TodayFortune(displayedDay);
-                button.Content = value > 0 ? "查看今日签" : "10 金币抽签";
-                result.Text = value > 0 && value <= messages.Length ? "今日签：" + messages[value - 1] : "每天可抽一次，当天免费查看。";
+                CompositionTarget.Rendering -= AnimateReveal;
+                revealClock.Stop();
+                reveal.Height = wordCard.Height = double.NaN;
+                reveal.Clip = null;
             }
-            button.Click += (_, __) =>
+
+            void AnimateReveal(object? sender, object args)
             {
+                const double damping = 7;
+                double progress = Math.Min(1, revealClock.Elapsed.TotalMilliseconds / 380);
+                if (progress >= 1 || !animationSettings.AnimationsEnabled) { FinishReveal(); return; }
+                double t = damping * progress;
+                // A critically damped spring slows to a stop without overshooting the card height.
+                double eased = (1 - (1 + t) * Math.Exp(-t)) / (1 - (1 + damping) * Math.Exp(-damping));
+                double height = revealFrom + (revealTo - revealFrom) * eased;
+                reveal.Height = height;
+                revealClip.Rect = new Windows.Foundation.Rect(0, 0, reveal.ActualWidth, height);
+            }
+
+            void StartReveal(double previousHeight)
+            {
+                FinishReveal();
+                double width = reveal.ActualWidth;
+                if (previousHeight <= 0 || width <= 0 || !animationSettings.AnimationsEnabled) return;
+                wordCard.Measure(new Windows.Foundation.Size(width, double.PositiveInfinity));
+                revealFrom = previousHeight;
+                revealTo = wordCard.DesiredSize.Height;
+                if (Math.Abs(revealTo - revealFrom) < .5) return;
+                wordCard.Height = revealTo;
+                reveal.Height = revealFrom;
+                revealClip.Rect = new Windows.Foundation.Rect(0, 0, width, revealFrom);
+                reveal.Clip = revealClip;
+                revealClock.Restart();
+                CompositionTarget.Rendering += AnimateReveal;
+            }
+
+            DateTime displayedDay = default;
+            DateTime? workEnd = null;
+            bool freeTime = false;
+            int wordId = 0;
+            PetAnimationPlayer? reactionPlayer = null;
+            void ClearReaction(bool animate = false)
+            {
+                double previousHeight = reveal.ActualHeight;
+                reactionPlayer?.Dispose();
+                reactionPlayer = null;
+                reaction.Source = null;
+                reaction.Visibility = Visibility.Collapsed;
+                if (animate) StartReveal(previousHeight);
+            }
+
+            void Refresh(bool animate = false)
+            {
+                DateTime now = DateTime.Now;
+                int todayWord = privacy.TodayWord(now);
+                if (displayedDay != now.Date) { FinishReveal(); ClearReaction(); }
+                displayedDay = now.Date;
+                workEnd = OffWorkWidget.DailyWord.WorkEnd(now, current);
+                freeTime = !workEnd.HasValue || now >= workEnd.Value;
+                wordId = todayWord;
+                var word = OffWorkWidget.DailyWord.Find(wordId);
+                button.Visibility = wordId > 0 ? Visibility.Collapsed : Visibility.Visible;
+                title.Visibility = word == null ? Visibility.Collapsed : Visibility.Visible;
+                title.Text = word?.Title ?? "";
+                streamedMessage.Show(word?.Message(now, current, freeTime) ?? (wordId > 0 ? "今天已经抽过词了。" : "每天抽一次，当天免费查看。"), animate && word != null);
+            }
+            button.Click += async (_, __) =>
+            {
+                DateTime now = DateTime.Now;
+                double previousHeight = reveal.ActualHeight;
+                bool drawn;
                 try
                 {
-                    if (displayedDay != DateTime.Today) { Refresh(); return; }
-                    if (!privacy.DrawDailyFortune(DateTime.Now, out int drawResult)) { result.Text = "金币不足，需要 10 金币。"; return; }
-                    Refresh();
-                    refreshEffectShop?.Invoke();
+                    if (displayedDay != now.Date) { Refresh(); return; }
+                    if (!privacy.DrawDailyWord(now, current, out drawn)) { streamedMessage.Show("金币不足，需要 10 金币。", false); return; }
+                    Refresh(animate: drawn);
                 }
-                catch (IOException) { result.Text = "保存失败，请稍后重试。"; }
+                catch (IOException) { streamedMessage.Show("保存失败，请稍后重试。", false); return; }
+
+                bool playReaction = drawn && wordId == OffWorkWidget.DailyWord.TakeABreak && petId == "polar-bear" && animationSettings.AnimationsEnabled;
+                // Reserve the image slot in the same reveal as the words, before loading the frames.
+                if (playReaction) reaction.Visibility = Visibility.Visible;
+                if (drawn) StartReveal(previousHeight);
+                if (!playReaction) return;
+                try
+                {
+                    string path = Path.Combine(AppContext.BaseDirectory, "assets", "polar-bear-cup-walk.frames.br");
+                    var animation = await PetAnimationPlayer.LoadAsync(reaction, path);
+                    if (windowClosed || DateTime.Today != now.Date) { animation.Dispose(); return; }
+                    if (petId != "polar-bear" || !animationSettings.AnimationsEnabled)
+                    {
+                        animation.Dispose();
+                        ClearReaction(animate: true);
+                        return;
+                    }
+                    reactionPlayer = animation;
+                    var visual = Microsoft.UI.Xaml.Hosting.ElementCompositionPreview.GetElementVisual(reaction);
+                    var fade = visual.Compositor.CreateScalarKeyFrameAnimation();
+                    fade.InsertKeyFrame(0, 0);
+                    fade.InsertKeyFrame(1, 1);
+                    fade.Duration = TimeSpan.FromMilliseconds(230);
+                    visual.StartAnimation("Opacity", fade);
+                    animation.PlayOnce();
+                    await Task.Delay(animation.Duration + TimeSpan.FromMilliseconds(100));
+                    if (reactionPlayer != animation) return;
+                    animation.Dispose();
+                    reactionPlayer = null;
+                }
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException || ex is COMException)
+                {
+                    if (!windowClosed && DateTime.Today == now.Date) ClearReaction(animate: true);
+                    Debug.WriteLine("今日有盼动画无法播放：" + ex.Message);
+                }
             };
-            refreshDailyFortune = Refresh;
+            var clock = DispatcherQueue.CreateTimer();
+            clock.Interval = TimeSpan.FromSeconds(1);
+            clock.Tick += (_, __) =>
+            {
+                DateTime now = DateTime.Now;
+                if (now.Date == displayedDay && (wordId == 0 || freeTime == (!workEnd.HasValue || now >= workEnd.Value))) return;
+                try { Refresh(animate: now.Date == displayedDay); }
+                catch (IOException) { streamedMessage.Show("暂时无法读取今日词，正在重试。", false); }
+            };
+            Closed += (_, __) => { clock.Stop(); FinishReveal(); ClearReaction(); };
+            refreshDailyWord = () => Refresh();
             Refresh();
+            clock.Start();
             return panel;
         }
         Border BuildWishCard()
@@ -2660,9 +2790,12 @@ namespace OffWorkWidget.WinUI
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Name, "心愿名称 " + number);
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Target, "目标金额 " + number + "，元");
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor.Saved, "已攒金额 " + number + "，元");
-            grid.Children.Add(editor.Name);
-            Grid.SetColumn(editor.Target, 1); grid.Children.Add(editor.Target);
-            Grid.SetColumn(editor.Saved, 2); grid.Children.Add(editor.Saved);
+            grid.Children.Add(InputFocusShadow.Wrap(editor.Name));
+            var targetEditor = InputFocusShadow.Wrap(editor.Target);
+            var savedEditor = InputFocusShadow.Wrap(editor.Saved);
+            Grid.SetColumn(targetEditor, 1); grid.Children.Add(targetEditor);
+            Grid.SetColumn(savedEditor, 2); grid.Children.Add(savedEditor);
+            UiTypography.Apply(grid, root.ActualTheme == ElementTheme.Dark);
             editor.Delete = new Button
             {
                 Content = new FontIcon { Glyph = "\uE74D", FontSize = 12 },
@@ -3157,7 +3290,8 @@ namespace OffWorkWidget.WinUI
             salary.Width = 136;
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(salary, "月薪，元");
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(eyeBtn, "显示或隐藏月薪");
-            Grid.SetColumn(salary, 1); grid.Children.Add(salary);
+            var salaryEditor = InputFocusShadow.Wrap(salary);
+            Grid.SetColumn(salaryEditor, 1); grid.Children.Add(salaryEditor);
 
             var daysLabel = new TextBlock { Text = "计薪天数", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
             workDays = CreateInputBox(current.WorkDays.ToString(CultureInfo.InvariantCulture));
@@ -3165,7 +3299,8 @@ namespace OffWorkWidget.WinUI
             ToolTipService.SetToolTip(workDays, "每月计薪天数，支持小数");
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(workDays, "每月计薪天数");
             Grid.SetRow(daysLabel, 1); grid.Children.Add(daysLabel);
-            Grid.SetRow(workDays, 1); Grid.SetColumn(workDays, 1); grid.Children.Add(workDays);
+            var daysEditor = InputFocusShadow.Wrap(workDays);
+            Grid.SetRow(daysEditor, 1); Grid.SetColumn(daysEditor, 1); grid.Children.Add(daysEditor);
 
             var payLabel = new TextBlock { Text = "每月发薪日", FontSize = 14, Foreground = inkBrush, VerticalAlignment = VerticalAlignment.Center };
             payDay = CreateInputBox(current.PayDay.ToString(CultureInfo.InvariantCulture));
@@ -3173,7 +3308,8 @@ namespace OffWorkWidget.WinUI
             ToolTipService.SetToolTip(payDay, "每月发薪日期，填写1–31");
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(payDay, "每月发薪日，1至31");
             Grid.SetRow(payLabel, 2); grid.Children.Add(payLabel);
-            Grid.SetRow(payDay, 2); Grid.SetColumn(payDay, 1); grid.Children.Add(payDay);
+            var paydayEditor = InputFocusShadow.Wrap(payDay);
+            Grid.SetRow(paydayEditor, 2); Grid.SetColumn(paydayEditor, 1); grid.Children.Add(paydayEditor);
 
             panel.Children.Add(grid);
 
@@ -3214,6 +3350,7 @@ namespace OffWorkWidget.WinUI
                 VerticalContentAlignment = VerticalAlignment.Center
             };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(amountDurationButton, "金额显示时长，分钟和秒");
+            UiTypography.Preserve(amountDurationButton);
             amountDurationButton.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
             amountDurationButton.Resources["ButtonBackgroundPressed"] = timePressedBrush;
             amountDurationButton.Click += (_, __) => ShowTimeWheel(amountDurationButton, amountDurationDisplay, false, true);
@@ -4243,6 +4380,7 @@ namespace OffWorkWidget.WinUI
             };
             shell.Children.Add(frosted); shell.Children.Add(tint); shell.Children.Add(sheen);
             shell.Children.Add(card); shell.Children.Add(rim);
+            UiTypography.Apply(shell, root.ActualTheme == ElementTheme.Dark);
             preview.SystemBackdrop = new WinUIEx.TransparentTintBackdrop(Windows.UI.Color.FromArgb(0, 0, 0, 0));
             preview.Content = shell;
 
@@ -4376,6 +4514,7 @@ namespace OffWorkWidget.WinUI
             button.Resources["ButtonBackgroundPointerOver"] = timeHoverBrush;
             button.Resources["ButtonBackgroundPressed"] = timePressedBrush;
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, (isWater ? "喝水" : "活动") + "提醒间隔，小时和分钟");
+            UiTypography.Preserve(button);
             ToolTipService.SetToolTip(button, "滚动或输入提醒间隔，1分钟至12小时");
             button.Click += (_, __) => ShowTimeWheelCore(button, label, false, false,
                 value => { if (isWater) waterMinutes = value; else walkMinutes = value; },
@@ -5104,8 +5243,6 @@ namespace OffWorkWidget.WinUI
                 VerticalContentAlignment = VerticalAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Stretch
             };
-            box.Resources["TextControlBorderBrushFocused"] = subInkBrush;
-            box.Resources["TextControlBorderThemeThicknessFocused"] = new Thickness(1);
             box.Resources["TextControlBackgroundFocused"] = inputBackgroundBrush;
             box.Resources["TextControlBackgroundPointerOver"] = timeHoverBrush;
             void CenterContent()

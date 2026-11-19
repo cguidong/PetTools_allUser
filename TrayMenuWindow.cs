@@ -212,6 +212,7 @@ internal sealed class TrayMenuWindow : Window
     {
         bool highContrast = accessibility.HighContrast;
         surface.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
+        UiTypography.Apply(surface, dark);
         Windows.UI.Color background = highContrast ? systemColors.UIElementColor(UIElementType.Window)
             : dark ? Windows.UI.Color.FromArgb(255, 39, 39, 41) : Windows.UI.Color.FromArgb(255, 250, 250, 251);
         Windows.UI.Color foreground = highContrast ? systemColors.UIElementColor(UIElementType.WindowText)

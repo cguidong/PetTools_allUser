@@ -117,6 +117,7 @@ namespace OffWorkWidget.WinUI
                 forgot.Click += (_, _) => { if (submitting) return; resetRequested = true; dialog.Hide(); };
                 panel.Children.Add(forgot);
             }
+            WinUI.UiTypography.Apply(dialog, dark);
             bool succeeded = false;
             dialog.Opened += delegate
             {
@@ -454,9 +455,11 @@ namespace OffWorkWidget.WinUI
 
         static void AddPassword(StackPanel panel, string label, PasswordBox input)
         {
-            input.Header = label;
             AutomationProperties.SetName(input, label);
-            panel.Children.Add(input);
+            var field = new StackPanel { Spacing = 6 };
+            field.Children.Add(new TextBlock { Text = label, FontSize = 13 });
+            field.Children.Add(WinUI.InputFocusShadow.Wrap(input));
+            panel.Children.Add(field);
         }
     }
 }

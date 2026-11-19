@@ -61,6 +61,9 @@ public sealed class MainWindow : Window
     Microsoft.UI.Composition.CompositionRoundedRectangleGeometry? surfaceGeometry;
     readonly Border card = new Border { CornerRadius = new CornerRadius(36), Margin = new Thickness(0) };
     readonly Border backdropCard = new Border();
+    readonly Canvas ambientEffects = new Canvas { IsHitTestVisible = false };
+    readonly ScaleTransform ambientEffectScale = new ScaleTransform();
+    readonly System.Collections.Generic.HashSet<Storyboard> ambientEffectStories = new();
     readonly Canvas foregroundLayer = new Canvas();
     readonly ScaleTransform contentScale = new ScaleTransform();
     readonly Canvas coins = new Canvas { IsHitTestVisible = false };
@@ -151,6 +154,7 @@ public sealed class MainWindow : Window
     Border? activeCoinUpgrade;
     readonly TextBlock caption = new TextBlock { FontSize = 14, CharacterSpacing = 15, FontFamily = new FontFamily("Microsoft YaHei"), FontWeight = Microsoft.UI.Text.FontWeights.Normal };
     readonly TextBlock countdown = new TextBlock { FontSize = 36, FontWeight = Microsoft.UI.Text.FontWeights.Medium, FontFamily = new FontFamily("Segoe UI"), Margin = new Thickness(0, 4, 0, 10) };
+    readonly StreamingText captionStream, countdownStream;
     readonly TextBlock rest = new TextBlock(), pay = new TextBlock(), earned = new TextBlock();
     readonly System.Collections.Generic.List<TextBlock> statTitles = new();
 
@@ -394,9 +398,13 @@ public sealed class MainWindow : Window
         hostSurface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
         surface.Children.Add(backdropCard);
+        ambientEffects.RenderTransform = ambientEffectScale;
+        surface.Children.Add(ambientEffects);
         surface.Children.Add(foregroundLayer);
         foregroundLayer.Children.Add(card);
         card.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0, 0, 0, 0));
+        captionStream = new StreamingText(caption);
+        countdownStream = new StreamingText(countdown);
         BuildCard();
         coinOverlay.Children.Add(coins);
         coinPopup.Child = coinOverlay;
@@ -641,7 +649,7 @@ public sealed class MainWindow : Window
         body.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var text = new StackPanel { Spacing = 0, VerticalAlignment = VerticalAlignment.Center };
         caption.Foreground = foreground; countdown.Foreground = foreground;
-        text.Children.Add(caption); text.Children.Add(countdown);
+        text.Children.Add(captionStream); text.Children.Add(countdownStream);
         var restPage = Stat("距休息", rest); var payPage = Stat("距发薪", pay);
         restPage.IsHitTestVisible = false;
         payPage.IsHitTestVisible = false;
@@ -1433,7 +1441,7 @@ public sealed class MainWindow : Window
         double logicalSize = unset ? 18 : weekday ? 20 : 22;
         double dpi = Math.Max(96u, GetDpiForWindow(hwnd)) / 96d;
         rest.FontSize = Math.Round(pay.FontSize * logicalSize / 22 * dpi) / dpi;
-        rest.FontWeight = unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium;
+        UiTypography.SetWeight(rest, unset ? Microsoft.UI.Text.FontWeights.Normal : Microsoft.UI.Text.FontWeights.Medium, surface.RequestedTheme == ElementTheme.Dark);
     }
     static string NormalizePet(string id) =>
         id == "cat" || id == "samoyed" || id == "corgi" || id == "red-panda" ? "cow-cat" :
@@ -1737,6 +1745,7 @@ public sealed class MainWindow : Window
         ApplyTypography();
         card.HorizontalAlignment = HorizontalAlignment.Left; card.VerticalAlignment = VerticalAlignment.Top;
         contentScale.ScaleX = contentScale.ScaleY = scale;
+        ambientEffectScale.ScaleX = ambientEffectScale.ScaleY = scale;
         glass.Brush.BlurAmount = 0;
         surface.HorizontalAlignment = HorizontalAlignment.Left; surface.VerticalAlignment = VerticalAlignment.Top;
         pixelScale = GetDpiForWindow(hwnd) / 96.0 * scale;
@@ -1925,9 +1934,13 @@ public sealed class MainWindow : Window
         coinBankBalance.Padding = new Thickness(Size(9), Size(5), Size(9), Size(5));
         coinBankBalanceText.FontSize = Size(13);
         caption.FontSize = Size(17); caption.CharacterSpacing = 0;
-        caption.FontWeight = Microsoft.UI.Text.FontWeights.Normal;
         countdown.FontSize = Size(36); countdown.Margin = new Thickness(0, Size(4), 0, Size(8));
-        foreach (var heading in statTitles) { heading.FontSize = Size(15); heading.FontWeight = Microsoft.UI.Text.FontWeights.Normal; heading.IsTextScaleFactorEnabled = false; }
+        foreach (var heading in statTitles)
+        {
+            heading.FontSize = Size(15);
+            UiTypography.SetWeight(heading, Microsoft.UI.Text.FontWeights.Normal, surface.RequestedTheme == ElementTheme.Dark);
+            heading.IsTextScaleFactorEnabled = false;
+        }
         foreach (var value in new[] { rest, pay, earned })
         {
             value.FontSize = Size(22); value.IsTextScaleFactorEnabled = false;
@@ -2163,22 +2176,25 @@ public sealed class MainWindow : Window
         TimeSpan? left = null;
         int days = Logic.UntilRest(now, settings);
         bool restStarted = Logic.RestStarted(now, settings, days);
-        if (!work) { caption.Text = "今天休息，好好放松"; countdown.Text = "休息中"; }
-        else if (now.TimeOfDay < start) { caption.Text = "距离上班还有"; left = start - now.TimeOfDay; }
-        else if (now.TimeOfDay < end) { caption.Text = "距离下班还有"; left = end - now.TimeOfDay; }
-        else if (restStarted) { caption.Text = "已经放假啦"; countdown.Text = "好好休息"; }
-        else { caption.Text = "今天辛苦了，自由时间到"; countdown.Text = "已下班"; }
+        string captionText, status = "";
+        if (!work) { captionText = "今天休息，好好放松"; status = "休息中"; }
+        else if (now.TimeOfDay < start) { captionText = "距离上班还有"; left = start - now.TimeOfDay; }
+        else if (now.TimeOfDay < end) { captionText = "距离下班还有"; left = end - now.TimeOfDay; }
+        else if (restStarted) { captionText = "已经放假啦"; status = "好好休息"; }
+        else { captionText = "今天辛苦了，自由时间到"; status = "已下班"; }
         if (now < reminderUntil && reminderDue != 0)
-            caption.Text = reminderDue == 3 ? "起身走走，喝口水吧"
+            captionText = reminderDue == 3 ? "起身走走，喝口水吧"
                 : reminderDue == 1 ? "歇一歇，喝口水吧" : "活动一下，放松身心";
+        captionStream.Show(captionText, animate: true, prepareLayout: FitCaptionToColumn);
         bool showStatus = !left.HasValue;
         if (countdownIsStatus != showStatus)
         {
             countdownIsStatus = showStatus;
             countdown.FontFamily = new FontFamily(countdownIsStatus ? "Microsoft YaHei" : "Segoe UI");
-            countdown.FontWeight = countdownIsStatus ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Medium;
+            UiTypography.SetWeight(countdown, countdownIsStatus ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Medium, surface.RequestedTheme == ElementTheme.Dark);
         }
-        if (left.HasValue) countdown.Text = string.Format(CultureInfo.InvariantCulture, "{0:00} : {1:00} : {2:00}", (int)left.Value.TotalHours, left.Value.Minutes, left.Value.Seconds);
+        if (left.HasValue) countdownStream.Show(string.Format(CultureInfo.InvariantCulture, "{0:00} : {1:00} : {2:00}", (int)left.Value.TotalHours, left.Value.Minutes, left.Value.Seconds), animate: false);
+        else countdownStream.Show(status, animate: true);
         statTitles[0].Text = restStarted ? "下次上班" : "距休息";
         if (restStarted)
         {
@@ -2596,6 +2612,7 @@ public sealed class MainWindow : Window
                 messageTitle.Text = text.Message;
                 messageBody.Text = text.Body;
                 popupSurface.RequestedTheme = isDark ? ElementTheme.Dark : ElementTheme.Light;
+                UiTypography.Apply(popupSurface, isDark);
                 if (frostedBackground.SystemBackdrop is ActiveAcrylicBackdrop acrylic) acrylic.UpdateTheme(isDark);
                 background.Color = acrylicSupported ? (isDark ? Windows.UI.Color.FromArgb(84, 4, 8, 14) : Windows.UI.Color.FromArgb(34, 92, 104, 120)) : (isDark ? Windows.UI.Color.FromArgb(255, 38, 38, 41) : Windows.UI.Color.FromArgb(255, 248, 248, 250));
                 messageBackground.Color = isDark ? Windows.UI.Color.FromArgb(255, 65, 65, 68) : Windows.UI.Color.FromArgb(255, 250, 250, 251);
@@ -2891,7 +2908,13 @@ public sealed class MainWindow : Window
         UpdateGlassTransition();
 
         var theme = glassTarget > .5 ? ElementTheme.Dark : ElementTheme.Light;
-        if (surface.RequestedTheme != theme) surface.RequestedTheme = theme;
+        if (surface.RequestedTheme != theme)
+        {
+            surface.RequestedTheme = theme;
+            UiTypography.Apply(surface, theme == ElementTheme.Dark);
+            fittedCaptionText = null;
+            FitCaptionToColumn();
+        }
         if (hostSurface.RequestedTheme != theme) hostSurface.RequestedTheme = theme;
         if (desktopSource.NeedsAnimation?.Invoke() == true) desktopSource.WakeRendering();
         GlassProfile.Appearance(GlassProfile.Ms(appearanceStarted), layoutMs, 0, 0,
@@ -3433,7 +3456,6 @@ public sealed class MainWindow : Window
         coinPopup.IsOpen = false;
         foreach (var story in coinStories.ToArray()) story.Stop();
         coinStories.Clear();
-        ambientParticlesActive = 0;
         activeCoinUpgrade = null;
         coins.Children.Clear();
         if (popupSettleTimer == null)
@@ -3474,29 +3496,32 @@ public sealed class MainWindow : Window
             (int)Math.Round(y * 65535.0 / Math.Max(1, height - 1)), 0, IntPtr.Zero);
     }
 
+    void ClearAmbientShopEffects()
+    {
+        foreach (var story in ambientEffectStories) story.Stop();
+        ambientEffectStories.Clear();
+        ambientEffects.Children.Clear();
+        ambientParticlesActive = 0;
+    }
+
     void ShowAmbientShopEffect()
     {
         if (disposed || exiting || !uiSettings.AnimationsEnabled || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
         int selectedEffect = privacy.SelectedEffect;
         if (ambientEffectKind != selectedEffect)
         {
+            ClearAmbientShopEffects();
             ambientEffectKind = selectedEffect;
             ambientBatchSize = Random.Shared.Next(1, 3);
             ambientParticleLimit = Random.Shared.Next(6, 9);
         }
         if (selectedEffect < 1 || selectedEffect > 5 || selectedEffect == 4 || !privacy.EffectUnlocked(selectedEffect)) return;
+        double cardWidth = surface.Width / PhysicalScale;
+        double cardHeight = surface.Height / PhysicalScale;
+        if (cardWidth < 32 || cardHeight < 32 || surface.XamlRoot == null) return;
         int particleCount = Math.Min(ambientBatchSize, Math.Max(0, ambientParticleLimit - ambientParticlesActive));
         if (particleCount == 0) return;
         ambientBatchSize = Math.Min(ambientParticleLimit, ambientBatchSize + Random.Shared.Next(1, 3));
-        if (!trackingCoins)
-        {
-            coinPopup.XamlRoot = surface.XamlRoot;
-            PositionCoinLayer();
-            coinPopup.IsOpen = true;
-            trackingCoins = true;
-            CompositionTarget.Rendering += TrackCoinLayer;
-        }
-        double glassWidth = surface.Width / PhysicalScale;
         var storyboard = new Storyboard();
         void Motion(DependencyObject target, string property, params (int At, double Value, EasingMode? Ease)[] keys)
         {
@@ -3510,59 +3535,53 @@ public sealed class MainWindow : Window
             Storyboard.SetTarget(motion, target); Storyboard.SetTargetProperty(motion, property);
             storyboard.Children.Add(motion);
         }
-        var effectVisuals = new System.Collections.Generic.List<UIElement>();
-        if (uiSettings.AnimationsEnabled && selectedEffect >= 1 && selectedEffect <= 5 && selectedEffect != 4 && privacy.EffectUnlocked(selectedEffect))
+        var effectVisuals = new System.Collections.Generic.List<UIElement>(particleCount);
+        bool lightEffectBackground = textAppearanceInitialized ? lightness < .5 :
+            uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R >= 128;
+        double peakOpacity = lightEffectBackground ? .95 : .68;
+        double holdOpacity = lightEffectBackground ? .86 : .62;
+        if (selectedEffect == 1)
         {
-            // Reuse the heading's adaptive background estimate; the effect is
-            // outside the card, so a mixed desktop can differ from this sample.
-            bool lightEffectBackground = textAppearanceInitialized ? lightness < .5 :
-                uiSettings.GetColorValue(Windows.UI.ViewManagement.UIColorType.Background).R >= 128;
-            double peakOpacity = lightEffectBackground ? .95 : .68;
-            double holdOpacity = lightEffectBackground ? .86 : .62;
-            if (selectedEffect == 1)
+            for (int i = 0; i < particleCount; i++)
             {
-                // Spread the twinkles across the space above the card.
-                for (int i = 0; i < particleCount; i++)
-                {
-                    double size = (lightEffectBackground ? 11 : 10) + Random.Shared.NextDouble() * 3;
-                    var star = CreateShopEffectParticle(1, size, lightEffectBackground);
-                    var twinkle = new CompositeTransform();
-                    star.RenderTransformOrigin = new Point(.5, .5); star.RenderTransform = twinkle;
-                    double minX = 3, maxX = Math.Max(minX, glassWidth - size - 3);
-                    double minY = 8, maxY = Math.Max(minY, CoinHeadroom - size - 8);
-                    Canvas.SetLeft(star, minX + Random.Shared.NextDouble() * (maxX - minX));
-                    Canvas.SetTop(star, minY + Random.Shared.NextDouble() * (maxY - minY));
-                    coins.Children.Add(star); effectVisuals.Add(star);
-                    int delay = i * 380 + Random.Shared.Next(20, 141), end = delay + 850 + Random.Shared.Next(0, 180);
-                    int second = delay + (end - delay) * 2 / 3;
-                    Motion(twinkle, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
-                    Motion(twinkle, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
-                    Motion(star, "Opacity", (0, 0, null), (delay, 0, null), (delay + 180, peakOpacity, null),
-                        (delay + 400, peakOpacity * .24, null), (second, peakOpacity * .72, null), (end, 0, EasingMode.EaseIn));
-                }
+                double size = (lightEffectBackground ? 11 : 10) + Random.Shared.NextDouble() * 3;
+                var star = CreateShopEffectParticle(1, size, lightEffectBackground);
+                var twinkle = new CompositeTransform();
+                star.RenderTransformOrigin = new Point(.5, .5); star.RenderTransform = twinkle;
+                Canvas.SetLeft(star, 8 + Random.Shared.NextDouble() * Math.Max(0, cardWidth - size - 16));
+                Canvas.SetTop(star, 8 + Random.Shared.NextDouble() * Math.Max(0, cardHeight - size - 16));
+                ambientEffects.Children.Add(star); effectVisuals.Add(star);
+                int delay = i * 380 + Random.Shared.Next(20, 141), end = delay + 850 + Random.Shared.Next(0, 180);
+                int second = delay + (end - delay) * 2 / 3;
+                Motion(twinkle, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
+                Motion(twinkle, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 180, 1, EasingMode.EaseOut), (end, .7, EasingMode.EaseIn));
+                Motion(star, "Opacity", (0, 0, null), (delay, 0, null), (delay + 180, peakOpacity, null),
+                    (delay + 400, peakOpacity * .24, null), (second, peakOpacity * .72, null), (end, 0, EasingMode.EaseIn));
             }
-            else if (selectedEffect != 1)
+        }
+        else
+        {
             for (int i = 0; i < particleCount; i++)
             {
                 double size = (selectedEffect == 2 ? 20 : 17) + Random.Shared.NextDouble() * 3;
                 var particle = CreateShopEffectParticle(selectedEffect, size, lightEffectBackground);
-                double particleWidth = size;
                 var particleTransform = new CompositeTransform();
                 particle.RenderTransformOrigin = new Point(.5, .5);
                 particle.RenderTransform = particleTransform;
-                double startX = 12 + Random.Shared.NextDouble() * Math.Max(0, glassWidth - particleWidth - 24);
+                const double fallDistance = 25;
+                double startX = 16 + Random.Shared.NextDouble() * Math.Max(0, cardWidth - size - 32);
+                double bottomMargin = 8 + (selectedEffect == 2 ? 0 : fallDistance);
+                double startY = 8 + Random.Shared.NextDouble() * Math.Max(0, cardHeight - size - 8 - bottomMargin);
                 Canvas.SetLeft(particle, startX);
-                // Keep the entire particle above the card so it cannot cover the coin counter.
-                double startY = 5 + Random.Shared.NextDouble() * Math.Max(0, CoinHeadroom - size - 40);
                 Canvas.SetTop(particle, startY);
-                coins.Children.Add(particle); effectVisuals.Add(particle);
+                ambientEffects.Children.Add(particle); effectVisuals.Add(particle);
                 int delay = i * 380 + Random.Shared.Next(20, 141);
                 int duration = selectedEffect == 2 ? Random.Shared.Next(2600, 3401) : Random.Shared.Next(1800, 2301), end = delay + duration;
                 double drift = (i == 0 ? -1 : 1) * (7 + Random.Shared.NextDouble() * 5);
                 if (selectedEffect == 2)
                 {
-                    double RandomX() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startX, glassWidth - size - 4 - startX);
-                    double RandomY() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 3 - startY, CoinHeadroom - size - 4 - startY);
+                    double RandomX() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startX, cardWidth - size - 4 - startX);
+                    double RandomY() => Math.Clamp((Random.Shared.NextDouble() - .5) * 20, 4 - startY, cardHeight - size - 4 - startY);
                     double x1 = RandomX(), x2 = RandomX(), x3 = RandomX();
                     double y1 = RandomY(), y2 = RandomY(), y3 = RandomY();
                     Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null),
@@ -3573,7 +3592,7 @@ public sealed class MainWindow : Window
                 else
                 {
                     Motion(particleTransform, "TranslateX", (0, 0, null), (delay, 0, null), (delay + duration / 2, drift, EasingMode.EaseInOut), (end, drift * .4, EasingMode.EaseInOut));
-                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null), (end, 25, EasingMode.EaseOut));
+                    Motion(particleTransform, "TranslateY", (0, 0, null), (delay, 0, null), (end, fallDistance, EasingMode.EaseOut));
                 }
                 Motion(particleTransform, "ScaleX", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
                 Motion(particleTransform, "ScaleY", (0, .55, null), (delay, .55, null), (delay + 230, 1, EasingMode.EaseOut), (end, .78, EasingMode.EaseIn));
@@ -3588,12 +3607,11 @@ public sealed class MainWindow : Window
         ambientParticlesActive += effectVisuals.Count;
         storyboard.Completed += (_, __) =>
         {
-            coinStories.Remove(storyboard);
-            foreach (var visual in effectVisuals) coins.Children.Remove(visual);
-            ambientParticlesActive = Math.Max(0, ambientParticlesActive - effectVisuals.Count);
-            if (coins.Children.Count == 0) CloseCoinLayer();
+            if (!ambientEffectStories.Remove(storyboard)) return;
+            foreach (var visual in effectVisuals) ambientEffects.Children.Remove(visual);
+            ambientParticlesActive -= effectVisuals.Count;
         };
-        coinStories.Add(storyboard);
+        ambientEffectStories.Add(storyboard);
         storyboard.Begin();
     }
 
@@ -5550,6 +5568,7 @@ public sealed class MainWindow : Window
         hoverDragTimer?.Stop();
         dragReleaseTimer?.Stop();
         CloseCoinLayer();
+        ClearAmbientShopEffects();
         petAnimationRevision++;
         if (petEnterHook != IntPtr.Zero) { UnhookWindowsHookEx(petEnterHook); petEnterHook = IntPtr.Zero; }
         petEnterHookProc = null;

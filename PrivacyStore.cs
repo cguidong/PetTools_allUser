@@ -106,35 +106,33 @@ namespace OffWorkWidget
             return true;
         }
         // Result and payment are committed together so reopening today never charges twice.
-        public bool DrawDailyFortune(DateTime localDate, out int result)
+        internal bool DrawDailyWord(DateTime localDate, Settings settings, out bool drawn)
         {
             int day = localDate.Year * 10000 + localDate.Month * 100 + localDate.Day;
-            bool spent = false;
-            result = 0;
+            drawn = false;
             Execute("BEGIN IMMEDIATE");
             try
             {
                 if (ReadMetaInt("fortune_day") == day && ReadMetaInt("fortune_result") > 0)
                 {
-                    result = ReadMetaInt("fortune_result");
                     Execute("COMMIT");
                     return true;
                 }
                 int balance = CoinBalance;
                 if (balance < 10) { Execute("COMMIT"); return false; }
-                result = RandomNumberGenerator.GetInt32(1, 13);
+                int result = DailyWord.Pick(localDate, settings);
                 WriteMetaInt("coins_balance", balance - 10);
                 WriteMetaInt("fortune_result", result);
                 WriteMetaInt("fortune_day", day);
                 ApplyPendingEffectRefund();
                 Execute("COMMIT");
-                spent = true;
+                drawn = true;
             }
             catch { Execute("ROLLBACK"); throw; }
-            if (spent) BalanceChanged?.Invoke();
+            BalanceChanged?.Invoke();
             return true;
         }
-        public int TodayFortune(DateTime localDate)
+        internal int TodayWord(DateTime localDate)
         {
             int day = localDate.Year * 10000 + localDate.Month * 100 + localDate.Day;
             return ReadMetaInt("fortune_day") == day ? ReadMetaInt("fortune_result") : 0;
