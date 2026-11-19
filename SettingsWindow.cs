@@ -2427,7 +2427,8 @@ namespace OffWorkWidget.WinUI
                 new(16, "游鱼水纹", "fish-koi-0.png"),
                 new(17, "微光烟花", "preview-firework.svg"), new(18, "落墨晕染", "preview-ink.svg"),
                 new(19, "引力旋涡", "preview-vortex.svg"), new(20, "蝶舞花影", "butterfly.png"),
-                new(21, "纸鹤乘风", "origami.png"), new(22, "轻羽飘梦", "feather.png")
+                new(21, "纸鹤乘风", "origami.png"), new(22, "轻羽飘梦", "feather.png"),
+                new(23, "3D 工笔锦鲤", "preview-fish3d.svg")
             };
             var parameterPanel = new StackPanel { Spacing = 4 };
             var parameterSection = CreateOptionsSection("实时参数微调", parameterPanel);

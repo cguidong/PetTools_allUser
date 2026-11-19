@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -221,8 +221,15 @@ public sealed partial class MainWindow
             if (groundShape != null)
             {
                 int bin = GroundIndex(p.X, width);
-                groundHeight[bin] = Math.Min(referenceEffect == 3 ? height * .085 : height * .055,
-                    groundHeight[bin] + (referenceEffect == 3 ? .64 : .43));
+                double maxH = referenceEffect == 3 ? height * .085 : Math.Min(13, height * .055);
+                double amt = referenceEffect == 3 ? .42 : .20;
+                ReadOnlySpan<double> weights = stackalloc double[] { .25, .60, 1.0, .60, .25 };
+                for (int offset = -2; offset <= 2; offset++)
+                {
+                    int idx = bin + offset;
+                    if (idx >= 0 && idx < GroundBinCount)
+                        groundHeight[idx] = Math.Min(maxH, groundHeight[idx] + amt * weights[offset + 2]);
+                }
                 if (referenceEffect == 10) AddReferenceRipple(p.X, floor, now);
                 ambientEffects.Children.Remove(p.Image);
             }
@@ -359,30 +366,50 @@ public sealed partial class MainWindow
 
     void UpdateGroundField(Point pointer, bool inside, double wind, double width, double height, double dt, double now)
     {
+        double maxH = referenceEffect == 3 ? height * .09 : Math.Min(14, height * .06);
         if (inside && pointer.Y > height - 27 && Math.Abs(wind) > 40)
         {
             int center = GroundIndex(pointer.X, width);
             for (int i = Math.Max(0, center - 4); i <= Math.Min(GroundBinCount - 1, center + 4); i++)
             {
-                int destination = Math.Clamp(i + (wind > 0 ? 7 : -7), 0, GroundBinCount - 1);
-                double transfer = Math.Min(groundHeight[i], dt * 18 * (1 - Math.Abs(i - center) / 5d));
+                int destination = Math.Clamp(i + (wind > 0 ? 6 : -6), 0, GroundBinCount - 1);
+                double room = Math.Max(0, maxH * 1.15 - groundHeight[destination]);
+                double transfer = Math.Min(room, Math.Min(groundHeight[i], dt * 14 * (1 - Math.Abs(i - center) / 5d)));
                 groundHeight[i] -= transfer;
                 groundHeight[destination] += transfer;
             }
         }
 
-        // Every exchange adds to one cell exactly what it subtracts from the other.
-        for (int i = 0; i < GroundBinCount - 1; i++)
+        // Volume-conserving, CFL-stable solver: prevents standing-wave spikes in rain puddles.
+        if (referenceEffect == 3)
         {
-            double difference = groundHeight[i] - groundHeight[i + 1];
-            double flow;
-            if (referenceEffect == 3)
-                flow = Math.CopySign(Math.Max(0, Math.Abs(difference) - .38) * dt * 5.2, difference);
-            else
-                flow = waterFlux[i] = (waterFlux[i] + difference * dt * 13) * Math.Exp(-dt * 4.8);
-            double moved = Math.Clamp(flow, -groundHeight[i + 1], groundHeight[i]);
-            groundHeight[i] -= moved;
-            groundHeight[i + 1] += moved;
+            for (int i = 0; i < GroundBinCount - 1; i++)
+            {
+                double difference = groundHeight[i] - groundHeight[i + 1];
+                double flow = Math.CopySign(Math.Max(0, Math.Abs(difference) - .38) * dt * 5.2, difference);
+                double moved = Math.Clamp(flow, -groundHeight[i + 1] * .45, groundHeight[i] * .45);
+                groundHeight[i] -= moved;
+                groundHeight[i + 1] += moved;
+            }
+        }
+        else
+        {
+            const int subSteps = 5;
+            double subDt = Math.Min(.016, dt) / subSteps;
+            double damp = Math.Pow(.16, subDt);
+            double diffGain = Math.Min(.28, subDt * 18);
+            for (int step = 0; step < subSteps; step++)
+            {
+                for (int i = 0; i < GroundBinCount - 1; i++)
+                {
+                    double difference = groundHeight[i] - groundHeight[i + 1];
+                    waterFlux[i] = (waterFlux[i] + difference * 115 * subDt) * damp;
+                    double flux = waterFlux[i] * subDt + difference * diffGain;
+                    double moved = Math.Clamp(flux, -groundHeight[i + 1] * .45, groundHeight[i] * .45);
+                    groundHeight[i] -= moved;
+                    groundHeight[i + 1] += moved;
+                }
+            }
         }
         if (now - groundFrame < 1d / 30 || groundShape == null) return;
         groundFrame = now;

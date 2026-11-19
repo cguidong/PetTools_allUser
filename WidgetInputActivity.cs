@@ -15,7 +15,7 @@ public sealed partial class MainWindow
     Task<int>? activityBatch;
 
     bool EarnsFromGlobalActivity => !activitySessionLocked && !activityShopComplete && activityInput?.Listening == true;
-    static bool SupportsTypingBreath(int id) => id is 2 or 8 or 12 or 13 or 15 or 19;
+    static bool SupportsTypingBreath(int id) => id is 2 or 8 or 12 or 13 or 15 or 19 or Koi3DShopEffect;
 
     void InitializeActivityInput()
     {
@@ -62,7 +62,8 @@ public sealed partial class MainWindow
         if (keyboard && uiSettings.AnimationsEnabled && now - lastActivityBreath >= 75 && SupportsTypingBreath(ambientEffectKind))
         {
             lastActivityBreath = now;
-            if (now + 200 < nextAmbientEffectAt) nextAmbientEffectAt = now + 200;
+            if (ambientEffectKind == Koi3DShopEffect) TriggerKoi3DBreathFeed();
+            else if (now + 200 < nextAmbientEffectAt) nextAmbientEffectAt = now + 200;
         }
         // Leave WM_INPUT unhandled so the original window procedure can clean it up.
     }

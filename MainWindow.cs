@@ -3406,6 +3406,7 @@ public sealed partial class MainWindow : Window
 
     void ClearAmbientShopEffects()
     {
+        StopKoi3DEffect();
         StopFishEffect();
         StopReferenceEffect();
         foreach (var story in ambientEffectStories) story.Stop();
@@ -3447,7 +3448,7 @@ public sealed partial class MainWindow : Window
         if (!celebration)
         {
             ambientPreviewPending = false;
-            if (selectionChanged || preview)
+            if (selectionChanged || (preview && selectedEffect != Koi3DShopEffect))
             {
                 ClearAmbientShopEffects();
                 ambientEffectKind = selectedEffect;
@@ -3462,6 +3463,11 @@ public sealed partial class MainWindow : Window
         double cardWidth = surface.Width / PhysicalScale;
         double cardHeight = surface.Height / PhysicalScale;
         if (cardWidth < 32 || cardHeight < 32 || surface.XamlRoot == null) return;
+        if (selectedEffect == Koi3DShopEffect)
+        {
+            StartKoi3DEffect(parameters, cardWidth, cardHeight);
+            return;
+        }
         if (selectedEffect == FishShopEffect)
         {
             StartFishEffect(parameters, cardWidth, cardHeight);
@@ -4600,7 +4606,12 @@ public sealed partial class MainWindow : Window
         bool clicked = isDragging && !dragMoved && GetCursorPos(out Win32Point cursor) &&
             Math.Abs(cursor.X - initialCursor.X) < GetSystemMetrics(68) &&
             Math.Abs(cursor.Y - initialCursor.Y) < GetSystemMetrics(69);
-        if (clicked && !dragStartedOnPet && ((shopEffectPreview ?? privacy.SelectedEffect) is 17 or 18))
+        int activeEffect = shopEffectPreview ?? privacy.SelectedEffect;
+        if (clicked && !dragStartedOnPet && activeEffect == Koi3DShopEffect)
+        {
+            HandleKoi3DClick(point.X / PhysicalScale, point.Y / PhysicalScale);
+        }
+        else if (clicked && !dragStartedOnPet && (activeEffect is 17 or 18))
         {
             ambientClick = new Point(point.X / PhysicalScale, point.Y / PhysicalScale);
             nextAmbientEffectAt = elapsed.ElapsedMilliseconds;

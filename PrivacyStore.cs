@@ -34,6 +34,7 @@ namespace OffWorkWidget
             20 => new(9, .85, 1, 94, 0),
             21 => new(6, .85, 1, 93, .2),
             22 => new(12, .75, 1, 94, .3),
+            23 => new(11, 1, 1, 98, 0),
             _ => throw new ArgumentOutOfRangeException(nameof(effect))
         };
 
@@ -75,12 +76,12 @@ namespace OffWorkWidget
         public int SelectedEffect => ReadMetaInt("effect_selected");
         static int ShopPrice(int effect) => effect switch
         {
-            1 => 100, 2 or 8 => 150, 3 or 5 or 7 or 12 or 13 or 14 or 15 => 300, 9 or 11 => 500, 10 => 200, 16 => 1000, 17 => 260, 18 => 300, 19 => 520, 20 => 600, 21 => 640, 22 => 780, _ => 0
+            1 => 100, 2 or 8 => 150, 3 or 5 or 7 or 12 or 13 or 14 or 15 => 300, 9 or 11 => 500, 10 => 200, 16 => 1000, 17 => 260, 18 => 300, 19 => 520, 20 => 600, 21 => 640, 22 => 780, 23 => 2000, _ => 0
         };
         public static int EffectPrice(int effect) => ShopPrice(effect) is > 0 and var price ? price : throw new ArgumentOutOfRangeException(nameof(effect));
         internal bool AllShopEffectsUnlocked()
         {
-            for (int effect = 1; effect <= 22; effect++)
+            for (int effect = 1; effect <= 23; effect++)
                 if (ShopPrice(effect) > 0 && !EffectUnlocked(effect)) return false;
             return true;
         }
