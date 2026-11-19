@@ -601,9 +601,10 @@ internal sealed class DesktopGlassSource : IDisposable
         if (preparingWindowMove && !followMovingHost &&
             MotionClock - lastCaptureAt < motionInterval) return;
         if (followMovingHost) ObserveWindowMotion(x, y);
-        // Reading a smaller margin while the cursor is fast cuts capture cost;
-        // the atlas still covers the next frame's displacement.
-        int movingMargin = FastDrag ? FastMovingCaptureMargin : MovingCaptureMargin;
+        // Allow roughly 35ms of travel for a fast drag, with bounded texture size.
+        int movingMargin = FastDrag
+            ? Math.Clamp((int)(dragSpeed * .035), FastMovingCaptureMargin, FastMovingCaptureMargin * 3)
+            : MovingCaptureMargin;
         int margin = followMovingHost || preparingWindowMove ? movingMargin : visualDrag ? CaptureMargin : 0;
         // Preserve look-ahead along motion without reading a full margin on the idle axis.
         int marginX = followMovingHost && motionDirectionX == 0 ? MovingCaptureMargin / 2 : margin;
@@ -703,7 +704,10 @@ internal sealed class DesktopGlassSource : IDisposable
                 // previous complete texture. Hold it during GPU warm-up instead of flashing lower layers.
                 var fresh = WindowBackdropCapture.CaptureAt(handle, left, top, right - left, bottom - top,
                     outputBuffer, scratch, preservePendingScene: true, avoidBlockingSources: avoidBlockingSources,
-                    allowPendingFill: pendingSince != 0 && MotionClock - pendingSince >= PendingFillAfterMilliseconds);
+                    // During a drag, a missing source crop must not be replaced by
+                    // the wallpaper or a lower window. Keep the last complete texture.
+                    allowPendingFill: !movingScene && pendingSince != 0 &&
+                        MotionClock - pendingSince >= PendingFillAfterMilliseconds);
                 double composeMs = GlassProfile.Ms(composeStarted);
                 long metricsStarted = GlassProfile.Timestamp();
                 // Adaptive ink metrics are not worth a full pixel sweep on every
@@ -726,6 +730,14 @@ internal sealed class DesktopGlassSource : IDisposable
             // pass that replaced it.
             if (pass != captureGeneration) return;
             if (disposed || frozen || paused || !IsActive) return;
+            if (followMovingHost && captured.Frame.Success && captured.Frame.PendingRegion)
+            {
+                // A stationary capture may have started just before the first move.
+                spareScenePixels = captured.Frame.PixelsBGRA;
+                sceneScratchPixels = captured.Scratch;
+                retryLatestBounds = true;
+                return;
+            }
             if (!TryGetRenderBounds(out int latestX, out int latestY, out int latestWidth, out int latestHeight)) return;
             bool movedDuringCapture = latestX != cardX || latestY != cardY ||
                 latestWidth != cardWidth || latestHeight != cardHeight;

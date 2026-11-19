@@ -1881,7 +1881,8 @@ namespace OffWorkWidget.WinUI
                 {
                     Text = value.ToString("00", CultureInfo.InvariantCulture), MaxLength = maximumLength,
                     Height = wheelRowHeight, MinHeight = 0, MinWidth = 0,
-                    FontFamily = new FontFamily("Segoe UI Variable Display"), FontSize = compact ? 20 : 23,
+                    FontFamily = new FontFamily("Segoe UI Variable Display"),
+                    FontSize = TimeWheelFontSize(compact) * TimeWheelSelectedScale,
                     TextAlignment = TextAlignment.Center, VerticalContentAlignment = VerticalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Stretch,
                     Margin = new Thickness(12, 0, 12, 0), Padding = new Thickness(0),
@@ -2268,6 +2269,9 @@ namespace OffWorkWidget.WinUI
             flyout.ShowAt(anchor);
         }
 
+        const double TimeWheelSelectedScale = 1.22;
+        static double TimeWheelFontSize(bool compact) => compact ? 20 : 23;
+
         ScrollViewer CreateTimeWheel(int count, int value, Windows.UI.Color foreground, Action<int> changed, string name, bool wrap = true, double rowHeight = 36, int visibleRows = 5)
         {
             double viewportHeight = rowHeight * visibleRows;
@@ -2290,7 +2294,7 @@ namespace OffWorkWidget.WinUI
                 IsTabStop = true
             };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(viewer, name);
-            const double labelRestScale = 1, labelSelectedScale = 1.22;
+            const double labelRestScale = 1;
             for (int index = 0; index < count * repeats; index++)
             {
                 int selected = index;
@@ -2298,7 +2302,7 @@ namespace OffWorkWidget.WinUI
                 var text = new TextBlock
                 {
                     Text = (index % count).ToString("00", CultureInfo.InvariantCulture),
-                    FontSize = visibleRows == 3 ? 20 : 23, Foreground = new SolidColorBrush(foreground),
+                    FontSize = TimeWheelFontSize(visibleRows == 3), Foreground = new SolidColorBrush(foreground),
                     VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
                     FontFamily = new FontFamily("Segoe UI Variable Display"),
                     RenderTransform = labelScale, RenderTransformOrigin = new Windows.Foundation.Point(.5, .5)
@@ -2355,7 +2359,7 @@ namespace OffWorkWidget.WinUI
                     double proximity = Math.Max(0, 1 - distance);
                     double eased = proximity * proximity * (3 - 2 * proximity);
                     labelScales[i].ScaleX = labelScales[i].ScaleY =
-                        labelRestScale + (labelSelectedScale - labelRestScale) * eased;
+                        labelRestScale + (TimeWheelSelectedScale - labelRestScale) * eased;
                 }
                 // Only a single-row crossing is the selection moving on; larger
                 // jumps are recentering or programmatic value sync.
